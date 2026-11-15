@@ -1,0 +1,1247 @@
+#!/usr/bin/env python3
+"""Unit and integration tests for Vyn Memory (`server.py`)."""
+from __future__ import annotations
+
+import base64
+import hashlib
+import importlib.util
+import json
+import os
+import sys
+import tempfile
+import threading
+import unittest
+import urllib.error
+import urllib.parse
+import urllib.request
+from http.server import ThreadingHTTPServer
+from pathlib import Path
+
+
+def _load_server():
+    here = Path(__file__).resolve().parent
+    spec = importlib.util.spec_from_file_location("vyn_memory_server", here / "server.py")
+    assert spec and spec.loader
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules["vyn_memory_server"] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+class TestVynMemory(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmpdir = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmpdir.name)
+        self.data_dir = self.root / "data"
+        self.vault_dir = self.root / "vault"
+        self.env_patch = {
+            "MEMORY_DATA_DIR": str(self.data_dir),
+            "MEMORY_VAULT_DIR": str(self.vault_dir),
+            "MEMORY_OWNER_TOKEN": "tok-owner-test",
+            "MEMORY_HERMES_TOKEN": "tok-hermes-test",
+            "MEMORY_CLAUDE_TOKEN": "tok-claude-test",
+            "MEMORY_CHATGPT_TOKEN": "tok-chatgpt-test",
+            "MEMORY_ANTIGRAVITY_TOKEN": "tok-antigravity-test",
+            "MEMORY_PUBLIC_URL": "https://memory.example.com",
+            "OMNI_PUBLIC_URL": "https://omni.example.com",
+            "MEMORY_ADMIN_EMAILS": "owner@example.com",
+            "MEMORY_SETTINGS": str(Path(__file__).resolve().parent / "settings.example.json"),
+        }
+        self._old_env = {k: os.environ.get(k) for k in self.env_patch}
+        os.environ.update(self.env_patch)
+        self.srv = _load_server()
+        self.conn = self.srv.open_db()
+        # Starter notes a deployment ships in its own vault template.
+        for rel in ("career/00-Read-Before-Interview.md", "career/company/README.md"):
+            (self.vault_dir / rel).parent.mkdir(parents=True, exist_ok=True)
+            (self.vault_dir / rel).write_text(f"---\ntitle: {Path(rel).stem}\n---\n\n# {Path(rel).stem}\n\n| Scope | Focus |\n| :--- | :--- |\n| `career/company/acme` | Example |\n", encoding="utf-8")
+        self.srv.seed_initial_scaffold(self.conn)
+
+    def tearDown(self) -> None:
+        self.conn.close()
+        for k, v in self._old_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        self.tmpdir.cleanup()
+
+    def test_scope_normalization_and_hermes_subagent_permissions(self) -> None:
+        self.assertEqual(self.srv.normalize_scope(""), "shared")
+        self.assertEqual(self.srv.normalize_scope("career"), "career")
+        self.assertEqual(self.srv.normalize_scope("interview-prep"), "career")
+        self.assertEqual(self.srv.normalize_scope("projects/interview-prep"), "career")
+        self.assertEqual(self.srv.normalize_scope("embedded"), "career/embedded")
+        self.assertEqual(self.srv.normalize_scope("c"), "career/embedded/c")
+        self.assertEqual(self.srv.normalize_scope("linux"), "career/embedded/linux")
+        self.assertEqual(self.srv.normalize_scope("os"), "career/embedded/os")
+        self.assertEqual(self.srv.normalize_scope("system-design"), "career/embedded/system-design")
+        self.assertEqual(self.srv.normalize_scope("career/embedded/rtos-concurrency"), "career/embedded/rtos-concurrency")
+        self.assertEqual(self.srv.normalize_scope("company"), "career/company")
+        self.assertEqual(self.srv.normalize_scope("companies"), "career/company")
+        self.assertEqual(self.srv.normalize_scope("acme"), "career/company/acme")
+        self.assertEqual(self.srv.normalize_scope("acmee"), "career/company/acme")
+        self.assertEqual(self.srv.normalize_scope("career/companies/acmee"), "career/company/acme")
+        self.assertEqual(self.srv.normalize_scope("projects/System Design"), "projects/system-design")
+        self.assertEqual(self.srv.normalize_scope("claude"), "agents/claude")
+        self.assertEqual(self.srv.normalize_scope("agents/hermes"), "agents/hermes")
+        self.assertEqual(self.srv.normalize_scope("main"), "agents/default")
+        self.assertEqual(self.srv.normalize_scope("default"), "agents/default")
+        self.assertEqual(self.srv.normalize_scope("upgrade"), "agents/upgrade")
+        self.assertEqual(self.srv.normalize_scope("hermes/reviewer"), "agents/reviewer")
+        self.assertEqual(self.srv.normalize_scope("agents/gotchas"), "agents/gotchas")
+        self.assertNotIn("alien-x", self.srv.HERMES_SUBAGENTS)
+
+        # Everyone (including Hermes sub-agents) can write to career/*, shared, and projects/*
+        for actor in ("claude", "chatgpt", "hermes", "hermes/default", "hermes/upgrade", "hermes/reviewer", "antigravity", "owner"):
+            self.srv.check_write_permission(actor, "shared")
+            self.srv.check_write_permission(actor, "career")
+            self.srv.check_write_permission(actor, "career/embedded/linux")
+            self.srv.check_write_permission(actor, "career/company/acme")
+            self.srv.check_write_permission(actor, "projects/vynstack")
+
+        # External AI tools can write ONLY their own agents/<tool> scope
+        for actor in ("claude", "chatgpt", "antigravity"):
+            self.srv.check_write_permission(actor, f"agents/{actor}")
+
+        # Hermes sub-agents can write their own agents/<subagent> scope AND shared Hermes folders
+        self.srv.check_write_permission("hermes/default", "agents/default")
+        self.srv.check_write_permission("hermes/upgrade", "agents/upgrade")
+        self.srv.check_write_permission("hermes/upgrade", "agents/gotchas")
+        self.srv.check_write_permission("hermes/upgrade", "agents/decisions")
+        self.srv.check_write_permission("hermes/reviewer", "agents/reviewer")
+
+        # Cross-subagent and cross-agent write is strictly forbidden (403)
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("hermes/upgrade", "agents/reviewer")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("hermes/reviewer", "agents/upgrade")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("hermes/upgrade", "agents/claude")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("claude", "agents/upgrade")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("claude", "agents/gotchas")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("chatgpt", "agents/antigravity")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.check_write_permission("owner", "personal/goals")
+
+    def test_temporal_fact_validity_superseding_and_invalidation(self) -> None:
+        # 1. Claude records an interview weakness in career/embedded/system-design -> valid
+        f1_res = self.srv.op_remember_fact(
+            self.conn,
+            "claude",
+            scope="career/embedded/system-design",
+            category="weakness",
+            subject="Consistent Hashing",
+            fact="Needs practice on virtual nodes and rebalance bounds.",
+            supersede_subject=True,
+        )
+        f1 = f1_res["fact"]
+        self.assertEqual(f1["status"], "active")
+        self.assertEqual(f1["validity"], "valid")
+        self.assertTrue(f1["is_valid"])
+
+        # 2. ChatGPT later records strength on the same subject -> automatically marks f1 invalid (superseded)
+        f2_res = self.srv.op_remember_fact(
+            self.conn,
+            "chatgpt",
+            scope="career/embedded/system-design",
+            category="strength",
+            subject="Consistent Hashing",
+            fact="Mastered virtual nodes, K-log-N ring lookup, and bounded load.",
+            supersede_subject=True,
+        )
+        f2 = f2_res["fact"]
+        self.assertEqual(f2["status"], "active")
+        self.assertEqual(f2["validity"], "valid")
+        self.assertIn(f1["id"], f2_res["superseded_ids"])
+
+        # 3. Search with validity='valid' returns only f2; validity='invalid' returns f1
+        valid_only = self.srv.op_search(self.conn, query="Consistent", validity="valid")
+        self.assertEqual([x["id"] for x in valid_only["facts"]], [f2["id"]])
+
+        invalid_only = self.srv.op_search(self.conn, query="Consistent", validity="invalid")
+        self.assertEqual([x["id"] for x in invalid_only["facts"]], [f1["id"]])
+        self.assertFalse(invalid_only["facts"][0]["is_valid"])
+        self.assertEqual(invalid_only["facts"][0]["validity"], "invalid")
+        self.assertIsNotNone(invalid_only["facts"][0]["invalidated_at"])
+
+        # 4. Hermes sub-agent (upgrade) writes a fact to agents/upgrade and invalidates it with reason
+        fu_res = self.srv.op_remember_fact(
+            self.conn,
+            "hermes/upgrade",
+            scope="agents/upgrade",
+            category="decision",
+            subject="Chrome CDP Port",
+            fact="Use port 9222 for local debugging.",
+        )
+        fu = fu_res["fact"]
+        self.assertEqual(fu["scope"], "agents/upgrade")
+        self.assertEqual(fu["author"], "hermes/upgrade")
+
+        # Another Hermes sub-agent (reviewer) CANNOT invalidate upgrade's fact
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.op_forget_fact(self.conn, "hermes/reviewer", fact_id=fu["id"], reason="Wrong subagent")
+
+        # Upgrade CAN invalidate its own fact
+        inv_res = self.srv.op_forget_fact(
+            self.conn,
+            "hermes/upgrade",
+            fact_id=fu["id"],
+            reason="Port changed to 9223",
+            resolution="invalidated",
+        )
+        self.assertEqual(inv_res["status"], "invalidated")
+        self.assertEqual(inv_res["validity"], "invalid")
+        self.assertFalse(inv_res["fact"]["is_valid"])
+        self.assertEqual(inv_res["fact"]["invalidated_reason"], "Port changed to 9223")
+
+    def test_unified_vault_indexing_graph_links_and_personal_exclusion(self) -> None:
+        # 1. Existing Obsidian vault files (e.g. agents/gotchas/, business/) are indexed, while personal/ is skipped
+        gotcha_file = self.vault_dir / "agents/gotchas/docker-dns-timeout.md"
+        gotcha_file.parent.mkdir(parents=True, exist_ok=True)
+        gotcha_file.write_text(
+            "---\ntype: gotcha\nsymptom: Container DNS lookup hangs\nagent: upgrade\n---\n\n# Docker DNS Timeout\n\nCheck `/etc/resolv.conf`.\n",
+            encoding="utf-8",
+        )
+        personal_file = self.vault_dir / "personal/goals/private-goal.md"
+        personal_file.parent.mkdir(parents=True, exist_ok=True)
+        personal_file.write_text("# Strictly Private Goal\n\nSecret personal note.\n", encoding="utf-8")
+
+        search_gotcha = self.srv.op_search(self.conn, query="resolv")
+        self.assertTrue(any("agents/gotchas/docker-dns-timeout.md" == n["path"] for n in search_gotcha["notes"]))
+
+        search_personal = self.srv.op_search(self.conn, query="Strictly Private")
+        self.assertEqual(len(search_personal["notes"]), 0)
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.op_read_note(self.conn, "personal/goals/private-goal.md")
+
+        # 2. Create a study note with Basic-Memory-style inline observations, relations, and [[wikilink]]
+        self.srv.op_write_note(
+            self.conn,
+            "antigravity",
+            path="career/embedded/system-design/System-Design-Notes.md",
+            title="System Design Notes",
+            content=(
+                "## Observations\n\n"
+                "- [weakness] Forgot bounded-load consistent hashing tradeoff #caching #ring\n"
+                "- [decision] Always clarify read:write ratio in first 2 minutes #framework\n\n"
+                "## Relations\n\n"
+                "- part_of [[00-Read-Before-Interview]]\n"
+                "- relates_to [[agents/gotchas/docker-dns-timeout]]\n"
+            ),
+            mode="replace",
+            tags=["interview", "system-design"],
+        )
+
+        note = self.srv.op_read_note(self.conn, "career/embedded/system-design/System-Design-Notes.md")
+        self.assertEqual(note["scope"], "career/embedded/system-design")
+        self.assertIn("00-read-before-interview", note["outgoing_links"])
+        self.assertTrue(any(r["relation"] == "part_of" for r in note["relations"]))
+        self.assertEqual(len(note["observations"]), 2)
+        self.assertEqual(note["observations"][0]["category"], "weakness")
+        self.assertIn("caching", note["observations"][0]["tags"])
+
+        # 1-hop connected note summary includes both linked notes
+        connected_paths = [c["path"] for c in note["connected_notes"]]
+        self.assertIn("career/00-Read-Before-Interview.md", connected_paths)
+        self.assertIn("agents/gotchas/docker-dns-timeout.md", connected_paths)
+
+        # 3. Search inline observations by category and query
+        obs_search = self.srv.op_search(self.conn, query="bounded-load", category="weakness")
+        self.assertEqual(len(obs_search["observations"]), 1)
+        self.assertEqual(obs_search["observations"][0]["source_path"], "career/embedded/system-design/System-Design-Notes.md")
+
+        # 4. Multi-hop context builder (op_build_context)
+        ctx = self.srv.op_build_context(self.conn, "career/embedded/system-design/System-Design-Notes.md", depth=1)
+        self.assertEqual(ctx["root_note"]["path"], "career/embedded/system-design/System-Design-Notes.md")
+        self.assertEqual(len(ctx["connected_notes"]), 2)
+        self.assertGreaterEqual(len(ctx["inline_observations"]), 2)
+
+        # 5. Confluence-style knowledge base, TOC outline, breadcrumbs & human-readable math assertions
+        dash_html = self.srv.render_dashboard_page(
+            self.conn,
+            "owner",
+            selected_note="career/company/README.md",
+            scope_filter="career",
+        )
+        self.assertIn('class="mobile-tabs"', dash_html)
+        self.assertIn('id="tab-reader"', dash_html)
+        self.assertIn('class="scope-strip"', dash_html)
+        self.assertIn('class="table-wrap"', dash_html)
+        self.assertIn('class="tree-group"', dash_html)
+        self.assertIn('class="toc-nav"', dash_html)
+        self.assertIn('class="breadcrumbs"', dash_html)
+
+        md_rendered = self.srv.render_markdown_html(
+            "# Power Budgets\n\n## Sleep Modes\n\nCompare ($\\mu$A sleep vs wall power) and $2^{16}$ with $\\approx 130\\text{ us}$.\n\n1. First step\n2. Second step\n"
+        )
+        self.assertIn("(µA sleep vs wall power)", md_rendered)
+        self.assertNotIn("\\mu", md_rendered)
+        self.assertIn("2¹⁶", md_rendered)
+        self.assertIn("≈ 130 us", md_rendered)
+        self.assertIn("<ol>", md_rendered)
+        self.assertIn('id="sec-2-sleep-modes"', md_rendered)
+        toc = self.srv.extract_toc_headings("# Power Budgets\n\n## Sleep Modes\n\n### Deep Sleep\n")
+        self.assertEqual(len(toc), 2)
+        self.assertEqual(toc[0]["id"], "sec-2-sleep-modes")
+        self.assertEqual(toc[1]["id"], "sec-3-deep-sleep")
+
+    def test_http_mcp_subagent_header_and_oauth(self) -> None:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # 1. Hermes sub-agent header refines actor to hermes/upgrade
+            req_upg = urllib.request.Request(
+                f"{base}/api/v1/briefing",
+                headers={
+                    "Authorization": "Bearer tok-hermes-test",
+                    "X-Hermes-Subagent": "upgrade",
+                },
+            )
+            with urllib.request.urlopen(req_upg) as resp:
+                brief = json.loads(resp.read().decode())
+                self.assertEqual(brief["authenticated_actor"], "hermes/upgrade")
+                self.assertIn("agents/upgrade", brief["permissions"]["writable_scopes"])
+
+            # 2. Hermes sub-agent upgrade trying to write to agents/reviewer over HTTP returns 403
+            bad_write = urllib.request.Request(
+                f"{base}/api/v1/remember",
+                data=json.dumps({
+                    "scope": "agents/reviewer",
+                    "fact": "Should be rejected",
+                }).encode(),
+                headers={
+                    "Authorization": "Bearer tok-hermes-test",
+                    "X-Hermes-Subagent": "upgrade",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(bad_write)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # 3. MCP Streamable HTTP via URL token (/s/<token>/mcp)
+            mcp_url = f"{base}/s/tok-claude-test/mcp"
+            call_ok = urllib.request.Request(
+                mcp_url,
+                data=json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 2,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory_remember_fact",
+                        "arguments": {
+                            "scope": "agents/claude",
+                            "category": "progress",
+                            "subject": "Mock Session #1",
+                            "fact": "Completed 45-minute distributed cache design.",
+                        },
+                    },
+                }).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(call_ok) as resp:
+                res_ok = json.loads(resp.read().decode())
+                self.assertFalse(res_ok["result"]["isError"])
+
+            # 4. OAuth 2.1 + PKCE flow
+            verifier = "test-pkce-verifier-string-1234567890"
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            auth_form = urllib.parse.urlencode({
+                "client_id": "claude-web",
+                "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+                "state": "xyz123",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "token": "tok-claude-test",
+            }).encode()
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            opener = urllib.request.build_opener(NoRedirect)
+            auth_req = urllib.request.Request(f"{base}/oauth/authorize", data=auth_form, method="POST")
+            try:
+                opener.open(auth_req)
+                self.fail("Expected 302 redirect")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 302)
+                loc = e.headers["Location"]
+                e.close()
+            parsed_loc = urllib.parse.urlparse(loc)
+            qs = urllib.parse.parse_qs(parsed_loc.query)
+            code = qs["code"][0]
+
+            token_form = urllib.parse.urlencode({
+                "grant_type": "authorization_code",
+                "code": code,
+                "code_verifier": verifier,
+            }).encode()
+            tok_req = urllib.request.Request(f"{base}/oauth/token", data=token_form, method="POST")
+            with urllib.request.urlopen(tok_req) as resp:
+                tok_data = json.loads(resp.read().decode())
+                access_token = tok_data["access_token"]
+
+            rest_req = urllib.request.Request(
+                f"{base}/api/v1/briefing?scope=agents/claude",
+                headers={"Authorization": f"Bearer {access_token}"},
+            )
+            with urllib.request.urlopen(rest_req) as resp:
+                brief = json.loads(resp.read().decode())
+                self.assertEqual(brief["authenticated_actor"], "claude")
+                self.assertEqual(len(brief["agent_specific_facts"]["agents/claude"]), 1)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_security_audit_hardening(self) -> None:
+        # 1. Sub-agent privilege override blocked & bare 'hermes' blocked from agents/<subagent>
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.normalize_actor("hermes/upgrade", "reviewer")
+        self.assertFalse(self.srv.can_write("hermes", "agents/reviewer"))
+        self.assertTrue(self.srv.can_write("hermes", "agents/hermes"))
+        self.assertTrue(self.srv.can_write("hermes", "agents/gotchas"))
+
+        # 2. Symlink escape to personal/ or outside vault rejected by sync, read, and write
+        personal_dir = self.vault_dir / "personal"
+        personal_dir.mkdir(parents=True, exist_ok=True)
+        secret_file = personal_dir / "private.md"
+        secret_file.write_text("# Top Secret Personal Note\n", encoding="utf-8")
+
+        shared_dir = self.vault_dir / "shared"
+        shared_dir.mkdir(parents=True, exist_ok=True)
+        symlink_note = shared_dir / "leak.md"
+        symlink_note.symlink_to(secret_file)
+
+        self.srv.sync_vault_notes(self.conn)
+        indexed_paths = [n["path"] for n in self.srv.op_list_notes(self.conn)["notes"]]
+        self.assertNotIn("shared/leak.md", indexed_paths)
+
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.op_write_note(
+                self.conn,
+                "claude",
+                path="shared/leak.md",
+                content="Attempted overwrite via symlink",
+            )
+        self.assertEqual(secret_file.read_text(encoding="utf-8"), "# Top Secret Personal Note\n")
+        symlink_note.unlink()
+
+        # 3. Frontmatter scope spoofing ignored; scope derived from canonical vault directory
+        biz_dir = self.vault_dir / "business"
+        biz_dir.mkdir(parents=True, exist_ok=True)
+        spoof_file = biz_dir / "spoofed.md"
+        spoof_file.write_text(
+            "---\ntitle: Spoofed\nscope: shared\n---\n\n# Spoofed Scope\n",
+            encoding="utf-8",
+        )
+        self.srv.sync_vault_notes(self.conn)
+        spoof_meta = self.srv.op_read_note(self.conn, "business/spoofed.md")
+        self.assertEqual(spoof_meta["scope"], "business")
+
+        # 4. HTTP-level security checks (XSS, Cookie CSRF isolation, OAuth open redirect & PKCE, 413 body limit)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # 4a. Valid /s/<token>/ dashboard sets __Host- cookie and CSP headers
+            dash_req = urllib.request.Request(f"{base}/s/tok-owner-test/")
+            with urllib.request.urlopen(dash_req) as resp:
+                html_body = resp.read().decode()
+                csp = resp.headers.get("Content-Security-Policy", "")
+                set_cookie = resp.headers.get("Set-Cookie", "")
+                self.assertIn("default-src 'none'", csp)
+                self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
+                self.assertIn("__Host-vyn_memory_token=vms_", set_cookie)
+                self.assertIn("SameSite=Lax", set_cookie)
+                self.assertIn("HttpOnly", set_cookie)
+                self.assertIn('action="/s/tok-owner-test/"', html_body)
+
+            # 4b. Crafted /s/<invalid-xss-payload>/ URL does NOT fall back to valid cookie (returns 401 JSON)
+            xss_path = urllib.parse.quote('"><script>alert(1)</script>', safe="")
+            xss_req = urllib.request.Request(
+                f"{base}/s/{xss_path}/",
+                headers={"Cookie": "__Host-vyn_memory_token=tok-owner-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(xss_req)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            # 4c. Ambient browser cookie is rejected on POST /api/v1/remember and GET /api/v1/briefing (CSRF protection)
+            csrf_post = urllib.request.Request(
+                f"{base}/api/v1/remember",
+                data=json.dumps({"scope": "shared", "fact": "CSRF attempt"}).encode(),
+                headers={
+                    "Cookie": "__Host-vyn_memory_token=tok-owner-test",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(csrf_post)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            csrf_get_api = urllib.request.Request(
+                f"{base}/api/v1/briefing",
+                headers={"Cookie": "__Host-vyn_memory_token=tok-owner-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(csrf_get_api)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            # 4d. Sub-agent override via JSON body when X-Hermes-Subagent is set returns 403
+            override_req = urllib.request.Request(
+                f"{base}/api/v1/remember",
+                data=json.dumps({
+                    "subagent": "reviewer",
+                    "scope": "agents/reviewer",
+                    "fact": "Attempted horizontal sub-agent override",
+                }).encode(),
+                headers={
+                    "Authorization": "Bearer tok-hermes-test",
+                    "X-Hermes-Subagent": "upgrade",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(override_req)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # 4e. OAuth authorize CSP omits form-action 'self' so Chrome allows 302 redirects to redirect_uri
+            valid_challenge = base64.urlsafe_b64encode(hashlib.sha256(b"x" * 43).digest()).decode().rstrip("=")
+            oauth_get_ok = urllib.request.Request(
+                f"{base}/oauth/authorize?client_id=vyn-mcp-test&redirect_uri={urllib.parse.quote('http://127.0.0.1:59631/callback/abc', safe='')}&code_challenge={valid_challenge}&code_challenge_method=S256"
+            )
+            with urllib.request.urlopen(oauth_get_ok) as resp:
+                oauth_csp = resp.headers.get("Content-Security-Policy", "")
+                self.assertIn("default-src 'none'", oauth_csp)
+                self.assertNotIn("form-action 'self'", oauth_csp)
+
+            # 4f. Browser GET /s/<owner_token>/?scope=career with Accept: text/html returns 303 to clean /?scope=career
+            class NoRedirectLocal(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            no_redir_opener = urllib.request.build_opener(NoRedirectLocal)
+            browser_tok_req = urllib.request.Request(
+                f"{base}/s/tok-owner-test/?scope=career",
+                headers={"Accept": "text/html,application/xhtml+xml"},
+            )
+            try:
+                no_redir_opener.open(browser_tok_req)
+                self.fail("Expected 303 See Other stripping token from URL")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 303)
+                self.assertEqual(e.headers.get("Location"), "/?scope=career")
+                self.assertIn("__Host-vyn_memory_token=", e.headers.get("Set-Cookie", ""))
+                e.close()
+
+            # 4g. POST /login sets __Host- cookie and redirects to /?scope=career; agent tokens get 403 on GET /
+            login_req = urllib.request.Request(
+                f"{base}/login",
+                data=urllib.parse.urlencode({"token": "tok-owner-test", "next": "/?scope=career"}).encode(),
+                method="POST",
+            )
+            try:
+                no_redir_opener.open(login_req)
+                self.fail("Expected 303 redirect on /login")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 303)
+                self.assertEqual(e.headers.get("Location"), "/?scope=career")
+                self.assertIn("__Host-vyn_memory_token=", e.headers.get("Set-Cookie", ""))
+                e.close()
+
+            agent_dash_req = urllib.request.Request(
+                f"{base}/",
+                headers={"Cookie": "__Host-vyn_memory_token=tok-chatgpt-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(agent_dash_req)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # 4h. OAuth open redirect (non-HTTPS / non-loopback or javascript:) and missing PKCE rejected with 400
+            bad_oauth_get = urllib.request.Request(
+                f"{base}/oauth/authorize?client_id=x&redirect_uri=http://evil.example.com/cb&code_challenge=abc"
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(bad_oauth_get)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+
+            no_pkce_post = urllib.request.Request(
+                f"{base}/oauth/authorize",
+                data=urllib.parse.urlencode({
+                    "client_id": "claude-web",
+                    "redirect_uri": "https://claude.ai/api/mcp/auth_callback",
+                    "token": "tok-claude-test",
+                }).encode(),
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(no_pkce_post)
+            self.assertEqual(ctx.exception.code, 400)
+            ctx.exception.close()
+
+            # 4i. Pre-auth oversized Content-Length rejected with 413 before reading body
+            import http.client
+            conn_http = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn_http.putrequest("POST", "/oauth/token")
+            conn_http.putheader("Content-Type", "application/x-www-form-urlencoded")
+            conn_http.putheader("Content-Length", str(10 * 1024 * 1024))
+            conn_http.endheaders()
+            resp_413 = conn_http.getresponse()
+            self.assertEqual(resp_413.status, 413)
+            resp_413.read()
+            conn_http.close()
+
+            # 4j. Per-IP brute-force rate limiting returns 429 after MAX_AUTH_FAILURES_PER_WINDOW failed attempts
+            self.srv._clear_auth_failures("127.0.0.1")
+            for _ in range(self.srv.MAX_AUTH_FAILURES_PER_WINDOW):
+                bad_tok_req = urllib.request.Request(
+                    f"{base}/api/v1/briefing",
+                    headers={"Authorization": "Bearer wrong-token-guess"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(bad_tok_req)
+                self.assertEqual(ctx.exception.code, 401)
+                ctx.exception.close()
+            rate_limited_req = urllib.request.Request(
+                f"{base}/api/v1/briefing",
+                headers={"Authorization": "Bearer tok-owner-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(rate_limited_req)
+            self.assertEqual(ctx.exception.code, 429)
+            ctx.exception.close()
+            self.srv._clear_auth_failures("127.0.0.1")
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_public_deployment_defaults(self) -> None:
+        # An Omni session counts as owner only for an email listed in MEMORY_ADMIN_EMAILS.
+        sess = self.srv._mint_web_session(self.conn, "owner@example.com")
+        self.assertEqual(self.srv.resolve_actor_from_token(sess, self.conn), "owner")
+        os.environ["MEMORY_ADMIN_EMAILS"] = ""
+        self.srv.MEMORY_ADMIN_EMAILS = set()
+        self.assertIsNone(self.srv.resolve_actor_from_token(sess, self.conn))
+        # CF-Connecting-IP is trusted only behind Cloudflare.
+        hdrs = {"CF-Connecting-IP": "203.0.113.9"}
+        self.assertEqual(self.srv._client_ip(hdrs, ("10.0.0.2", 1)), "10.0.0.2")
+        os.environ["MEMORY_BEHIND_CLOUDFLARE"] = "1"
+        try:
+            self.assertEqual(self.srv._client_ip(hdrs, ("10.0.0.2", 1)), "203.0.113.9")
+        finally:
+            os.environ.pop("MEMORY_BEHIND_CLOUDFLARE")
+        # Aliases can never route a path into personal/.
+        self.srv.SCOPE_ALIASES["secret"] = "personal"
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.normalize_note_path("secret/x.md")
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.normalize_scope("secret")
+
+    def test_omni_sso_login_oauth_session_and_refresh_token(self) -> None:
+        os.environ["MEMORY_ADMIN_EMAILS"] = "owner@example.com"
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+
+        class NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):
+                return None
+
+        no_redir = urllib.request.build_opener(NoRedirect)
+        orig_exchange = self.srv.exchange_omni_handoff
+        try:
+            # 1. Start Omni SSO flow -> 303 redirect to omni.example.com/hub/signin?state=memory_...
+            try:
+                no_redir.open(f"{base}/auth/start?next=%2F%3Fscope%3Dcareer")
+                self.fail("Expected 303 redirect from /auth/start")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 303)
+                loc = e.headers.get("Location", "")
+                set_cookie = e.headers.get("Set-Cookie", "")
+                e.close()
+            self.assertIn("/hub/signin?state=memory_", loc)
+            state_val = urllib.parse.parse_qs(urllib.parse.urlsplit(loc).query)["state"][0]
+            self.assertIn(state_val, set_cookie)
+
+            # 2. Non-admin member returned by Omni is rejected with 403
+            self.srv.exchange_omni_handoff = lambda code: {
+                "email": "member@example.com",
+                "is_admin": False,
+                "active_access": True,
+            }
+            cb_nonadmin = urllib.request.Request(
+                f"{base}/auth/callback?code=code-member&state={state_val}",
+                headers={"Cookie": f"__Host-vyn_memory_state={state_val}"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                no_redir.open(cb_nonadmin)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # 3. Start again and complete callback as owner@example.com (is_admin=True)
+            try:
+                no_redir.open(f"{base}/auth/start?next=%2F%3Fscope%3Dcareer")
+                self.fail("Expected 303 redirect from /auth/start")
+            except urllib.error.HTTPError as e:
+                loc2 = e.headers.get("Location", "")
+                e.close()
+            state2 = urllib.parse.parse_qs(urllib.parse.urlsplit(loc2).query)["state"][0]
+            self.srv.exchange_omni_handoff = lambda code: {
+                "email": "owner@example.com",
+                "is_admin": True,
+                "active_access": False,
+            }
+            cb_owner = urllib.request.Request(
+                f"{base}/auth/callback?code=code-owner&state={state2}",
+                headers={"Cookie": f"__Host-vyn_memory_state={state2}"},
+            )
+            try:
+                no_redir.open(cb_owner)
+                self.fail("Expected 303 redirect from /auth/callback")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 303)
+                self.assertEqual(e.headers.get("Location"), "/?scope=career")
+                cookies = e.headers.get_all("Set-Cookie") or []
+                e.close()
+            sess_cookie_hdr = next(c for c in cookies if "vyn_memory_token=vms_" in c)
+            sess_tok = sess_cookie_hdr.split("vyn_memory_token=", 1)[1].split(";", 1)[0]
+            self.assertTrue(sess_tok.startswith("vms_"))
+
+            # 4. Owner session cookie grants access to GET / dashboard
+            dash_req = urllib.request.Request(
+                f"{base}/?scope=career",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}", "Accept": "text/html"},
+            )
+            with urllib.request.urlopen(dash_req) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertIn("Vyn Unified Obsidian Vault", resp.read().decode())
+
+            # 5. One-click OAuth 2.1 approval using Omni session cookie (omni_session=1, role=chatgpt)
+            import re as _re
+            verifier = "omni-pkce-verifier-string-1234567890-abcdef"
+            challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
+            oauth_get = urllib.request.Request(
+                f"{base}/oauth/authorize?response_type=code&client_id=chatgpt-web"
+                f"&redirect_uri={urllib.parse.quote('https://chatgpt.com/connector_platform_oauth_redirect', safe='')}"
+                f"&state=st99&code_challenge={challenge}&code_challenge_method=S256",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}"},
+            )
+            with urllib.request.urlopen(oauth_get) as resp:
+                html_oauth = resp.read().decode()
+                self.assertIn("Omni Owner Session", html_oauth)
+                self.assertIn('value="chatgpt" selected', html_oauth)
+            m_csrf = _re.search(r'name="csrf_token"\s+value="([^"]+)"', html_oauth)
+            self.assertIsNotNone(m_csrf)
+            oauth_csrf = m_csrf.group(1) if m_csrf else ""
+
+            # 5a. OAuth omni_session=1 without csrf_token or from Sec-Fetch-Site: same-site is rejected with 401
+            oauth_no_csrf = urllib.request.Request(
+                f"{base}/oauth/authorize",
+                data=urllib.parse.urlencode({
+                    "client_id": "chatgpt-web",
+                    "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
+                    "state": "st99",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "omni_session": "1",
+                    "role": "chatgpt",
+                }).encode(),
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_nc:
+                no_redir.open(oauth_no_csrf)
+            self.assertEqual(ctx_nc.exception.code, 401)
+            ctx_nc.exception.close()
+
+            oauth_same_site = urllib.request.Request(
+                f"{base}/oauth/authorize",
+                data=urllib.parse.urlencode({
+                    "client_id": "chatgpt-web",
+                    "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
+                    "state": "st99",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "omni_session": "1",
+                    "csrf_token": oauth_csrf,
+                    "role": "chatgpt",
+                }).encode(),
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Sec-Fetch-Site": "same-site",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_ss:
+                no_redir.open(oauth_same_site)
+            self.assertEqual(ctx_ss.exception.code, 401)
+            ctx_ss.exception.close()
+
+            self.srv._clear_auth_failures("127.0.0.1")
+            oauth_post = urllib.request.Request(
+                f"{base}/oauth/authorize",
+                data=urllib.parse.urlencode({
+                    "client_id": "chatgpt-web",
+                    "redirect_uri": "https://chatgpt.com/connector_platform_oauth_redirect",
+                    "state": "st99",
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                    "omni_session": "1",
+                    "csrf_token": oauth_csrf,
+                    "role": "chatgpt",
+                }).encode(),
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Sec-Fetch-Site": "same-origin",
+                },
+                method="POST",
+            )
+            try:
+                no_redir.open(oauth_post)
+                self.fail("Expected 302 redirect on OAuth approval")
+            except urllib.error.HTTPError as e:
+                self.assertEqual(e.code, 302)
+                oauth_loc = e.headers.get("Location", "")
+                e.close()
+            oauth_code = urllib.parse.parse_qs(urllib.parse.urlsplit(oauth_loc).query)["code"][0]
+
+            # 6. Exchange authorization_code -> access_token + refresh_token, then rotate via grant_type=refresh_token
+            tok_req = urllib.request.Request(
+                f"{base}/oauth/token",
+                data=urllib.parse.urlencode({
+                    "grant_type": "authorization_code",
+                    "code": oauth_code,
+                    "code_verifier": verifier,
+                    "client_id": "chatgpt-web",
+                }).encode(),
+                method="POST",
+            )
+            with urllib.request.urlopen(tok_req) as resp:
+                tok_res = json.loads(resp.read().decode())
+            access_1 = tok_res["access_token"]
+            refresh_1 = tok_res["refresh_token"]
+            self.assertEqual(self.srv.resolve_actor_from_token(access_1, self.conn), "chatgpt")
+
+            refresh_req = urllib.request.Request(
+                f"{base}/oauth/token",
+                data=urllib.parse.urlencode({
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_1,
+                    "client_id": "chatgpt-web",
+                }).encode(),
+                method="POST",
+            )
+            with urllib.request.urlopen(refresh_req) as resp:
+                ref_res = json.loads(resp.read().decode())
+            access_2 = ref_res["access_token"]
+            self.assertNotEqual(access_1, access_2)
+            self.assertIsNone(self.srv.resolve_actor_from_token(access_1, self.conn))
+            self.assertEqual(self.srv.resolve_actor_from_token(access_2, self.conn), "chatgpt")
+
+            # 6b. Revoking email from MEMORY_ADMIN_EMAILS immediately invalidates active web_sessions for that email
+            os.environ["MEMORY_ADMIN_EMAILS"] = "other-admin@example.com"
+            self.assertIsNone(self.srv.resolve_actor_from_token(sess_tok, self.conn))
+            os.environ["MEMORY_ADMIN_EMAILS"] = "owner@example.com"
+            self.assertEqual(self.srv.resolve_actor_from_token(sess_tok, self.conn), "owner")
+
+            # 7. Cross-site or prefetch GET /logout is ignored (400) without revoking session; same-origin GET /logout revokes it
+            cross_logout = urllib.request.Request(
+                f"{base}/logout",
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_cl:
+                urllib.request.urlopen(cross_logout)
+            self.assertEqual(ctx_cl.exception.code, 400)
+            ctx_cl.exception.close()
+            self.assertEqual(self.srv.resolve_actor_from_token(sess_tok, self.conn), "owner")
+
+            logout_req = urllib.request.Request(
+                f"{base}/logout",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}"},
+            )
+            with urllib.request.urlopen(logout_req) as resp:
+                self.assertEqual(resp.status, 200)
+            self.assertIsNone(self.srv.resolve_actor_from_token(sess_tok, self.conn))
+        finally:
+            self.srv.exchange_omni_handoff = orig_exchange
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_pdf_and_docx_indexing_upload_and_download(self) -> None:
+        import io
+        import zipfile
+        import zlib
+
+        # 1. Build a valid .docx archive in memory (Heading1 + paragraph + table)
+        docx_buf = io.BytesIO()
+        doc_xml = (
+            '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+            '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+            "<w:body>"
+            '<w:p><w:pPr><w:pStyle w:val="Heading1"/></w:pPr><w:r><w:t>Sample Resume 2026</w:t></w:r></w:p>'
+            "<w:p><w:r><w:t>Example engineer working on storage drivers.</w:t></w:r></w:p>"
+            "<w:tbl>"
+            "<w:tr><w:tc><w:p><w:r><w:t>Company</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>Domain</w:t></w:r></w:p></w:tc></w:tr>"
+            "<w:tr><w:tc><w:p><w:r><w:t>Example Corp</w:t></w:r></w:p></w:tc><w:tc><w:p><w:r><w:t>BSP &amp; IOMMU</w:t></w:r></w:p></w:tc></w:tr>"
+            "</w:tbl>"
+            "</w:body></w:document>"
+        )
+        with zipfile.ZipFile(docx_buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("word/document.xml", doc_xml)
+        docx_bytes = docx_buf.getvalue()
+
+        # 2. Build a valid .pdf with a FlateDecode content stream
+        stream_raw = b"BT /F1 12 Tf 72 720 Td (Linux Kernel XylographyDMA77 Coherency Textbook) Tj ET"
+        stream_compressed = zlib.compress(stream_raw)
+        pdf_bytes = (
+            b"%PDF-1.4\n"
+            b"1 0 obj << /Type /Catalog /Pages 2 0 R >> endobj\n"
+            b"2 0 obj << /Type /Pages /Kids [3 0 R] /Count 1 >> endobj\n"
+            b"3 0 obj << /Type /Page /Parent 2 0 R /Contents 4 0 R >> endobj\n"
+            b"4 0 obj << /Length " + str(len(stream_compressed)).encode() + b" /Filter /FlateDecode >>\nstream\n"
+            + stream_compressed
+            + b"\nendstream\nendobj\n%%EOF\n"
+        )
+
+        # Drop the PDF directly into vault/resources/books/ and verify auto-sync + scope isolation
+        books_dir = self.vault_dir / "resources/books"
+        books_dir.mkdir(parents=True, exist_ok=True)
+        (books_dir / "linux-dma-book.pdf").write_bytes(pdf_bytes)
+
+        career_search = self.srv.op_search(self.conn, query="XylographyDMA77", scope="career")
+        self.assertEqual(len(career_search["notes"]), 0)
+
+        books_search = self.srv.op_search(self.conn, query="XylographyDMA77", scope="resources/books")
+        self.assertEqual(len(books_search["notes"]), 1)
+        self.assertEqual(books_search["notes"][0]["path"], "resources/books/linux-dma-book.pdf")
+
+        pdf_note = self.srv.op_read_note(self.conn, "resources/books/linux-dma-book.pdf")
+        self.assertIn("Linux Kernel XylographyDMA77 Coherency Textbook", pdf_note["content"])
+
+        # 3. Upload .docx via POST /api/v1/upload (Base64) and verify table + text extraction
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            up_req = urllib.request.Request(
+                f"{base}/api/v1/upload",
+                data=json.dumps({
+                    "filename": "Sample-Resume-2026.docx",
+                    "base64_content": base64.b64encode(docx_bytes).decode("ascii"),
+                    "scope": "career",
+                    "title": "Sample Resume 2026 (DOCX)",
+                    "tags": ["resume", "docx"],
+                }).encode("utf-8"),
+                headers={
+                    "Authorization": "Bearer tok-chatgpt-test",
+                    "Content-Type": "application/json",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(up_req) as resp:
+                up_res = json.loads(resp.read().decode())
+            self.assertEqual(up_res["status"], "uploaded")
+            self.assertEqual(up_res["path"], "career/Sample-Resume-2026.docx")
+            self.assertEqual(up_res["scope"], "career")
+
+            docx_note = self.srv.op_read_note(self.conn, "career/Sample-Resume-2026.docx")
+            self.assertIn("Example engineer working on storage drivers", docx_note["content"])
+            self.assertIn("| Example Corp | BSP & IOMMU |", docx_note["content"])
+
+            # 4. Browser multipart/form-data POST /upload and GET /download with owner session cookie + CSRF token
+            sess_tok = self.srv._mint_web_session(self.conn, "owner@example.com")
+            csrf_tok = self.srv._mint_upload_csrf()
+            boundary = "----VynTestBoundary987654"
+            mp_body = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="csrf_token"\r\n\r\n'
+                f"{csrf_tok}\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="scope"\r\n\r\n'
+                "career/embedded/linux\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="title"\r\n\r\n'
+                "Browser Uploaded PDF\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="kernel-slides.pdf"\r\n'
+                "Content-Type: application/pdf\r\n\r\n"
+            ).encode("utf-8") + pdf_bytes + f"\r\n--{boundary}--\r\n".encode("utf-8")
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            no_redir = urllib.request.build_opener(NoRedirect)
+            mp_req = urllib.request.Request(
+                f"{base}/upload",
+                data=mp_body,
+                headers={
+                    "Cookie": f"cf_clearance=weird[val]; vyn_memory_token=stale-old-token; __Host-vyn_memory_token={sess_tok}",
+                    "Origin": "null",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                method="POST",
+            )
+            try:
+                no_redir.open(mp_req)
+                self.fail("Expected 303 redirect after browser upload")
+            except urllib.error.HTTPError as e:
+                loc_val = e.headers.get("Location", "")
+                e.close()
+                self.assertEqual(e.code, 303)
+                self.assertIn("note=career/embedded/linux/kernel-slides.pdf", loc_val)
+
+            # 4a. Cookie-authenticated POST /upload WITHOUT csrf_token is rejected with 403
+            mp_no_csrf = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="scope"\r\n\r\n'
+                "career/embedded/linux\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="no-csrf.md"\r\n'
+                "Content-Type: text/markdown\r\n\r\n"
+                "# Missing CSRF\n"
+                f"\r\n--{boundary}--\r\n"
+            ).encode("utf-8")
+            mp_no_csrf_req = urllib.request.Request(
+                f"{base}/upload",
+                data=mp_no_csrf,
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_nc2:
+                no_redir.open(mp_no_csrf_req)
+            self.assertEqual(ctx_nc2.exception.code, 403)
+            ctx_nc2.exception.close()
+
+            # 4b. Unauthenticated or logged-out POST /upload is rejected with 401 before reading body even if csrf_token is present
+            mp_csrf_body = (
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="csrf_token"\r\n\r\n'
+                f"{csrf_tok}\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="scope"\r\n\r\n'
+                "career/embedded/linux\r\n"
+                f"--{boundary}\r\n"
+                'Content-Disposition: form-data; name="file"; filename="csrf-uploaded.md"\r\n'
+                "Content-Type: text/markdown\r\n\r\n"
+                "# Uploaded without session cookie\n"
+                f"\r\n--{boundary}--\r\n"
+            ).encode("utf-8")
+            mp_csrf_req = urllib.request.Request(
+                f"{base}/upload",
+                data=mp_csrf_body,
+                headers={
+                    "Origin": "null",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                no_redir.open(mp_csrf_req)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+
+            # 4c. Cross-origin or spoofed X-Forwarded-Host POST /upload is rejected with 401 even if session cookie is present
+            cross_req = urllib.request.Request(
+                f"{base}/upload",
+                data=mp_body,
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess_tok}",
+                    "Origin": "https://evil.example.com",
+                    "X-Forwarded-Host": "evil.example.com",
+                    "Content-Type": f"multipart/form-data; boundary={boundary}",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                no_redir.open(cross_req)
+            self.assertEqual(ctx.exception.code, 401)
+            ctx.exception.close()
+            self.srv._clear_auth_failures("127.0.0.1")
+
+            # 4d. Verify GET /download returns the exact original PDF bytes + sandbox CSP & X-Frame-Options for owner
+            dl_req = urllib.request.Request(
+                f"{base}/download?path=career/embedded/linux/kernel-slides.pdf",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}"},
+            )
+            with urllib.request.urlopen(dl_req) as resp:
+                self.assertEqual(resp.status, 200)
+                self.assertEqual(resp.headers.get("Content-Type"), "application/pdf")
+                self.assertEqual(resp.headers.get("Content-Security-Policy"), "default-src 'none'; sandbox")
+                self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
+                self.assertEqual(resp.read(), pdf_bytes)
+
+            # Verify SQL LIKE wildcard in op_read_note does not enumerate vault paths
+            with self.assertRaises(self.srv.MemoryError) as ctx_wild:
+                self.srv.op_read_note(self.conn, "%.md")
+            self.assertIn("not found", str(ctx_wild.exception))
+            self.assertNotIn("Ambiguous note name", str(ctx_wild.exception))
+
+            # 4e. Spoofed PDF/DOCX without magic bytes are rejected, and _extract_pdf_text_stdlib bounds decompression
+            with self.assertRaises(self.srv.MemoryError):
+                self.srv.op_upload_document(
+                    self.conn,
+                    "chatgpt",
+                    filename="spoofed.pdf",
+                    raw_bytes=b"<html><script>alert(1)</script></html>",
+                    scope="career",
+                )
+            with self.assertRaises(self.srv.MemoryError):
+                self.srv.op_upload_document(
+                    self.conn,
+                    "chatgpt",
+                    filename="spoofed.docx",
+                    raw_bytes=b"not-a-zip-archive",
+                    scope="career",
+                )
+            big_stream = zlib.compress(b"BT (" + (b"A" * (6 * 1024 * 1024)) + b") Tj ET", level=9)
+            bounded_out = self.srv._extract_pdf_text_stdlib(
+                b"%PDF-1.4\n1 0 obj\n<<>>\nstream\n" + big_stream + b"\nendstream\nendobj\n%%EOF",
+                max_chars=50_000,
+            )
+            self.assertLessEqual(len(bounded_out), 50_000)
+
+            # 4f. Unscoped op_search excludes resources/books, while explicit scope="resources/books" includes it, and agents can upload to resources/books
+            unscoped_book_hit = self.srv.op_search(self.conn, query="XylographyDMA77", scope="")
+            unscoped_paths = [n["path"] for n in unscoped_book_hit["notes"]]
+            self.assertNotIn("resources/books/linux-dma-book.pdf", unscoped_paths)
+            scoped_book_hit = self.srv.op_search(self.conn, query="XylographyDMA77", scope="resources/books")
+            self.assertEqual(len(scoped_book_hit["notes"]), 1)
+            self.assertEqual(scoped_book_hit["notes"][0]["path"], "resources/books/linux-dma-book.pdf")
+            agent_book_up = self.srv.op_upload_document(
+                self.conn,
+                "chatgpt",
+                filename="agent-book.pdf",
+                raw_bytes=pdf_bytes,
+                scope="resources/books",
+            )
+            self.assertEqual(agent_book_up["scope"], "resources/books")
+
+            # Verify non-owner token is rejected with 403 on GET /download
+            dl_agent = urllib.request.Request(
+                f"{base}/download?path=career/embedded/linux/kernel-slides.pdf",
+                headers={"Authorization": "Bearer tok-claude-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.urlopen(dl_agent)
+            self.assertEqual(ctx.exception.code, 403)
+            ctx.exception.close()
+
+            # 4g. POST /messages requires authentication (401) and matching SSE session actor (403)
+            import queue as _queue
+            with self.srv.SSE_LOCK:
+                self.srv.SSE_SESSIONS["test-sse-1"] = ("claude", _queue.Queue(maxsize=8))
+            try:
+                unauth_msg = urllib.request.Request(
+                    f"{base}/messages?session_id=test-sse-1",
+                    data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_um:
+                    urllib.request.urlopen(unauth_msg)
+                self.assertEqual(ctx_um.exception.code, 401)
+                ctx_um.exception.close()
+                self.srv._clear_auth_failures("127.0.0.1")
+
+                mismatch_msg = urllib.request.Request(
+                    f"{base}/messages?session_id=test-sse-1",
+                    data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                    headers={
+                        "Authorization": "Bearer tok-chatgpt-test",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_mm:
+                    urllib.request.urlopen(mismatch_msg)
+                self.assertEqual(ctx_mm.exception.code, 403)
+                ctx_mm.exception.close()
+
+                ok_msg = urllib.request.Request(
+                    f"{base}/messages?session_id=test-sse-1",
+                    data=b'{"jsonrpc":"2.0","id":1,"method":"ping"}',
+                    headers={
+                        "Authorization": "Bearer tok-claude-test",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(ok_msg) as resp_om:
+                    self.assertEqual(resp_om.status, 202)
+            finally:
+                with self.srv.SSE_LOCK:
+                    self.srv.SSE_SESSIONS.pop("test-sse-1", None)
+
+            # 4h. Backslash open-redirect next=/\evil.example.com sanitized to /?scope=career, Transfer-Encoding rejected with 411, and non-int depth rejected with 400
+            self.assertEqual(self.srv._sanitize_next_path("/\\evil.example.com"), "/?scope=career")
+            self.assertEqual(self.srv._sanitize_next_path("//evil.example.com"), "/?scope=career")
+            self.assertEqual(self.srv._sanitize_next_path("/?scope=career&note=test.md"), "/?scope=career&note=test.md")
+
+            import http.client as _hc
+            conn_te = _hc.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn_te.putrequest("POST", "/oauth/register")
+            conn_te.putheader("Transfer-Encoding", "chunked")
+            conn_te.endheaders()
+            resp_411 = conn_te.getresponse()
+            self.assertEqual(resp_411.status, 411)
+            resp_411.read()
+            conn_te.close()
+
+            bad_depth_req = urllib.request.Request(
+                f"{base}/api/v1/context?target=career/00-Read-Before-Interview.md&depth=not-an-int",
+                headers={"Authorization": "Bearer tok-claude-test"},
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_bd:
+                urllib.request.urlopen(bad_depth_req)
+            self.assertEqual(ctx_bd.exception.code, 400)
+            ctx_bd.exception.close()
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
+
+if __name__ == "__main__":
+    unittest.main()

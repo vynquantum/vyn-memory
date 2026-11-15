@@ -1,0 +1,32 @@
+{
+  "timezone": "UTC",
+  "default_scope": "career",
+  "open_scopes": ["career/*", "shared", "projects/*", "resources/books"],
+  "areas": ["career", "projects", "business", "resources"],
+  "nested_scopes": ["career/embedded", "career/company"],
+  "scope_aliases": {
+    "interview-prep": "career",
+    "projects/interview-prep": "career",
+    "embedded": "career/embedded",
+    "c": "career/embedded/c",
+    "linux": "career/embedded/linux",
+    "os": "career/embedded/os",
+    "system-design": "career/embedded/system-design",
+    "company": "career/company",
+    "companies": "career/company",
+    "career/companies": "career/company",
+    "acme": "career/company/acme",
+    "acmee": "career/company/acme",
+    "career/company/acmee": "career/company/acme"
+  },
+  "hermes": {
+    "subagents": ["default", "main", "upgrade", "reviewer"],
+    "aliases": {"main": "default"},
+    "extra_write": ["business/clients"]
+  },
+  "briefing_areas": ["career", "business"],
+  "dashboard": {
+    "pinned": [["career/00-Read-Before-Interview.md", "Read before an interview"]],
+    "landing": ["career/00-Read-Before-Interview.md"]
+  }
+}
