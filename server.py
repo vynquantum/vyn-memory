@@ -28,6 +28,7 @@ import queue
 import re
 import secrets
 import sqlite3
+import stat
 import sys
 import threading
 import time
@@ -35,6 +36,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
+import xml.parsers.expat as expat
 import zipfile
 import zlib
 from datetime import datetime, timedelta, timezone
@@ -80,13 +82,6 @@ NESTED_SCOPES: tuple[str, ...] = tuple(SETTINGS.get("nested_scopes", []))
 READABLE_SCOPES: list[str] = ["shared", *(f"{a}/*" for a in AREAS), "agents/*", "daily", "inbox"]
 # Shorthand -> scope prefix rewrites, e.g. {"acme": "career/company/acme"}; longest key wins.
 SCOPE_ALIASES: dict[str, str] = {k.lower(): v.lower() for k, v in SETTINGS.get("scope_aliases", {}).items()}
-READONLY_INDEXED_PREFIXES = (
-    "business",
-    "daily",
-    "inbox",
-    "resources",
-    "agents/memories",
-)
 SKIP_VAULT_TOP_DIRS = {".obsidian", ".sync", ".git", "personal", "templates", "memory"}
 SKIP_VAULT_ROOT_FILES = {"Home.md", "README.md", "AGENTS.md", "INDEX.md", "00-AI-Memory-Snapshot.md"}
 SKIP_VAULT_GENERATED_FILES = {"shared/00-AI-Memory-Snapshot.md", "shared/00-Memory-Index.md"}
@@ -119,6 +114,12 @@ MEMORY_ADMIN_EMAILS = {
     if e.strip()
 }
 PORT = int(os.environ.get("MEMORY_PORT", "8770"))
+# Hosts allowed to receive OAuth codes; any other https host could phish a code through the owner's approval click.
+OAUTH_REDIRECT_HOSTS = {
+    h.strip().lower()
+    for h in os.environ.get("MEMORY_OAUTH_REDIRECT_HOSTS", "claude.ai,claude.com,chatgpt.com,chat.openai.com").split(",")
+    if h.strip()
+}
 
 
 class MemoryError(Exception):
@@ -194,6 +195,52 @@ def normalize_actor(actor: str, subagent: str | None = None) -> str:
     return base
 
 
+def owner_session_email() -> str:
+    """Session email for browser sessions opened with MEMORY_OWNER_TOKEN, bound to the current token value
+    so rotating or removing the token ends them."""
+    tok = configured_tokens().get("owner", "")
+    return "owner@token:" + hashlib.sha256(tok.encode()).hexdigest()[:32] if tok else ""
+
+
+def owner_email_ok(email: str) -> bool:
+    """A browser session or approval email that still grants owner: listed in MEMORY_ADMIN_EMAILS (Omni sign-in)
+    or equal to the current owner-token session email."""
+    email = email.strip().lower()
+    owner_email = owner_session_email()
+    return email in allowed_admin_emails() or bool(owner_email and hmac.compare_digest(email, owner_email))
+
+
+def web_session_email(db: sqlite3.Connection, token: str) -> str | None:
+    """Email of a live vms_ browser session that still grants owner, else None."""
+    if not token.startswith("vms_"):
+        return None
+    with DB_LOCK:
+        sess = db.execute(
+            "SELECT email, expires_at FROM web_sessions WHERE token_hash = ?",
+            (hashlib.sha256(token.encode()).hexdigest(),),
+        ).fetchone()
+    if sess and sess["expires_at"] > time.time() and owner_email_ok(str(sess["email"] or "")):
+        return str(sess["email"]).strip().lower()
+    return None
+
+
+def oauth_parent_valid(parent: str, actor: str) -> bool:
+    """An OAuth code/token stays valid only while the credential that approved it does:
+    'role:<sha256 of the role token>' or 'email:<approving session email>'."""
+    kind, _, ref = parent.partition(":")
+    if kind == "role":
+        return any(
+            hmac.compare_digest(hashlib.sha256(v.encode()).hexdigest(), ref)
+            for r, v in configured_tokens().items()
+            if r != "owner"
+        )
+    if kind == "email":
+        return owner_email_ok(ref)
+    # ponytail: rows from before parent binding keep working for agent roles so existing phone connectors
+    # survive the upgrade; owner-actor rows are revoked. Delete oauth_tokens rows to force a reconnect.
+    return not parent and actor != "owner"
+
+
 def resolve_actor_from_token(
     candidate: str | None,
     db: sqlite3.Connection | None = None,
@@ -212,22 +259,12 @@ def resolve_actor_from_token(
         now_ts = time.time()
         with DB_LOCK:
             if token.startswith("vms_"):
-                sess = db.execute(
-                    "SELECT email, expires_at FROM web_sessions WHERE token_hash = ?",
-                    (tok_hash,),
-                ).fetchone()
-                if sess and sess["expires_at"] > now_ts:
-                    sess_email = str(sess["email"] or "").strip().lower()
-                    admins = allowed_admin_emails()
-                    # Omni sessions need the email listed in MEMORY_ADMIN_EMAILS; owner@token comes from the owner token.
-                    if sess_email == "owner@token" or sess_email in admins:
-                        return "owner"
-                return None
+                return "owner" if web_session_email(db, token) else None
             row = db.execute(
-                "SELECT actor, expires_at FROM oauth_tokens WHERE token_hash = ?",
+                "SELECT actor, parent, expires_at FROM oauth_tokens WHERE token_hash = ?",
                 (tok_hash,),
             ).fetchone()
-        if row and row["expires_at"] > now_ts:
+        if row and row["expires_at"] > now_ts and oauth_parent_valid(str(row["parent"]), str(row["actor"])):
             stored_actor = str(row["actor"])
             return normalize_actor(stored_actor, subagent if stored_actor == "hermes" else None)
     return None
@@ -526,6 +563,7 @@ CREATE TABLE IF NOT EXISTS oauth_codes (
     redirect_uri TEXT NOT NULL,
     code_challenge TEXT NOT NULL,
     resource TEXT NOT NULL DEFAULT '',
+    parent TEXT NOT NULL DEFAULT '',
     expires_at REAL NOT NULL
 );
 
@@ -535,6 +573,7 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     actor TEXT NOT NULL,
     client_id TEXT NOT NULL,
     resource TEXT NOT NULL DEFAULT '',
+    parent TEXT NOT NULL DEFAULT '',
     created_at REAL NOT NULL,
     expires_at REAL NOT NULL
 );
@@ -568,6 +607,10 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
     oauth_tok_cols = {r["name"] for r in conn.execute("PRAGMA table_info(oauth_tokens)").fetchall()}
     if "refresh_hash" not in oauth_tok_cols:
         conn.execute("ALTER TABLE oauth_tokens ADD COLUMN refresh_hash TEXT NOT NULL DEFAULT ''")
+    if "parent" not in oauth_tok_cols:
+        conn.execute("ALTER TABLE oauth_tokens ADD COLUMN parent TEXT NOT NULL DEFAULT ''")
+    if "parent" not in {r["name"] for r in conn.execute("PRAGMA table_info(oauth_codes)").fetchall()}:
+        conn.execute("ALTER TABLE oauth_codes ADD COLUMN parent TEXT NOT NULL DEFAULT ''")
     conn.commit()
 
 
@@ -591,7 +634,7 @@ def serialize_fact(row: sqlite3.Row | dict[str, object]) -> dict[str, object]:
     return d
 
 
-_VAULT_STAT_CACHE: dict[str, tuple[int, int, str]] = {}
+_VAULT_STAT_CACHE: dict[str, tuple[tuple[int, int, int], str]] = {}  # rel -> ((inode, mtime_ns, size), sha256)
 
 
 def assert_safe_vault_path(target: Path, *, allow_root_dashboard: bool = False) -> Path:
@@ -623,36 +666,94 @@ def assert_safe_vault_path(target: Path, *, allow_root_dashboard: bool = False) 
     return resolved
 
 
-def atomic_write_text(target: Path, text: str, *, allow_root_dashboard: bool = False) -> None:
+def _vault_dir_fd(parts: list[str], *, create: bool = False) -> int:
+    """fd of VAULT_DIR/<parts> reached without following any symlink (O_NOFOLLOW per component).
+    Checking a path and then reopening it by name lets a swapped-in symlink win, so reads and writes go through fds."""
+    if any(p in ("", ".", "..") for p in parts):
+        raise MemoryPermissionError("Invalid vault path")
+    dfd = os.open(VAULT_DIR, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        for part in parts:
+            if create:
+                try:
+                    os.mkdir(part, 0o755, dir_fd=dfd)
+                except FileExistsError:
+                    pass
+            nfd = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=dfd)
+            os.close(dfd)
+            dfd = nfd
+    except OSError as exc:
+        os.close(dfd)
+        raise MemoryPermissionError("Vault path is not a plain directory inside the vault") from exc
+    return dfd
+
+
+def atomic_write_bytes(target: Path, raw_bytes: bytes, *, allow_root_dashboard: bool = False) -> Path:
     safe_target = assert_safe_vault_path(target, allow_root_dashboard=allow_root_dashboard)
-    safe_target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = safe_target.with_name(f".{safe_target.name}.{secrets.token_hex(4)}.tmp")
-    if tmp.is_symlink():
-        raise MemoryPermissionError("Refusing to write through a temporary symlink")
-    tmp.write_text(text, encoding="utf-8")
-    tmp.replace(safe_target)
-
-
-def atomic_write_bytes(target: Path, raw_bytes: bytes) -> Path:
-    safe_target = assert_safe_vault_path(target)
-    safe_target.parent.mkdir(parents=True, exist_ok=True)
-    tmp = safe_target.with_name(f".{safe_target.name}.{secrets.token_hex(4)}.tmp")
-    if tmp.is_symlink():
-        raise MemoryPermissionError("Refusing to write through a temporary symlink")
-    tmp.write_bytes(raw_bytes)
-    tmp.replace(safe_target)
+    *dirs, leaf = safe_target.relative_to(VAULT_DIR.resolve()).parts
+    dfd = _vault_dir_fd(dirs, create=True)
+    tmp = f".{leaf}.{secrets.token_hex(4)}.tmp"
+    try:
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o644, dir_fd=dfd)
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(raw_bytes)
+        os.replace(tmp, leaf, src_dir_fd=dfd, dst_dir_fd=dfd)
+    finally:
+        os.close(dfd)
     return safe_target
 
 
-def _file_sha256(file_path: Path) -> str:
-    h = hashlib.sha256()
-    with file_path.open("rb") as f:
-        while chunk := f.read(65536):
-            h.update(chunk)
-    return h.hexdigest()
+def atomic_write_text(target: Path, text: str, *, allow_root_dashboard: bool = False) -> None:
+    atomic_write_bytes(target, text.encode("utf-8"), allow_root_dashboard=allow_root_dashboard)
 
 
-def extract_docx_markdown(file_path: Path, max_chars: int = 250_000) -> tuple[str, str]:
+def read_vault_file(rel: str) -> tuple[bytes, os.stat_result]:
+    """Read VAULT_DIR/rel as a regular single-link file, without following any symlink."""
+    *dirs, leaf = [p for p in rel.split("/") if p] or [""]
+    if leaf in ("", ".", ".."):
+        raise MemoryPermissionError("Invalid vault path")
+    dfd = _vault_dir_fd(dirs)
+    try:
+        fd = os.open(leaf, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dfd)
+    except OSError as exc:
+        raise MemoryPermissionError("Vault path is not a plain file inside the vault") from exc
+    finally:
+        os.close(dfd)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_nlink != 1:
+            raise MemoryPermissionError("Vault path is not a plain file inside the vault")
+        return fh.read(), st
+
+
+class _DoctypeFound(Exception):
+    pass
+
+
+def _declares_doctype(xml_bytes: bytes) -> bool:
+    """True if the XML has a DOCTYPE, in any encoding expat reads (a byte search misses UTF-16)."""
+    probe = expat.ParserCreate()
+
+    def _stop(*_args: object) -> None:
+        raise _DoctypeFound
+
+    def _root(*_args: object) -> None:
+        raise StopIteration  # a DOCTYPE can only come before the root element; stop reading there
+
+    probe.StartDoctypeDeclHandler = _stop
+    probe.StartElementHandler = _root
+    try:
+        probe.Parse(xml_bytes, True)
+    except _DoctypeFound:
+        return True
+    except StopIteration:
+        return False
+    except expat.ExpatError:
+        return False  # ET.fromstring reports the parse error itself
+    return False
+
+
+def extract_docx_markdown(file_path: Path, data: bytes, max_chars: int = 250_000) -> tuple[str, str]:
     """Extract clean Markdown (headings, bullet lists, and tables) from a .docx archive using stdlib only."""
     doc_title = file_path.stem.replace("-", " ").replace("_", " ")
     w_ns = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
@@ -673,11 +774,11 @@ def extract_docx_markdown(file_path: Path, max_chars: int = 250_000) -> tuple[st
         return "".join(parts).strip()
 
     try:
-        with zipfile.ZipFile(file_path, "r") as zf:
+        with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
             if "docProps/core.xml" in zf.namelist():
                 with zf.open("docProps/core.xml") as fp:
                     core_bytes = fp.read(1024 * 1024 + 1)
-                if len(core_bytes) <= 1024 * 1024 and b"<!ENTITY" not in core_bytes.upper():
+                if len(core_bytes) <= 1024 * 1024 and not _declares_doctype(core_bytes):
                     core_root = ET.fromstring(core_bytes)
                     t_el = core_root.find(f".//{dc_title_ns}")
                     if t_el is not None and t_el.text and t_el.text.strip():
@@ -689,8 +790,8 @@ def extract_docx_markdown(file_path: Path, max_chars: int = 250_000) -> tuple[st
                 doc_bytes = fp.read(8 * 1024 * 1024 + 1)
             if len(doc_bytes) > 8 * 1024 * 1024:
                 return doc_title, f"# {doc_title}\n\n*(DOCX XML exceeds 8 MB safety limit.)*\n"
-            if b"<!ENTITY" in doc_bytes.upper():
-                return doc_title, f"# {doc_title}\n\n*(DOCX XML rejected: DTD entity declarations are not permitted.)*\n"
+            if _declares_doctype(doc_bytes):
+                return doc_title, f"# {doc_title}\n\n*(DOCX XML rejected: DTD declarations are not permitted.)*\n"
             root = ET.fromstring(doc_bytes)
     except (zipfile.BadZipFile, ET.ParseError, OSError) as exc:
         return doc_title, f"# {doc_title}\n\n*(Could not parse DOCX archive: {exc})*\n"
@@ -702,7 +803,7 @@ def extract_docx_markdown(file_path: Path, max_chars: int = 250_000) -> tuple[st
             truncated = True
             break
         if child.tag == f"{w_ns}p":
-            txt = _para_text(child)
+            txt = _para_text(child)[: max_chars - total_chars]
             if not txt:
                 continue
             style_val = ""
@@ -744,7 +845,7 @@ def extract_docx_markdown(file_path: Path, max_chars: int = 250_000) -> tuple[st
                 header = "| " + " | ".join(padded[0]) + " |"
                 sep = "| " + " | ".join(["---"] * col_count) + " |"
                 tbl_lines = [header, sep, *("| " + " | ".join(r) + " |" for r in padded[1:])]
-                tbl_str = "\n".join(tbl_lines)
+                tbl_str = "\n".join(tbl_lines)[: max_chars - total_chars]
                 lines.append(tbl_str)
                 total_chars += len(tbl_str) + 1
 
@@ -780,38 +881,49 @@ def _extract_pdf_text_stdlib(raw_pdf: bytes, max_chars: int = 250_000) -> str:
                 i += 1
         return out.decode("latin-1", errors="ignore")
 
-    for stream_idx, m in enumerate(re.finditer(rb"stream\r?\n(.*?)\r?\nendstream", raw_pdf, flags=re.S)):
-        if total >= max_chars or stream_idx >= 250:
+    # Linear scans only: a regex search for "stream...endstream" rescans the rest of the input from every
+    # unterminated "stream", which a small crafted upload turns into seconds of work under DB_LOCK.
+    pos = 0
+    for _ in range(250):
+        if total >= max_chars:
             break
-        data = m.group(1)
-        for cand in (data,):
-            try:
-                dobj = zlib.decompressobj()
-                decomp = dobj.decompress(cand, max_stream_decomp)
-            except zlib.error:
-                decomp = cand[:max_stream_decomp]
-            if b"BT" not in decomp and b"Tj" not in decomp and b"TJ" not in decomp:
-                continue
-            pieces: list[str] = []
-            for str_m in re.finditer(rb"\((?:\\.|[^\\()])*\)\s*Tj|\[((?:\\.|[^\]])*)\]\s*TJ", decomp, flags=re.S):
-                grp = str_m.group(0)
-                for lit in re.finditer(rb"\(((?:\\.|[^\\()])*)\)", grp):
-                    txt = _unescape_pdf_str(lit.group(1))
-                    if txt:
-                        pieces.append(txt)
-            if pieces:
-                joined = " ".join(pieces).strip()
-                if joined:
-                    rem = max_chars - total
-                    if len(joined) > rem:
-                        joined = joined[:rem]
-                    chunks.append(joined)
-                    total += len(joined)
+        start = raw_pdf.find(b"stream", pos)
+        if start < 0:
+            break
+        body_start = start + 6 + (2 if raw_pdf.startswith(b"\r\n", start + 6) else 1)
+        end = raw_pdf.find(b"endstream", body_start)
+        if end < 0:
+            break
+        pos = end + 9
+        data = raw_pdf[body_start:end].rstrip(b"\r\n")
+        try:
+            dobj = zlib.decompressobj()
+            decomp = dobj.decompress(data, max_stream_decomp)
+        except zlib.error:
+            decomp = data[:max_stream_decomp]
+        if b"BT" not in decomp and b"Tj" not in decomp and b"TJ" not in decomp:
+            continue
+        pieces: list[str] = []
+        for str_m in re.finditer(rb"\((?:\\.|[^\\()])*\)\s*Tj|\[((?:\\.|[^\]\\])*)\]\s*TJ", decomp, flags=re.S):
+            grp = str_m.group(0)
+            for lit in re.finditer(rb"\(((?:\\.|[^\\()])*)\)", grp):
+                txt = _unescape_pdf_str(lit.group(1))
+                if txt:
+                    pieces.append(txt)
+        if pieces:
+            joined = " ".join(pieces).strip()
+            if joined:
+                rem = max_chars - total
+                if len(joined) > rem:
+                    joined = joined[:rem]
+                chunks.append(joined)
+                total += len(joined)
     return "\n\n".join(chunks)
 
 
 def extract_pdf_markdown(
     file_path: Path,
+    data: bytes,
     *,
     max_pages: int = 120,
     max_chars: int = 250_000,
@@ -821,7 +933,7 @@ def extract_pdf_markdown(
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
 
-        reader = PdfReader(str(file_path))
+        reader = PdfReader(io.BytesIO(data))
         meta = reader.metadata
         if meta and getattr(meta, "title", None):
             cand_title = str(meta.title).strip()
@@ -859,7 +971,7 @@ def extract_pdf_markdown(
         return doc_title, f"# {doc_title}\n\n*(Could not parse PDF via pypdf: {exc})*\n"
 
     try:
-        raw_bytes = file_path.read_bytes()[: 16 * 1024 * 1024]
+        raw_bytes = data[: 16 * 1024 * 1024]
         fallback_txt = _extract_pdf_text_stdlib(raw_bytes, max_chars=max_chars).strip()
         if fallback_txt:
             return doc_title, f"# {doc_title}\n\n{fallback_txt}\n"
@@ -932,10 +1044,6 @@ def extract_wikilinks_with_relations(text: str) -> list[tuple[str, str]]:
         if target and target.lower() not in found:
             found[target.lower()] = "links_to"
     return list(found.items())
-
-
-def extract_wikilinks(text: str) -> list[str]:
-    return [t for t, _ in extract_wikilinks_with_relations(text)]
 
 
 def extract_inline_observations(text: str) -> list[dict[str, object]]:
@@ -1106,22 +1214,23 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                 continue
             seen.add(rel)
             cached = _VAULT_STAT_CACHE.get(rel)
-            if cached and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            if cached and cached[0] == (st.st_ino, st.st_mtime_ns, st.st_size):
                 existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
-                if existing and existing["sha256"] == cached[2]:
+                if existing and existing["sha256"] == cached[1]:
                     continue
+            try:
+                data, st = read_vault_file(rel)
+            except (MemoryError, OSError):
+                seen.discard(rel)
+                continue
+            sha = hashlib.sha256(data).hexdigest()
+            _VAULT_STAT_CACHE[rel] = ((st.st_ino, st.st_mtime_ns, st.st_size), sha)
+            existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
+            if existing and existing["sha256"] == sha:
+                continue
 
             if fname_low.endswith(".md"):
-                try:
-                    raw = file.read_text(encoding="utf-8", errors="replace")
-                except OSError:
-                    continue
-                sha = hashlib.sha256(raw.encode("utf-8")).hexdigest()
-                _VAULT_STAT_CACHE[rel] = (st.st_mtime_ns, st.st_size, sha)
-                existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
-                if existing and existing["sha256"] == sha:
-                    continue
-                meta, body = parse_frontmatter(raw)
+                meta, body = parse_frontmatter(data.decode("utf-8", errors="replace"))
                 scope = infer_vault_scope(rel, meta)
                 heading_match = re.search(r"^#\s+(.+)$", body, flags=re.M)
                 title = str(meta.get("title") or (heading_match.group(1).strip() if heading_match else file.stem))
@@ -1137,19 +1246,11 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                     or datetime.fromtimestamp(st.st_mtime, LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
                 )
             else:
-                try:
-                    sha = _file_sha256(file)
-                except OSError:
-                    continue
-                _VAULT_STAT_CACHE[rel] = (st.st_mtime_ns, st.st_size, sha)
-                existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
-                if existing and existing["sha256"] == sha:
-                    continue
                 ext_tag = "docx" if fname_low.endswith(".docx") else "pdf"
                 if ext_tag == "docx":
-                    title, body = extract_docx_markdown(file)
+                    title, body = extract_docx_markdown(file, data)
                 else:
-                    title, body = extract_pdf_markdown(file)
+                    title, body = extract_pdf_markdown(file, data)
                 scope = infer_vault_scope(rel)
                 summary = f"{ext_tag.upper()} document ({st.st_size / 1024:.1f} KB)"
                 tags = [ext_tag, "binary-doc"]
@@ -1536,7 +1637,7 @@ def op_write_note(
         existing_meta: dict[str, object] = {}
         existing_body = ""
         if target.exists():
-            existing_meta, existing_body = parse_frontmatter(target.read_text(encoding="utf-8", errors="replace"))
+            existing_meta, existing_body = parse_frontmatter(read_vault_file(rel_path)[0].decode("utf-8", errors="replace"))
 
         if mode == "replace":
             final_body = content.strip() + "\n"
@@ -1684,9 +1785,9 @@ def op_upload_document(
         sha = hashlib.sha256(raw_bytes).hexdigest()
         ext_tag = "docx" if ext_low == ".docx" else "pdf"
         if ext_tag == "docx":
-            extracted_title, extracted_body = extract_docx_markdown(target)
+            extracted_title, extracted_body = extract_docx_markdown(target, raw_bytes)
         else:
-            extracted_title, extracted_body = extract_pdf_markdown(target)
+            extracted_title, extracted_body = extract_pdf_markdown(target, raw_bytes)
 
         final_title = title.strip() or extracted_title
         final_summary = summary.strip() or f"{ext_tag.upper()} document ({len(raw_bytes) / 1024:.1f} KB)"
@@ -2213,7 +2314,6 @@ def op_briefing(
             },
             "agent_specific_facts": agent_buckets,
             "recent_invalidated_and_superseded_facts": recent_invalid_or_superseded,
-            "recent_progress_transitions": recent_invalid_or_superseded,
             # The focus scope's newest notes only: the whole vault index (531 notes, ~60k tokens)
             # made every briefing expensive. memory_list_notes / list-notes gives the rest.
             "notes_total": len(notes),
@@ -3866,11 +3966,14 @@ def validate_oauth_redirect_uri(uri: str) -> str:
         raise MemoryError("redirect_uri must not contain fragments or credentials")
     scheme = parsed.scheme.lower()
     host = parsed.hostname.lower()
-    if scheme == "https":
+    if scheme == "https" and host in OAUTH_REDIRECT_HOSTS:
         return cleaned
     if scheme == "http" and host in ("127.0.0.1", "localhost", "::1"):
         return cleaned
-    raise MemoryError("redirect_uri must use https:// (or http://localhost / http://127.0.0.1 for local loopback)")
+    raise MemoryError(
+        "redirect_uri must be an https callback on an allowed connector host (MEMORY_OAUTH_REDIRECT_HOSTS) "
+        "or a local loopback http://127.0.0.1 / http://localhost address"
+    )
 
 
 def _default_oauth_role(redirect_uri: str, query: dict[str, list[str]]) -> str:
@@ -4047,10 +4150,6 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
         return host_tokens + [t for t in plain_tokens if t not in host_tokens]
-
-    def _extract_cookie_token(self) -> str:
-        tokens = self._extract_cookie_tokens()
-        return tokens[0] if tokens else ""
 
     def _extract_state_cookie(self) -> str:
         raw_headers = self.headers.get_all("Cookie") if hasattr(self.headers, "get_all") else None
@@ -4436,6 +4535,7 @@ input{{width:100%;padding:11px;margin:10px 0;border-radius:6px;border:1px solid 
 button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:16px}}</style>
 </head><body><div class="card">
 <h2>🔑 Authorize Vyn Memory</h2>
+<p style="font-size:14px">Access will be sent to <strong>{html.escape(urllib.parse.urlsplit(redirect_uri).hostname or "", quote=True)}</strong> (client <code>{html.escape(client_id, quote=True)}</code>). Approve only if you started this connection there.</p>
 <form method="post" action="{action_path}">
   <input type="hidden" name="client_id" value="{html.escape(client_id, quote=True)}">
   <input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}">
@@ -4474,7 +4574,11 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             if not full.is_file() or not full.name.lower().endswith(SUPPORTED_VAULT_EXTENSIONS):
                 self.send_json(404, {"error": "Vault document not found"})
                 return
-            data_bytes = full.read_bytes()
+            try:
+                data_bytes = read_vault_file(rel)[0]
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)})
+                return
             low_name = full.name.lower()
             safe_fname = re.sub(r"[^a-zA-Z0-9._-]", "_", full.name)
             if low_name.endswith(".pdf"):
@@ -4605,7 +4709,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 return
             extra_hdrs: dict[str, str] = {}
             if url_token:
-                sess_tok = _mint_web_session(conn, "owner@token")
+                sess_tok = _mint_web_session(conn, owner_session_email())
                 extra_hdrs["Set-Cookie"] = _session_cookie_header(sess_tok, max_age=2592000)
                 if "text/html" in self.headers.get("Accept", ""):
                     parsed_req = urllib.parse.urlsplit(self.path)
@@ -4709,7 +4813,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 self.send_html(401, render_login_page(next_path=next_p, error_msg=msg))
                 return
             _clear_auth_failures(ip)
-            sess_tok = _mint_web_session(conn, "owner@token")
+            sess_tok = _mint_web_session(conn, owner_session_email())
             self.send_response(303)
             self.send_header("Location", next_p)
             self.send_header("Set-Cookie", _session_cookie_header(sess_tok, max_age=2592000))
@@ -4758,15 +4862,25 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
 
             submitted_token = (form.get("token") or [""])[0].strip()
             resolved: str | None = None
+            parent = ""
             if submitted_token:
-                resolved = resolve_actor_from_token(submitted_token, conn)
+                # Role tokens only (no db: sessions and OAuth tokens are not accepted here), and never the owner's:
+                # the owner approves through the Omni session below, so owner credentials never become OAuth tokens.
+                resolved = resolve_actor_from_token(submitted_token)
+                if resolved == "owner":
+                    resolved = None
+                parent = "role:" + hashlib.sha256(submitted_token.encode()).hexdigest()
             elif (form.get("omni_session") or [""])[0].strip() == "1":
                 same_origin_ok = self._is_same_origin_browser_post()
                 csrf_ok = _verify_upload_csrf((form.get("csrf_token") or [""])[0])
                 cookie_actor = None
                 for cand_tok in self._extract_cookie_tokens():
-                    if resolve_actor_from_token(cand_tok, conn) == "owner":
+                    email = web_session_email(conn, cand_tok)
+                    if email is None and resolve_actor_from_token(cand_tok) == "owner":
+                        email = owner_session_email()
+                    if email:
                         cookie_actor = "owner"
+                        parent = "email:" + email
                         break
                 selected_role = (form.get("role") or ["claude"])[0].strip().lower()
                 if (
@@ -4789,8 +4903,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 _prune_oauth_tables(conn)
                 conn.execute(
                     """
-                    INSERT INTO oauth_codes(code_hash, actor, client_id, redirect_uri, code_challenge, resource, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO oauth_codes(code_hash, actor, client_id, redirect_uri, code_challenge, resource, parent, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hashlib.sha256(code.encode()).hexdigest(),
@@ -4799,6 +4913,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                         redirect_uri,
                         code_challenge,
                         resource,
+                        parent,
                         time.time() + 300,
                     ),
                 )
@@ -4845,7 +4960,11 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                         "SELECT * FROM oauth_tokens WHERE refresh_hash = ?",
                         (refresh_hash,),
                     ).fetchone()
-                    if not tok_row or tok_row["expires_at"] < time.time():
+                    if (
+                        not tok_row
+                        or tok_row["expires_at"] < time.time()
+                        or not oauth_parent_valid(str(tok_row["parent"]), str(tok_row["actor"]))
+                    ):
                         self.send_json(400, {"error": "invalid_grant"})
                         return
                     if req_client_id and tok_row["client_id"] and req_client_id != tok_row["client_id"]:
@@ -4857,8 +4976,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     now_ts = time.time()
                     conn.execute(
                         """
-                        INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, created_at, expires_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, created_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             hashlib.sha256(access_token.encode()).hexdigest(),
@@ -4866,6 +4985,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                             tok_row["actor"],
                             tok_row["client_id"],
                             tok_row["resource"],
+                            tok_row["parent"],
                             now_ts,
                             now_ts + 86400 * 365,
                         ),
@@ -4892,7 +5012,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             with DB_LOCK:
                 _prune_oauth_tables(conn)
                 row = conn.execute("SELECT * FROM oauth_codes WHERE code_hash = ?", (code_hash,)).fetchone()
-                if not row or row["expires_at"] < time.time():
+                if not row or row["expires_at"] < time.time() or not oauth_parent_valid(str(row["parent"]), str(row["actor"])):
                     self.send_json(400, {"error": "invalid_grant"})
                     return
                 conn.execute("DELETE FROM oauth_codes WHERE code_hash = ?", (code_hash,))
@@ -4916,8 +5036,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 now_ts = time.time()
                 conn.execute(
                     """
-                    INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hashlib.sha256(access_token.encode()).hexdigest(),
@@ -4925,6 +5045,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                         row["actor"],
                         row["client_id"],
                         row["resource"],
+                        row["parent"],
                         now_ts,
                         now_ts + 86400 * 365,
                     ),

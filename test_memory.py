@@ -661,6 +661,60 @@ class TestVynMemory(unittest.TestCase):
         with self.assertRaises(self.srv.MemoryPermissionError):
             self.srv.normalize_scope("secret")
 
+    def test_security_audit_run2_regressions(self) -> None:
+        import io, time, zipfile
+        srv = self.srv
+        # PDF fallback stays linear on unterminated streams and backslash runs.
+        start = time.monotonic()
+        srv._extract_pdf_text_stdlib(b"%PDF-1.4\n" + b"stream\n" * 8000)
+        srv._extract_pdf_text_stdlib(b"%PDF-1.4\nstream\nBT [" + b"\\" * 40 + b"\nendstream\n")
+        self.assertLess(time.monotonic() - start, 1.0)
+        # OAuth codes only go to allowed connector hosts or loopback.
+        self.assertTrue(srv.validate_oauth_redirect_uri("https://claude.ai/api/mcp/auth_callback"))
+        self.assertTrue(srv.validate_oauth_redirect_uri("http://127.0.0.1:9/cb"))
+        with self.assertRaises(srv.MemoryError):
+            srv.validate_oauth_redirect_uri("https://attacker.example.net/cb")
+        # A UTF-16 DOCX cannot smuggle a DTD past the guard.
+        xml = ('<?xml version="1.0" encoding="UTF-16"?><!DOCTYPE d [<!ENTITY e "AAAAAAAAAA">]>'
+               '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+               "<w:body><w:p><w:r><w:t>&e;&e;</w:t></w:r></w:p></w:body></w:document>").encode("utf-16")
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("word/document.xml", xml)
+        _, body = srv.extract_docx_markdown(Path("x.docx"), buf.getvalue())
+        self.assertIn("DTD declarations are not permitted", body)
+        # Owner-token browser sessions end when the owner token changes.
+        sess = srv._mint_web_session(self.conn, srv.owner_session_email())
+        self.assertEqual(srv.resolve_actor_from_token(sess, self.conn), "owner")
+        os.environ["MEMORY_OWNER_TOKEN"] = "tok-owner-rotated"
+        try:
+            self.assertIsNone(srv.resolve_actor_from_token(sess, self.conn))
+        finally:
+            os.environ["MEMORY_OWNER_TOKEN"] = "tok-owner-test"
+        # OAuth tokens live only as long as the credential that approved them.
+        parent = "role:" + hashlib.sha256(b"tok-claude-test").hexdigest()
+        self.assertTrue(srv.oauth_parent_valid(parent, "claude"))
+        os.environ["MEMORY_CLAUDE_TOKEN"] = "tok-claude-rotated"
+        try:
+            self.assertFalse(srv.oauth_parent_valid(parent, "claude"))
+        finally:
+            os.environ["MEMORY_CLAUDE_TOKEN"] = "tok-claude-test"
+        self.assertTrue(srv.oauth_parent_valid("email:owner@example.com", "claude"))
+        self.assertFalse(srv.oauth_parent_valid("email:gone@example.com", "claude"))
+        self.assertFalse(srv.oauth_parent_valid("", "owner"))
+        # Vault reads never follow a symlink, even one swapped in after the directory walk.
+        (self.vault_dir / "shared").mkdir(parents=True, exist_ok=True)
+        os.symlink("/etc/hostname", self.vault_dir / "shared" / "link.md")
+        with self.assertRaises(srv.MemoryPermissionError):
+            srv.read_vault_file("shared/link.md")
+        # Writes walk directories without following symlinks too.
+        outside = self.root / "outside"
+        outside.mkdir()
+        os.symlink(outside, self.vault_dir / "shared" / "linkdir")
+        with self.assertRaises(srv.MemoryPermissionError):
+            srv._vault_dir_fd(["shared", "linkdir"], create=True)
+        self.assertEqual(list(outside.iterdir()), [])
+
     def test_omni_sso_login_oauth_session_and_refresh_token(self) -> None:
         os.environ["MEMORY_ADMIN_EMAILS"] = "owner@example.com"
         httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)

@@ -46,6 +46,7 @@ and keep them in an env file only you can read, never in Git.
 | `MEMORY_PUBLIC_URL` | the address clients use (OAuth metadata and links) |
 | `MEMORY_SETTINGS` | path to your settings JSON (below) |
 | `MEMORY_BEHIND_CLOUDFLARE=1` | trust `CF-Connecting-IP` for rate limiting (only behind a Cloudflare tunnel) |
+| `MEMORY_OAUTH_REDIRECT_HOSTS` | hosts allowed to receive OAuth codes (default `claude.ai,claude.com,chatgpt.com,chat.openai.com`; loopback is always allowed) |
 | `OMNI_PUBLIC_URL`, `OMNI_INTERNAL_URL`, `OMNI_MEMORY_KEY`, `MEMORY_ADMIN_EMAILS` | optional sign-in through an Omni server; only the listed emails get in |
 
 Put it behind HTTPS (a reverse proxy or a tunnel) before you expose it to the internet.
@@ -76,6 +77,10 @@ Starter notes for your areas belong in your vault (or a template you copy into i
   profiles also share `agents/{hermes,decisions,gotchas,playbooks,research}`.
 - The owner (owner token, or an Omni sign-in for an email in `MEMORY_ADMIN_EMAILS`) can
   write everywhere and is the only one who can open the dashboard and download files.
+- Connector logins (OAuth) stay valid only while the credential that approved them does: rotating an
+  agent token, or removing an email from `MEMORY_ADMIN_EMAILS`, ends them. Owner credentials cannot be
+  turned into OAuth tokens, and browser sessions opened with the owner token end when it changes.
+- The vault is read and written through directory file descriptors that never follow a symlink.
 - Agent tokens may sit in a URL (`/s/<token>/mcp`) for clients that cannot send headers.
   Treat such URLs like passwords; rotate a token by changing it and restarting.
 - Notes render with a strict Content-Security-Policy (no scripts), uploads and request
