@@ -18,7 +18,8 @@ import urllib.request
 from pathlib import Path
 
 HOME = Path(os.environ.get("HERMES_HOME") or os.environ.get("HOME") or "/opt/data")
-SCRIPT_PATH = Path(__file__).resolve()
+# Not resolve(): a laptop links this folder into ~/.claude/skills and ~/.codex/skills, and the link path tells the apps apart.
+SCRIPT_PATH = Path(__file__).absolute()
 # Token files: MEMORY_ENV_FILE, else ~/.config/vyn-memory.env (chmod 600), e.g.
 #   MEMORY_CLAUDE_TOKEN=...
 #   MEMORY_HUB_URL=https://memory.example.com
