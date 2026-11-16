@@ -599,6 +599,21 @@ class TestVynMemory(unittest.TestCase):
             resp_413.read()
             conn_http.close()
 
+            # 4j. claude.ai's sequence on one connection: a POST refused before its body is read
+            # closes the connection, so the next request is not parsed from the leftover body (was 501)
+            init = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
+            conn_ka = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+            conn_ka.request("POST", "/s/old-token/mcp", init, {"Content-Type": "application/json"})
+            resp_410 = conn_ka.getresponse()
+            resp_410.read()
+            self.assertEqual(resp_410.status, 410)
+            self.assertEqual(resp_410.getheader("Connection"), "close")
+            conn_ka.request("POST", "/mcp", init, {"Content-Type": "application/json", "Authorization": "Bearer tok-claude-test"})
+            resp_ok = conn_ka.getresponse()
+            resp_ok.read()
+            self.assertEqual(resp_ok.status, 200)
+            conn_ka.close()
+
             # 4j. Per-IP brute-force rate limiting returns 429 after MAX_AUTH_FAILURES_PER_WINDOW failed attempts
             self.srv._clear_auth_failures("127.0.0.1")
             for _ in range(self.srv.MAX_AUTH_FAILURES_PER_WINDOW):

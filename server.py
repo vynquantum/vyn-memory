@@ -4206,6 +4206,14 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
+    def end_headers(self) -> None:
+        # A POST answered before its body was read (401, 429, ...) must not keep the connection:
+        # the unread body would be parsed as the next request line (claude.ai got a 501 from that).
+        if self.command == "POST" and not getattr(self, "_body_read", False):
+            self.close_connection = True
+            self.send_header("Connection", "close")
+        super().end_headers()
+
     def client_ip(self) -> str:
         return _client_ip(self.headers, getattr(self, "client_address", None))
 
@@ -4419,10 +4427,12 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             self.close_connection = True
             raise MemoryError("Invalid Content-Length header")
         if length == 0:
+            self._body_read = True
             return b""
         if length > max_bytes:
             self.close_connection = True
             raise MemoryPayloadTooLargeError(f"Request body exceeds maximum size of {max_bytes} bytes")
+        self._body_read = True
         return self.rfile.read(length)
 
     def read_json_body(self, max_bytes: int = MAX_JSON_BODY_BYTES) -> dict[str, object] | list[object]:
@@ -4855,6 +4865,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
         self.send_json(404, {"error": f"Unknown route: {route}"})
 
     def do_POST(self) -> None:
+        self._body_read = False
         conn: sqlite3.Connection = self.server.db  # type: ignore[attr-defined]
         ip = self.client_ip()
         if _is_rate_limited(ip):
