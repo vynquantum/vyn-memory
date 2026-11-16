@@ -10,8 +10,11 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import getpass
 import os
+import platform
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -101,65 +104,82 @@ def resolve_token() -> str:
     return tok
 
 
+def _send(path: str, data: bytes | None = None, subagent: str = "", auth: bool = True) -> dict[str, object]:
+    headers = {"User-Agent": "vyn-memory-cli/1", "Content-Type": "application/json; charset=utf-8"}
+    if auth:
+        tok, is_hermes = resolve_token_and_mode()
+        headers["Authorization"] = f"Bearer {tok}"
+        if is_hermes:
+            headers["X-Hermes-Subagent"] = detect_hermes_subagent(subagent)
+    req = urllib.request.Request(f"{DEFAULT_URL}{path}", data=data, headers=headers, method="POST" if data else "GET")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            err = json.loads(body).get("error", body)
+        except Exception:
+            err = body
+        raise ValueError(f"HTTP {exc.code}: {err}") from exc
+
+
 def api_get(path: str, params: dict[str, object] | None = None, subagent: str = "") -> dict[str, object]:
-    qs = ""
-    if params:
-        clean = {k: str(v) for k, v in params.items() if v is not None and str(v) != ""}
-        if clean:
-            qs = "?" + urllib.parse.urlencode(clean)
-    tok, is_hermes = resolve_token_and_mode()
-    headers = {"Authorization": f"Bearer {tok}", "User-Agent": "vyn-memory-cli/1"}
-    if is_hermes:
-        headers["X-Hermes-Subagent"] = detect_hermes_subagent(subagent)
-    req = urllib.request.Request(
-        f"{DEFAULT_URL}{path}{qs}",
-        headers=headers,
-        method="GET",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        try:
-            err = json.loads(body).get("error", body)
-        except Exception:
-            err = body
-        raise ValueError(f"HTTP {exc.code}: {err}") from exc
+    clean = {k: str(v) for k, v in (params or {}).items() if v is not None and str(v) != ""}
+    return _send(path + ("?" + urllib.parse.urlencode(clean) if clean else ""), subagent=subagent)
 
 
-def api_post(path: str, payload: dict[str, object], subagent: str = "") -> dict[str, object]:
-    data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-    tok, is_hermes = resolve_token_and_mode()
-    headers = {
-        "User-Agent": "vyn-memory-cli/1",
-        "Authorization": f"Bearer {tok}",
-        "Content-Type": "application/json; charset=utf-8",
-    }
-    if is_hermes:
-        headers["X-Hermes-Subagent"] = detect_hermes_subagent(subagent)
-    req = urllib.request.Request(
-        f"{DEFAULT_URL}{path}",
-        data=data,
-        headers=headers,
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            return json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+def api_post(path: str, payload: dict[str, object], subagent: str = "", auth: bool = True) -> dict[str, object]:
+    return _send(path, json.dumps(payload, ensure_ascii=False).encode("utf-8"), subagent=subagent, auth=auth)
+
+
+def detect_app() -> str:
+    actor = os.environ.get("MEMORY_ACTOR", "").strip().lower()
+    path = str(SCRIPT_PATH)
+    if actor == "claude" or "/.claude/" in path:
+        return "Claude Code"
+    if actor in ("chatgpt", "codex") or "/.codex/" in path:
+        return "Codex"
+    if actor == "antigravity" or "/.gemini/" in path:
+        return "Antigravity"
+    return "memory.py"
+
+
+def login() -> dict[str, object]:
+    """Device login: the owner approves this device in a browser, and its own token lands in the token file."""
+    info = {"app": detect_app(), "user": getpass.getuser(), "host": platform.node(),
+            "os": f"{platform.system()} {platform.release()} {platform.machine()}".strip()}
+    start = api_post("/device/code", info, auth=False)
+    print(f"Open {start['verification_uri_complete']}\nand approve code {start['user_code']} "
+          "(it must match the page).", file=sys.stderr, flush=True)
+    deadline = time.time() + float(start["expires_in"])
+    while time.time() < deadline:
+        time.sleep(float(start["interval"]))
         try:
-            err = json.loads(body).get("error", body)
-        except Exception:
-            err = body
-        raise ValueError(f"HTTP {exc.code}: {err}") from exc
+            got = api_post("/device/token", {"device_code": start["device_code"]}, auth=False)
+        except ValueError as exc:
+            if "authorization_pending" in str(exc):
+                continue
+            raise
+        key = f"MEMORY_{str(got['actor']).upper()}_TOKEN"
+        target = HOST_MEMORY_ENV_CANDIDATES[0]
+        old = target.read_text(encoding="utf-8").splitlines() if target.exists() else []
+        kept = [ln for ln in old if not ln.strip().startswith((f"{key}=", "MEMORY_HUB_URL="))]
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("\n".join([*kept, f"MEMORY_HUB_URL={DEFAULT_URL}", f"{key}={got['access_token']}"]) + "\n")
+        os.chmod(target, 0o600)
+        return {"ok": True, "app": info["app"], "acts_as": got["actor"], "saved_to": str(target)}
+    raise ValueError("Login was not approved within 10 minutes; run login again.")
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Vyn Unified Cross-Agent Memory CLI")
     parser.add_argument("--subagent", default="", help="Override Hermes sub-agent name (auto-detected from profile HOME)")
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("login", help="Get this device's own token: approve it in the browser, saved to the token file")
 
     p_brief = sub.add_parser("briefing", help="Get unified cross-agent memory briefing")
     p_brief.add_argument("--project", default="")
@@ -219,7 +239,9 @@ def main() -> int:
 
     args = parser.parse_args()
     subagent = args.subagent
-    if args.command == "briefing":
+    if args.command == "login":
+        res = login()
+    elif args.command == "briefing":
         res = api_get("/api/v1/briefing", {"project": args.project, "scope": args.scope}, subagent=subagent)
     elif args.command == "search":
         validity = "all" if args.history else args.validity

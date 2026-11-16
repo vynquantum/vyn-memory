@@ -20,7 +20,7 @@ One Python file, standard library only (`pypdf` is optional, for PDF text).
 | :--- | :--- |
 | Agents that can run commands (Claude Code, Codex, Antigravity, Hermes) | the skill in `skills/vyn-memory/`: `memory.py` calls the REST API |
 | Apps that cannot (claude.ai, ChatGPT, phone apps) | MCP connector at `<your address>/mcp` (OAuth 2.1 + PKCE) or `/sse` |
-| You, in a browser | the dashboard at `<your address>/` |
+| You, in a browser | the dashboard at `<your address>/`, and **Connected apps** at `/apps` |
 | Anything else | REST API under `/api/v1/`, described at `/openapi.json` |
 
 The skill only loads its instructions when a task needs memory, so it costs far fewer
@@ -81,8 +81,12 @@ Starter notes for your areas belong in your vault (or a template you copy into i
   agent token, or removing an email from `MEMORY_ADMIN_EMAILS`, ends them. Owner credentials cannot be
   turned into OAuth tokens, and browser sessions opened with the owner token end when it changes.
 - The vault is read and written through directory file descriptors that never follow a symlink.
-- Agent tokens may sit in a URL (`/s/<token>/mcp`) for clients that cannot send headers.
-  Treat such URLs like passwords; rotate a token by changing it and restarting.
+- Tokens travel only in the `Authorization` header (or `X-API-Key`), never in a URL, because URLs end up
+  in logs and browser history. Old `/s/<token>/...` addresses answer 410.
+- Each laptop or app gets its own token through `memory.py login`, labelled with the app, user, device
+  and OS that asked for it. **Connected apps** (`/apps`) lists every device login, connector login and
+  browser session with when it was added and last used, and revokes any of them at once.
+- The role tokens are for apps on the server itself; rotate one by changing it and restarting.
 - Notes render with a strict Content-Security-Policy (no scripts), uploads and request
   bodies have size limits, failed sign-ins are rate limited, and paths cannot leave the vault.
 
@@ -95,12 +99,15 @@ Starter notes for your areas belong in your vault (or a template you copy into i
      mkdir -p "$d" && ln -sfn ~/vyn-memory/skills/vyn-memory "$d/vyn-memory"
    done
    ```
-3. Create `~/.config/vyn-memory.env` with your address and that app's token, then `chmod 600` it:
+3. Log in once from each app's copy, so the server knows which app it is:
    ```sh
-   MEMORY_HUB_URL=https://memory.example.com
-   MEMORY_CLAUDE_TOKEN=...
+   export MEMORY_HUB_URL=https://memory.example.com
+   python3 ~/.claude/skills/vyn-memory/memory.py login   # Claude Code
+   python3 ~/.codex/skills/vyn-memory/memory.py login    # Codex
    ```
-4. Check: `python3 ~/vyn-memory/skills/vyn-memory/memory.py search test`.
+   It prints a link and a code. Open the link on any device where you are signed in as the owner,
+   check the code matches, and approve. The token is saved to `~/.config/vyn-memory.env` (mode 600).
+4. Check: `python3 ~/.claude/skills/vyn-memory/memory.py search test`.
 
 `git -C ~/vyn-memory pull` updates the skill.
 

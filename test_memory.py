@@ -329,8 +329,8 @@ class TestVynMemory(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 403)
             ctx.exception.close()
 
-            # 3. MCP Streamable HTTP via URL token (/s/<token>/mcp)
-            mcp_url = f"{base}/s/tok-claude-test/mcp"
+            # 3. MCP Streamable HTTP with a Bearer header
+            mcp_url = f"{base}/mcp"
             call_ok = urllib.request.Request(
                 mcp_url,
                 data=json.dumps({
@@ -347,7 +347,7 @@ class TestVynMemory(unittest.TestCase):
                         },
                     },
                 }).encode(),
-                headers={"Content-Type": "application/json"},
+                headers={"Content-Type": "application/json", "Authorization": "Bearer tok-claude-test"},
                 method="POST",
             )
             with urllib.request.urlopen(call_ok) as resp:
@@ -458,28 +458,25 @@ class TestVynMemory(unittest.TestCase):
         thread.start()
         base = f"http://127.0.0.1:{port}"
         try:
-            # 4a. Valid /s/<token>/ dashboard sets __Host- cookie and CSP headers
-            dash_req = urllib.request.Request(f"{base}/s/tok-owner-test/")
+            # 4a. Owner dashboard carries CSP and framing headers
+            dash_req = urllib.request.Request(f"{base}/", headers={"Cookie": "__Host-vyn_memory_token=tok-owner-test"})
             with urllib.request.urlopen(dash_req) as resp:
                 html_body = resp.read().decode()
                 csp = resp.headers.get("Content-Security-Policy", "")
-                set_cookie = resp.headers.get("Set-Cookie", "")
                 self.assertIn("default-src 'none'", csp)
                 self.assertEqual(resp.headers.get("X-Frame-Options"), "DENY")
                 self.assertEqual(resp.headers.get("X-Content-Type-Options"), "nosniff")
-                self.assertIn("__Host-vyn_memory_token=vms_", set_cookie)
-                self.assertIn("SameSite=Lax", set_cookie)
-                self.assertIn("HttpOnly", set_cookie)
-                self.assertIn('action="/s/tok-owner-test/"', html_body)
+                self.assertIn('action="/"', html_body)
+                self.assertIn('href="/apps"', html_body)
 
-            # 4b. Crafted /s/<invalid-xss-payload>/ URL does NOT fall back to valid cookie (returns 401 JSON)
-            xss_path = urllib.parse.quote('"><script>alert(1)</script>', safe="")
-            xss_req = urllib.request.Request(
-                f"{base}/s/{xss_path}/",
-                headers={"Cookie": "__Host-vyn_memory_token=tok-owner-test"},
-            )
+            # 4b. Token URLs are gone: /s/<token>/... answers 410 even with a valid token, ?token= is ignored
+            for path in ("/s/tok-owner-test/", "/s/tok-claude-test/mcp"):
+                with self.assertRaises(urllib.error.HTTPError) as ctx:
+                    urllib.request.urlopen(urllib.request.Request(f"{base}{path}"))
+                self.assertEqual(ctx.exception.code, 410)
+                ctx.exception.close()
             with self.assertRaises(urllib.error.HTTPError) as ctx:
-                urllib.request.urlopen(xss_req)
+                urllib.request.urlopen(urllib.request.Request(f"{base}/api/v1/briefing?token=tok-claude-test"))
             self.assertEqual(ctx.exception.code, 401)
             ctx.exception.close()
 
@@ -537,24 +534,11 @@ class TestVynMemory(unittest.TestCase):
                 self.assertIn("default-src 'none'", oauth_csp)
                 self.assertNotIn("form-action 'self'", oauth_csp)
 
-            # 4f. Browser GET /s/<owner_token>/?scope=career with Accept: text/html returns 303 to clean /?scope=career
             class NoRedirectLocal(urllib.request.HTTPRedirectHandler):
                 def redirect_request(self, req, fp, code, msg, headers, newurl):
                     return None
 
             no_redir_opener = urllib.request.build_opener(NoRedirectLocal)
-            browser_tok_req = urllib.request.Request(
-                f"{base}/s/tok-owner-test/?scope=career",
-                headers={"Accept": "text/html,application/xhtml+xml"},
-            )
-            try:
-                no_redir_opener.open(browser_tok_req)
-                self.fail("Expected 303 See Other stripping token from URL")
-            except urllib.error.HTTPError as e:
-                self.assertEqual(e.code, 303)
-                self.assertEqual(e.headers.get("Location"), "/?scope=career")
-                self.assertIn("__Host-vyn_memory_token=", e.headers.get("Set-Cookie", ""))
-                e.close()
 
             # 4g. POST /login sets __Host- cookie and redirects to /?scope=career; agent tokens get 403 on GET /
             login_req = urllib.request.Request(
@@ -714,6 +698,76 @@ class TestVynMemory(unittest.TestCase):
         with self.assertRaises(srv.MemoryPermissionError):
             srv._vault_dir_fd(["shared", "linkdir"], create=True)
         self.assertEqual(list(outside.iterdir()), [])
+
+    def test_device_login_and_connected_apps(self) -> None:
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+        owner = {"Cookie": "__Host-vyn_memory_token=tok-owner-test", "Origin": base}
+
+        def call(path: str, data: object = None, headers: dict[str, str] | None = None) -> tuple[int, str]:
+            body = None if data is None else (
+                urllib.parse.urlencode(data).encode() if "Cookie" in (headers or {}) else json.dumps(data).encode()
+            )
+            req = urllib.request.Request(f"{base}{path}", data=body, headers=headers or {})
+            try:
+                with urllib.request.urlopen(req) as resp:
+                    return resp.status, resp.read().decode()
+            except urllib.error.HTTPError as exc:
+                with exc:
+                    return exc.code, exc.read().decode()
+
+        try:
+            _, raw = call("/device/code", {"app": "Codex<script>", "user": "veera", "host": "laptop", "os": "Linux 6.8"})
+            start = json.loads(raw)
+            code, dev = start["user_code"], start["device_code"]
+            self.assertEqual(call("/device/token", {"device_code": dev})[1], '{"error": "authorization_pending"}')
+            # The approval page needs the owner, shows who is asking, and escapes what the device sent.
+            self.assertEqual(call(f"/device?code={code}")[0], 401)
+            status, page = call(f"/device?code={code}", headers=owner)
+            self.assertEqual(status, 200)
+            self.assertIn("Codexscript · veera@laptop · Linux 6.8", page)
+            self.assertIn('<option value="chatgpt" selected>', page)
+            csrf = page.split('name="csrf_token" value="')[1].split('"')[0]
+            # No CSRF token, or another site's Origin: refused.
+            self.assertEqual(call("/device", {"code": code, "role": "chatgpt", "decision": "approve"}, owner)[0], 403)
+            self.assertEqual(call("/device", {"code": code, "role": "chatgpt", "decision": "approve", "csrf_token": csrf},
+                                  {**owner, "Origin": "https://evil.example"})[0], 403)
+            self.srv._clear_auth_failures("127.0.0.1")
+            self.assertEqual(call("/device", {"code": code, "role": "chatgpt", "decision": "approve", "csrf_token": csrf}, owner)[0], 200)
+            got = json.loads(call("/device/token", {"device_code": dev})[1])
+            self.assertEqual(got["actor"], "chatgpt")
+            tok = got["access_token"]
+            self.assertEqual(call("/device/token", {"device_code": dev})[0], 400)  # one token per approval
+            auth = {"Authorization": f"Bearer {tok}"}
+            self.assertEqual(json.loads(call("/api/v1/briefing", headers=auth)[1])["authenticated_actor"], "chatgpt")
+            # Connected apps lists the device and revokes it.
+            apps = call("/apps", headers=owner)[1]
+            self.assertIn("veera@laptop", apps)
+            row_id = apps.split('name="kind" value="token"><input type="hidden" name="id" value="')[1].split('"')[0]
+            csrf = apps.split('name="csrf_token" value="')[1].split('"')[0]
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            req = urllib.request.Request(f"{base}/apps", data=urllib.parse.urlencode(
+                {"kind": "token", "id": row_id, "csrf_token": csrf}).encode(), headers=owner)
+            with self.assertRaises(urllib.error.HTTPError) as ctx:
+                urllib.request.build_opener(NoRedirect).open(req)
+            self.assertEqual(ctx.exception.code, 303)
+            ctx.exception.close()
+            self.assertEqual(call("/api/v1/briefing", headers=auth)[0], 401)
+            # A denied request gets no token.
+            start = json.loads(call("/device/code", {"app": "Claude Code"})[1])
+            call("/device", {"code": start["user_code"], "role": "claude", "decision": "deny", "csrf_token": csrf}, owner)
+            self.assertEqual(json.loads(call("/device/token", {"device_code": start["device_code"]})[1])["error"], "access_denied")
+        finally:
+            self.srv._clear_auth_failures("127.0.0.1")
+            httpd.shutdown()
+            httpd.server_close()
 
     def test_omni_sso_login_oauth_session_and_refresh_token(self) -> None:
         os.environ["MEMORY_ADMIN_EMAILS"] = "owner@example.com"

@@ -261,9 +261,12 @@ def resolve_actor_from_token(
             if token.startswith("vms_"):
                 return "owner" if web_session_email(db, token) else None
             row = db.execute(
-                "SELECT actor, parent, expires_at FROM oauth_tokens WHERE token_hash = ?",
+                "SELECT actor, parent, last_used, expires_at FROM oauth_tokens WHERE token_hash = ?",
                 (tok_hash,),
             ).fetchone()
+            if row and now_ts - row["last_used"] > 300:  # for the Connected apps page; at most one write per 5 min
+                db.execute("UPDATE oauth_tokens SET last_used = ? WHERE token_hash = ?", (now_ts, tok_hash))
+                db.commit()
         if row and row["expires_at"] > now_ts and oauth_parent_valid(str(row["parent"]), str(row["actor"])):
             stored_actor = str(row["actor"])
             return normalize_actor(stored_actor, subagent if stored_actor == "hermes" else None)
@@ -574,7 +577,20 @@ CREATE TABLE IF NOT EXISTS oauth_tokens (
     client_id TEXT NOT NULL,
     resource TEXT NOT NULL DEFAULT '',
     parent TEXT NOT NULL DEFAULT '',
+    label TEXT NOT NULL DEFAULT '',
+    last_used REAL NOT NULL DEFAULT 0,
     created_at REAL NOT NULL,
+    expires_at REAL NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS device_codes (
+    device_hash TEXT PRIMARY KEY,
+    user_code TEXT NOT NULL UNIQUE,
+    label TEXT NOT NULL,
+    role_hint TEXT NOT NULL,
+    ip TEXT NOT NULL,
+    actor TEXT NOT NULL DEFAULT '',
+    parent TEXT NOT NULL DEFAULT '',
     expires_at REAL NOT NULL
 );
 
@@ -609,6 +625,9 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE oauth_tokens ADD COLUMN refresh_hash TEXT NOT NULL DEFAULT ''")
     if "parent" not in oauth_tok_cols:
         conn.execute("ALTER TABLE oauth_tokens ADD COLUMN parent TEXT NOT NULL DEFAULT ''")
+    if "label" not in oauth_tok_cols:
+        conn.execute("ALTER TABLE oauth_tokens ADD COLUMN label TEXT NOT NULL DEFAULT ''")
+        conn.execute("ALTER TABLE oauth_tokens ADD COLUMN last_used REAL NOT NULL DEFAULT 0")
     if "parent" not in {r["name"] for r in conn.execute("PRAGMA table_info(oauth_codes)").fetchall()}:
         conn.execute("ALTER TABLE oauth_codes ADD COLUMN parent TEXT NOT NULL DEFAULT ''")
     conn.commit()
@@ -3566,7 +3585,7 @@ def render_dashboard_page(
           </form>
         </details>
         <label for="theme-dark" class="theme-toggle" title="Switch between Confluence Light and Slate Dark mode">🌓 Theme</label>
-        <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a href="/logout" style="color:var(--red);text-decoration:none;font-weight:600">Sign Out</a></div>
+        <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a href="/apps" style="color:inherit;font-weight:600">Apps</a> · <a href="/logout" style="color:var(--red);text-decoration:none;font-weight:600">Sign Out</a></div>
       </div>
     </header>
     <nav class="mobile-tabs" aria-label="Mobile view switcher">
@@ -3763,6 +3782,13 @@ MAX_OAUTH_CODES = 256
 MAX_OAUTH_TOKENS = 512
 PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{32,128}$")
+# Human pages that accept the owner's browser cookie; API/MCP routes never do.
+BROWSER_ROUTES = ("/", "/oauth/authorize", "/logout", "/download", "/device", "/apps")
+# Roles a device login can be granted (Hermes runs on the server with its own token).
+DEVICE_ROLES = {"claude": "Claude (Claude Code)", "chatgpt": "ChatGPT (Codex)", "antigravity": "Antigravity"}
+USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"  # no vowels or look-alikes, so codes never spell words
+MAX_PENDING_DEVICE_CODES = 20
+DEVICE_TOKEN_TTL = 86400 * 365
 DASHBOARD_CSP = (
     "default-src 'none'; "
     "style-src 'unsafe-inline'; "
@@ -3921,6 +3947,119 @@ def _state_cookie_header(state_value: str, max_age: int = 900) -> str:
     return f"vyn_memory_state={safe_st}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
 
 
+CARD_CSS = """body{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;padding:40px 16px;margin:0}
+.card{background:#1e293b;padding:24px 20px;border-radius:12px;border:1px solid #334155;max-width:var(--w);width:100%;box-sizing:border-box}
+h2{margin:0 0 12px;font-size:1.3rem}
+p,td{color:#cbd5e1;font-size:14px;line-height:1.5}
+.muted{color:#94a3b8;font-size:13px}
+.code{font:600 1.6rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;margin:4px 0 16px}
+select,button{width:100%;padding:11px;margin:6px 0;border-radius:6px;font-size:16px;box-sizing:border-box}
+select{border:1px solid #475569;background:#020617;color:#f8fafc}
+button{background:#38bdf8;color:#020617;border:none;font-weight:700;cursor:pointer}
+button.secondary{background:#334155;color:#f8fafc;border:1px solid #475569;font-weight:600}
+td button{width:auto;margin:0;padding:6px 12px;font-size:13px}
+button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
+a{color:#38bdf8;text-underline-offset:3px}
+code{color:#e2e8f0}
+::selection{background:#38bdf8;color:#020617}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin:8px 0 16px}
+th{text-align:left;color:#94a3b8;font-size:12px;font-weight:600;padding:8px 6px;border-bottom:1px solid #334155}
+td{padding:10px 6px;border-bottom:1px solid #263449;vertical-align:top}
+@media (max-width:640px){thead{display:none}tr{display:block;padding:10px 0;border-bottom:1px solid #334155}td{display:block;border:0;padding:2px 0}}"""
+
+
+def render_card_page(title: str, body: str, width: int = 430) -> str:
+    return f"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>{html.escape(title)} · Vyn Memory</title><style>{CARD_CSS}</style>
+</head><body><main class="card" style="--w:{width}px"><h2>{html.escape(title)}</h2>{body}</main></body></html>"""
+
+
+def _device_label(info: dict[str, object]) -> str:
+    """'Codex · veera@laptop · Linux 6.8' from what `memory.py login` reports (untrusted, so cleaned and capped)."""
+    def part(key: str) -> str:
+        return re.sub(r"[^\w .@()+/-]", "", str(info.get(key) or ""))[:60].strip()
+    host, user = part("host") or "unknown device", part("user")
+    return " · ".join(x for x in (part("app") or "Unknown app", f"{user}@{host}" if user else host, part("os")) if x)
+
+
+def _device_role_hint(label: str) -> str:
+    app = label.split(" · ")[0].lower()
+    if "codex" in app or "chatgpt" in app:
+        return "chatgpt"
+    return "antigravity" if "antigravity" in app or "gemini" in app else "claude"
+
+
+def render_device_page(row: sqlite3.Row) -> str:
+    options = "".join(
+        f'<option value="{r}"{" selected" if r == row["role_hint"] else ""}>{label}</option>'
+        for r, label in DEVICE_ROLES.items()
+    )
+    code = html.escape(str(row["user_code"]), quote=True)
+    body = f"""<p>A device is asking for its own memory token.</p>
+<p><strong>{html.escape(str(row["label"]))}</strong><br><span class="muted">from {html.escape(str(row["ip"]))}</span></p>
+<p class="muted">Approve only if you just ran <code>memory.py login</code> and your terminal shows this code:</p>
+<div class="code">{code}</div>
+<form method="post" action="/device">
+<input type="hidden" name="code" value="{code}">
+<input type="hidden" name="csrf_token" value="{html.escape(_mint_upload_csrf(), quote=True)}">
+<label class="muted" for="role">Act as</label>
+<select id="role" name="role">{options}</select>
+<button name="decision" value="approve">Approve</button>
+<button class="secondary" name="decision" value="deny">Deny</button>
+</form>"""
+    return render_card_page("Approve device login", body)
+
+
+def render_apps_page(conn: sqlite3.Connection) -> str:
+    def when(ts: float) -> str:
+        return datetime.fromtimestamp(ts, LOCAL_TZ).strftime("%d %b %Y, %H:%M") if ts else "–"
+
+    csrf = html.escape(_mint_upload_csrf(), quote=True)
+
+    def row_html(name: str, kind: str, acts_as: str, added: float, used: float, rev_kind: str, rowid: int) -> str:
+        return (
+            f'<tr><td><strong>{html.escape(name)}</strong><br><span class="muted">{kind}</span></td>'
+            f"<td>{html.escape(acts_as)}</td><td>{when(added)}</td><td>{when(used)}</td>"
+            f'<td><form method="post" action="/apps"><input type="hidden" name="csrf_token" value="{csrf}">'
+            f'<input type="hidden" name="kind" value="{rev_kind}"><input type="hidden" name="id" value="{rowid}">'
+            f'<button class="secondary" aria-label="Revoke {html.escape(name, quote=True)}">Revoke</button></form></td></tr>'
+        )
+
+    with DB_LOCK:
+        _prune_oauth_tables(conn)
+        conn.commit()
+        tokens = conn.execute("SELECT rowid, * FROM oauth_tokens ORDER BY MAX(last_used, created_at) DESC").fetchall()
+        sessions = conn.execute("SELECT rowid, * FROM web_sessions ORDER BY created_at DESC").fetchall()
+    rows = [
+        row_html(
+            str(t["label"] or t["client_id"]),
+            "Device login" if t["client_id"] == "device" else "Connector (OAuth)",
+            str(t["actor"]), t["created_at"], t["last_used"], "token", t["rowid"],
+        )
+        for t in tokens
+        if oauth_parent_valid(str(t["parent"]), str(t["actor"]))
+    ] + [
+        row_html(
+            "Owner token sign-in" if str(w["email"]).startswith("owner@token:") else str(w["email"]),
+            "Browser session", "owner", w["created_at"], 0, "session", w["rowid"],
+        )
+        for w in sessions
+        if owner_email_ok(str(w["email"]))
+    ]
+    roles = ", ".join(sorted(r for r in configured_tokens() if r != "owner")) or "none"
+    body = (
+        '<p class="muted">Everything that can reach your memory now. Revoke ends access at once; '
+        "a device can log in again with <code>memory.py login</code>.</p>"
+        "<table><thead><tr><th>App</th><th>Acts as</th><th>Added</th><th>Last used</th><th></th></tr></thead>"
+        f'<tbody>{"".join(rows) or "<tr><td colspan=5>Nothing connected.</td></tr>"}</tbody></table>'
+        f'<p class="muted">The server also has role tokens for: {html.escape(roles)}. '
+        "To revoke one, change it in the server's env file and restart.</p>"
+        '<p><a href="/">Back to the vault</a></p>'
+    )
+    return render_card_page("Connected apps", body, width=880)
+
+
 def render_login_page(next_path: str = f"/?scope={DEFAULT_SCOPE}", error_msg: str = "") -> str:
     safe_next = _sanitize_next_path(next_path)
     err_html = (
@@ -3992,6 +4131,7 @@ def _prune_oauth_tables(conn: sqlite3.Connection) -> None:
     conn.execute("DELETE FROM oauth_tokens WHERE expires_at < ?", (now_ts,))
     conn.execute("DELETE FROM web_auth_states WHERE expires_at < ?", (now_ts,))
     conn.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now_ts,))
+    conn.execute("DELETE FROM device_codes WHERE expires_at < ?", (now_ts,))
     code_count = int(conn.execute("SELECT COUNT(*) FROM oauth_codes").fetchone()[0])
     if code_count >= MAX_OAUTH_CODES:
         conn.execute(
@@ -4192,66 +4332,63 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             return True
         return False
 
-    def parse_route_and_auth(
-        self, *, allow_cookie: bool = False
-    ) -> tuple[str, dict[str, list[str]], str | None, str | None]:
-        """Strip optional /s/<token> prefix, returning (route, query, actor, url_token).
-
-        Security invariants:
-        - If /s/<token> is present in the URL, it must be valid on its own (never fall back to ambient cookies).
-        - Ambient browser cookies (__Host-vyn_memory_token / vyn_memory_token) are only accepted when
-          allow_cookie=True on human browser routes (/, /oauth/authorize, /logout, /download), never on API/MCP routes.
-        """
+    def parse_route_and_auth(self, *, allow_cookie: bool = False) -> tuple[str, dict[str, list[str]], str | None]:
+        """Return (route, query, actor). Tokens come only from the Authorization / X-API-Key headers, never the URL
+        (URLs end up in logs and browser history). Browser cookies count only when allow_cookie=True on the human
+        pages in BROWSER_ROUTES, never on API/MCP routes."""
         parsed = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(parsed.query)
         raw_path = parsed.path or "/"
-
-        url_token: str | None = None
         if raw_path.startswith("/s/"):
-            rest = raw_path[3:]
-            if "/" in rest:
-                url_token, sub = rest.split("/", 1)
-                raw_path = "/" + sub
-            else:
-                url_token = rest
-                raw_path = "/"
+            exc = MemoryError(f"Token URLs (/s/<token>/...) were removed. Connect to {PUBLIC_URL}/mcp and sign in, "
+                              "or send the token in an Authorization: Bearer header.")
+            exc.status = 410
+            raise exc
 
         auth_hdr = self.headers.get("Authorization", "").strip()
         bearer = auth_hdr[7:].strip() if auth_hdr.lower().startswith("bearer ") else ""
         api_key = self.headers.get("X-API-Key", "").strip()
-        q_token = (query.get("token") or [""])[0].strip()
         subagent = (
             self.headers.get("X-Hermes-Subagent", "").strip()
             or (query.get("subagent") or [""])[0].strip()
         )
-
-        ip = self.client_ip()
-        conn = self.server.db  # type: ignore[attr-defined]
-        if url_token is not None:
-            for candidate in (bearer, api_key, url_token):
-                if not candidate:
-                    continue
-                actor = resolve_actor_from_token(candidate, conn, subagent=subagent)
-                if actor:
-                    return raw_path, query, actor, url_token
-            _record_auth_failure(ip)
-            return raw_path, query, None, url_token
-
-        cookie_tokens: list[str] = []
-        if allow_cookie and raw_path in ("/", "/oauth/authorize", "/logout", "/download"):
-            cookie_tokens = self._extract_cookie_tokens()
+        cookie_tokens = self._extract_cookie_tokens() if allow_cookie and raw_path in BROWSER_ROUTES else []
 
         provided_any = False
-        for candidate in (bearer, api_key, q_token, *cookie_tokens):
+        for candidate in (bearer, api_key, *cookie_tokens):
             if not candidate:
                 continue
             provided_any = True
-            actor = resolve_actor_from_token(candidate, conn, subagent=subagent)
+            actor = resolve_actor_from_token(candidate, self.server.db, subagent=subagent)  # type: ignore[attr-defined]
             if actor:
-                return raw_path, query, actor, None
+                return raw_path, query, actor
         if provided_any:
-            _record_auth_failure(ip)
-        return raw_path, query, None, None
+            _record_auth_failure(self.client_ip())
+        return raw_path, query, None
+
+    def owner_cookie_email(self) -> str | None:
+        """Email of the owner browser session in this request's cookies, if any."""
+        for tok in self._extract_cookie_tokens():
+            email = web_session_email(self.server.db, tok)  # type: ignore[attr-defined]
+            if email is None and resolve_actor_from_token(tok) == "owner":
+                email = owner_session_email()
+            if email:
+                return email
+        return None
+
+    def read_owner_form(self) -> tuple[dict[str, list[str]], str] | None:
+        """Form fields and approving email of a same-origin, CSRF-checked owner POST; otherwise sends 403."""
+        try:
+            form = urllib.parse.parse_qs(self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace"))
+        except MemoryError as exc:
+            self.send_json(exc.status, {"error": str(exc)})
+            return None
+        email = self.owner_cookie_email()
+        if self._is_same_origin_browser_post() and _verify_upload_csrf((form.get("csrf_token") or [""])[0]) and email:
+            return form, email
+        _record_auth_failure(self.client_ip())
+        self.send_html(403, render_card_page("Not allowed", "<p>Sign in again and retry from the page.</p>"))
+        return None
 
     def require_auth(self, actor: str | None) -> bool:
         if actor:
@@ -4259,7 +4396,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         resource_meta = f"{PUBLIC_URL}/.well-known/oauth-protected-resource"
         self.send_json(
             401,
-            {"error": "Unauthorized; provide Bearer token, /s/<token>/mcp URL, or complete OAuth."},
+            {"error": "Unauthorized; send a Bearer token or complete OAuth."},
             extra_headers={
                 "WWW-Authenticate": f'Bearer resource_metadata="{resource_meta}"',
             },
@@ -4313,7 +4450,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             self.send_json(429, {"error": "Too many failed authentication attempts; try again in 5 minutes."})
             return
         try:
-            route, query, actor, url_token = self.parse_route_and_auth(allow_cookie=True)
+            route, query, actor = self.parse_route_and_auth(allow_cookie=True)
         except MemoryError as exc:
             self.send_json(exc.status, {"error": str(exc)})
             return
@@ -4435,19 +4572,18 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/.well-known/oauth-protected-resource":
-            base_u = f"{PUBLIC_URL}/s/{urllib.parse.quote(url_token, safe='')}" if url_token else PUBLIC_URL
             self.send_json(
                 200,
                 {
-                    "resource": f"{base_u}/mcp",
-                    "authorization_servers": [base_u],
+                    "resource": f"{PUBLIC_URL}/mcp",
+                    "authorization_servers": [PUBLIC_URL],
                     "bearer_methods_supported": ["header"],
                 },
             )
             return
 
         if route in ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"):
-            base_u = f"{PUBLIC_URL}/s/{urllib.parse.quote(url_token, safe='')}" if url_token else PUBLIC_URL
+            base_u = PUBLIC_URL
             self.send_json(
                 200,
                 {
@@ -4477,25 +4613,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             except MemoryError as exc:
                 self.send_json(exc.status, {"error": "invalid_request", "error_description": str(exc)})
                 return
-            prefilled_token = url_token if (url_token and actor) else ""
-            detected_actor = actor if prefilled_token else None
-            if not prefilled_token and "/s/" in resource:
-                m_res = re.search(r"/s/([^/?#]+)", resource)
-                if m_res:
-                    cand_tok = urllib.parse.unquote(m_res.group(1)).strip()
-                    cand_actor = resolve_actor_from_token(cand_tok, conn)
-                    if cand_actor:
-                        prefilled_token = cand_tok
-                        detected_actor = cand_actor
-            action_path = f"/s/{urllib.parse.quote(prefilled_token, safe='')}/oauth/authorize" if prefilled_token else "/oauth/authorize"
             default_role = _default_oauth_role(redirect_uri, query)
-            if prefilled_token and detected_actor:
-                auth_body_html = (
-                    f'<p style="color:#4ade80;font-size:14px">✅ Role token detected from connector URL (<strong>{html.escape(detected_actor)}</strong>). Click below to finish connecting:</p>'
-                    f'<input type="hidden" name="token" value="{html.escape(prefilled_token, quote=True)}">'
-                    f'<button type="submit">Approve Access</button>'
-                )
-            elif actor == "owner":
+            if actor == "owner":
                 oauth_csrf = _mint_upload_csrf()
                 role_options = "".join(
                     f'<option value="{r}" {"selected" if r == default_role else ""}>{label}</option>'
@@ -4536,7 +4655,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
 </head><body><div class="card">
 <h2>🔑 Authorize Vyn Memory</h2>
 <p style="font-size:14px">Access will be sent to <strong>{html.escape(urllib.parse.urlsplit(redirect_uri).hostname or "", quote=True)}</strong> (client <code>{html.escape(client_id, quote=True)}</code>). Approve only if you started this connection there.</p>
-<form method="post" action="{action_path}">
+<form method="post" action="/oauth/authorize">
   <input type="hidden" name="client_id" value="{html.escape(client_id, quote=True)}">
   <input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}">
   <input type="hidden" name="state" value="{html.escape(state, quote=True)}">
@@ -4548,7 +4667,32 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             self.send_html(200, form_html, csp=OAUTH_CSP)
             return
 
-        if route == "/" and actor is None and url_token is None and "text/html" in self.headers.get("Accept", ""):
+        if route in ("/device", "/apps"):
+            if actor != "owner":
+                self.send_html(401, render_login_page(next_path=self.path))
+                return
+            if route == "/apps":
+                self.send_html(200, render_apps_page(conn))
+                return
+            with DB_LOCK:
+                row = conn.execute(
+                    "SELECT * FROM device_codes WHERE user_code = ? AND actor = '' AND expires_at > ?",
+                    ((query.get("code") or [""])[0].strip().upper(), time.time()),
+                ).fetchone()
+            if row:
+                self.send_html(200, render_device_page(row))
+            else:
+                self.send_html(404, render_card_page(
+                    "Login request not found",
+                    "<p>It expired or was already answered. Run <code>memory.py login</code> again.</p>",
+                ))
+            return
+
+        if route == "/openapi.json":  # public: only the API shape, so ChatGPT Actions can import it
+            self.send_json(200, build_openapi_schema(PUBLIC_URL))
+            return
+
+        if route == "/" and actor is None and "text/html" in self.headers.get("Accept", ""):
             parsed_req = urllib.parse.urlsplit(self.path)
             next_target = "/" + (f"?{parsed_req.query}" if parsed_req.query else f"?scope={DEFAULT_SCOPE}")
             self.send_html(401, render_login_page(next_path=next_target))
@@ -4603,11 +4747,6 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 self.wfile.write(data_bytes)
             return
 
-        if route == "/openapi.json":
-            prefix = f"{PUBLIC_URL}/s/{urllib.parse.quote(url_token, safe='')}" if url_token else PUBLIC_URL
-            self.send_json(200, build_openapi_schema(prefix))
-            return
-
         if route == "/api/v1/briefing":
             project = (query.get("project") or [""])[0]
             scope = (query.get("scope") or [""])[0]
@@ -4653,11 +4792,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     self.send_json(429, {"error": "Too many active SSE sessions"})
                     return
                 SSE_SESSIONS[session_id] = (actor, q_chan)
-            msg_endpoint = (
-                f"/s/{urllib.parse.quote(url_token, safe='')}/messages?session_id={session_id}"
-                if url_token
-                else f"/messages?session_id={session_id}"
-            )
+            msg_endpoint = f"/messages?session_id={session_id}"
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.send_header("Cache-Control", "no-cache")
@@ -4707,32 +4842,14 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     },
                 )
                 return
-            extra_hdrs: dict[str, str] = {}
-            if url_token:
-                sess_tok = _mint_web_session(conn, owner_session_email())
-                extra_hdrs["Set-Cookie"] = _session_cookie_header(sess_tok, max_age=2592000)
-                if "text/html" in self.headers.get("Accept", ""):
-                    parsed_req = urllib.parse.urlsplit(self.path)
-                    clean_target = "/" + (f"?{parsed_req.query}" if parsed_req.query else f"?scope={DEFAULT_SCOPE}")
-                    self.send_response(303)
-                    self.send_header("Location", clean_target)
-                    self.send_header("Set-Cookie", extra_hdrs["Set-Cookie"])
-                    self.send_header("Cache-Control", "no-store")
-                    self.end_headers()
-                    return
-            selected_note = (query.get("note") or [""])[0]
-            scope_filter = (query.get("scope") or [""])[0]
-            search_q = (query.get("q") or [""])[0]
-            base_p = f"/s/{urllib.parse.quote(url_token, safe='')}/" if url_token else "/"
             page = render_dashboard_page(
                 conn,
                 actor,
-                selected_note=selected_note,
-                scope_filter=scope_filter,
-                search_query=search_q,
-                base_path=base_p,
+                selected_note=(query.get("note") or [""])[0],
+                scope_filter=(query.get("scope") or [""])[0],
+                search_query=(query.get("q") or [""])[0],
             )
-            self.send_html(200, page, extra_headers=extra_hdrs)
+            self.send_html(200, page)
             return
 
         self.send_json(404, {"error": f"Unknown route: {route}"})
@@ -4744,7 +4861,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             self.send_json(429, {"error": "Too many failed authentication attempts; try again in 5 minutes."})
             return
         try:
-            route, query, actor, url_token = self.parse_route_and_auth(allow_cookie=False)
+            route, query, actor = self.parse_route_and_auth(allow_cookie=False)
         except MemoryError as exc:
             self.send_json(exc.status, {"error": str(exc)})
             return
@@ -4873,20 +4990,13 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             elif (form.get("omni_session") or [""])[0].strip() == "1":
                 same_origin_ok = self._is_same_origin_browser_post()
                 csrf_ok = _verify_upload_csrf((form.get("csrf_token") or [""])[0])
-                cookie_actor = None
-                for cand_tok in self._extract_cookie_tokens():
-                    email = web_session_email(conn, cand_tok)
-                    if email is None and resolve_actor_from_token(cand_tok) == "owner":
-                        email = owner_session_email()
-                    if email:
-                        cookie_actor = "owner"
-                        parent = "email:" + email
-                        break
+                email = self.owner_cookie_email()
+                parent = "email:" + (email or "")
                 selected_role = (form.get("role") or ["claude"])[0].strip().lower()
                 if (
                     same_origin_ok
                     and csrf_ok
-                    and cookie_actor == "owner"
+                    and email
                     and selected_role in ("chatgpt", "claude", "antigravity", "hermes")
                 ):
                     resolved = selected_role
@@ -4976,8 +5086,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     now_ts = time.time()
                     conn.execute(
                         """
-                        INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, created_at, expires_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, label, last_used, created_at, expires_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             hashlib.sha256(access_token.encode()).hexdigest(),
@@ -4986,7 +5096,9 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                             tok_row["client_id"],
                             tok_row["resource"],
                             tok_row["parent"],
+                            tok_row["label"],
                             now_ts,
+                            tok_row["created_at"],
                             now_ts + 86400 * 365,
                         ),
                     )
@@ -5036,8 +5148,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 now_ts = time.time()
                 conn.execute(
                     """
-                    INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, created_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    INSERT INTO oauth_tokens(token_hash, refresh_hash, actor, client_id, resource, parent, label, created_at, expires_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         hashlib.sha256(access_token.encode()).hexdigest(),
@@ -5046,6 +5158,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                         row["client_id"],
                         row["resource"],
                         row["parent"],
+                        f'{urllib.parse.urlsplit(str(row["redirect_uri"])).hostname} connector',
                         now_ts,
                         now_ts + 86400 * 365,
                     ),
@@ -5060,6 +5173,117 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     "expires_in": 86400 * 365,
                 },
             )
+            return
+
+        if route == "/device/code":  # RFC 8628-style login for a device; the owner approves it at /device
+            try:
+                body = self.read_json_body()
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": "invalid_request", "error_description": str(exc)})
+                return
+            label = _device_label(body if isinstance(body, dict) else {})
+            device_code = secrets.token_urlsafe(32)
+            letters = "".join(secrets.choice(USER_CODE_ALPHABET) for _ in range(8))
+            user_code = f"{letters[:4]}-{letters[4:]}"
+            with DB_LOCK:
+                _prune_oauth_tables(conn)
+                # ponytail: global cap, so a flood of anonymous requests can delay logins for 10 minutes; per-IP caps if that bites
+                if conn.execute("SELECT COUNT(*) FROM device_codes").fetchone()[0] >= MAX_PENDING_DEVICE_CODES:
+                    conn.commit()
+                    self.send_json(429, {"error": "slow_down", "error_description": "Too many pending logins; try again later."})
+                    return
+                conn.execute(
+                    "INSERT INTO device_codes(device_hash, user_code, label, role_hint, ip, expires_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (hashlib.sha256(device_code.encode()).hexdigest(), user_code, label, _device_role_hint(label), ip, time.time() + 600),
+                )
+                conn.commit()
+            self.send_json(200, {
+                "device_code": device_code,
+                "user_code": user_code,
+                "verification_uri": f"{PUBLIC_URL}/device",
+                "verification_uri_complete": f"{PUBLIC_URL}/device?code={user_code}",
+                "expires_in": 600,
+                "interval": 5,
+            })
+            return
+
+        if route == "/device/token":
+            try:
+                body = self.read_json_body()
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": "invalid_request", "error_description": str(exc)})
+                return
+            device_hash = hashlib.sha256(str((body if isinstance(body, dict) else {}).get("device_code") or "").encode()).hexdigest()
+            with DB_LOCK:
+                _prune_oauth_tables(conn)
+                row = conn.execute("SELECT * FROM device_codes WHERE device_hash = ?", (device_hash,)).fetchone()
+                if not row:
+                    conn.commit()
+                    _record_auth_failure(ip)
+                    self.send_json(400, {"error": "expired_token"})
+                    return
+                if not row["actor"]:
+                    conn.commit()
+                    self.send_json(400, {"error": "authorization_pending"})
+                    return
+                conn.execute("DELETE FROM device_codes WHERE device_hash = ?", (device_hash,))
+                if row["actor"] == "denied" or not oauth_parent_valid(str(row["parent"]), str(row["actor"])):
+                    conn.commit()
+                    self.send_json(400, {"error": "access_denied"})
+                    return
+                token = "vmd_" + secrets.token_urlsafe(32)
+                now_ts = time.time()
+                conn.execute(
+                    """
+                    INSERT INTO oauth_tokens(token_hash, actor, client_id, parent, label, last_used, created_at, expires_at)
+                    VALUES (?, ?, 'device', ?, ?, ?, ?, ?)
+                    """,
+                    (hashlib.sha256(token.encode()).hexdigest(), row["actor"], row["parent"], row["label"],
+                     now_ts, now_ts, now_ts + DEVICE_TOKEN_TTL),
+                )
+                conn.commit()
+            self.send_json(200, {"access_token": token, "token_type": "Bearer", "actor": row["actor"], "expires_in": DEVICE_TOKEN_TTL})
+            return
+
+        if route == "/device":
+            owner = self.read_owner_form()
+            if not owner:
+                return
+            form, email = owner
+            role = (form.get("role") or [""])[0].strip().lower()
+            approve = (form.get("decision") or [""])[0] == "approve" and role in DEVICE_ROLES
+            with DB_LOCK:
+                cur = conn.execute(
+                    "UPDATE device_codes SET actor = ?, parent = ? WHERE user_code = ? AND actor = '' AND expires_at > ?",
+                    (role if approve else "denied", "email:" + email, (form.get("code") or [""])[0].strip().upper(), time.time()),
+                )
+                conn.commit()
+            if not cur.rowcount:
+                self.send_html(404, render_card_page("Login request not found", "<p>It expired or was already answered.</p>"))
+            elif approve:
+                self.send_html(200, render_card_page(
+                    "Approved",
+                    "<p>Go back to your terminal; the login finishes on its own.</p><p><a href=\"/apps\">Connected apps</a></p>",
+                ))
+            else:
+                self.send_html(200, render_card_page("Denied", "<p>That device gets no token.</p>"))
+            return
+
+        if route == "/apps":
+            owner = self.read_owner_form()
+            if not owner:
+                return
+            form = owner[0]
+            table = {"token": "oauth_tokens", "session": "web_sessions"}.get((form.get("kind") or [""])[0])
+            rowid = (form.get("id") or [""])[0]
+            if table and rowid.isdigit():
+                with DB_LOCK:
+                    conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (int(rowid),))
+                    conn.commit()
+            self.send_response(303)
+            self.send_header("Location", "/apps")
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
 
         if not self.require_auth(actor):

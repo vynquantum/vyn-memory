@@ -16,10 +16,10 @@ It never edits files itself, so it works the same from Hermes, the server or a l
 
 - **Address:** `MEMORY_HUB_URL` from the environment or the token file below; otherwise
   `http://vyn-memory:8770` inside Hermes and `http://127.0.0.1:8770` elsewhere.
-- **Who you are:** each app has a role token (`claude`, `chatgpt`, `antigravity`, `hermes`).
-  Hermes has its token already. Elsewhere, put the token and address in `~/.config/vyn-memory.env`
-  (`MEMORY_CLAUDE_TOKEN=...`, `MEMORY_HUB_URL=https://...`) and `chmod 600` it.
-  Never print a token or put it on a command line.
+- **Who you are:** each app acts as a role (`claude`, `chatgpt`, `antigravity`, `hermes`).
+  Hermes and the server's own apps have their tokens already. On another machine, run
+  `M login` once (with `MEMORY_HUB_URL` set): the owner approves it in a browser and this
+  device's own token is saved to `~/.config/vyn-memory.env`. Never print a token or put it on a command line.
 - **Phone apps** (claude.ai, ChatGPT) cannot run commands; they use the MCP connector at
   `<server address>/mcp`, which reaches the same server.
 
