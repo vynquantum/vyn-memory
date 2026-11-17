@@ -951,7 +951,15 @@ def extract_pdf_markdown(
     doc_title = file_path.stem.replace("-", " ").replace("_", " ")
     try:
         from pypdf import PdfReader  # type: ignore[import-not-found]
-
+        try:
+            import pypdf.filters as _pypdf_filters  # type: ignore[import-not-found]
+            if hasattr(_pypdf_filters, "ZLIB_MAX_OUTPUT_LENGTH"):
+                _pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH = min(
+                    int(_pypdf_filters.ZLIB_MAX_OUTPUT_LENGTH or 0) or (4 * 1024 * 1024),
+                    4 * 1024 * 1024,
+                )
+        except ImportError:
+            pass
         reader = PdfReader(io.BytesIO(data))
         meta = reader.metadata
         if meta and getattr(meta, "title", None):
@@ -962,23 +970,30 @@ def extract_pdf_markdown(
         sections: list[str] = [f"# {doc_title}", f"> 📄 **PDF Document** · {total_pages} page(s)"]
         chars = 0
         extracted_pages = 0
+        truncated = False
         for idx in range(min(total_pages, max_pages)):
             if chars >= max_chars:
                 break
             try:
-                page_txt = (reader.pages[idx].extract_text() or "").strip()
+                raw_page_txt = (reader.pages[idx].extract_text() or "").strip()
             except Exception:
-                page_txt = ""
+                raw_page_txt = ""
             extracted_pages = idx + 1
-            if not page_txt:
+            if not raw_page_txt:
                 continue
+            rem = max_chars - chars
+            if len(raw_page_txt) > rem:
+                page_txt = raw_page_txt[:rem]
+                truncated = True
+            else:
+                page_txt = raw_page_txt
             if total_pages > 1:
                 block = f"## Page {idx + 1}\n\n{page_txt}"
             else:
                 block = page_txt
             sections.append(block)
-            chars += len(block)
-        if total_pages > extracted_pages or chars >= max_chars:
+            chars += len( page_txt )
+        if total_pages > extracted_pages or chars >= max_chars or truncated:
             sections.append(
                 f"> *[Indexed first {extracted_pages} of {total_pages} pages ({chars:,} chars) to keep search fast. "
                 "Use the Open Original PDF button above to view the complete PDF.]*"
@@ -2087,9 +2102,10 @@ def op_list_notes(conn: sqlite3.Connection, scope: str = "") -> dict[str, object
         sync_vault_notes(conn)
         if (scope or "").strip():
             norm = normalize_scope(scope)
+            esc_norm = _escape_like(norm)
             rows = conn.execute(
-                "SELECT path, scope, title, summary, tags, updated_by, updated_at FROM notes WHERE scope = ? OR scope LIKE ? ORDER BY path ASC",
-                (norm, f"{norm}/%"),
+                "SELECT path, scope, title, summary, tags, updated_by, updated_at FROM notes WHERE scope = ? OR scope LIKE ? ESCAPE '\\' ORDER BY path ASC",
+                (norm, f"{esc_norm}/%"),
             ).fetchall()
         else:
             rows = conn.execute(
@@ -2133,6 +2149,7 @@ def op_search(
         sync_vault_notes(conn)
         cap = max(1, min(int(limit or 15), 50))
         norm_scope = normalize_scope(scope) if (scope or "").strip() else ""
+        esc_scope = _escape_like(norm_scope)
         fts_q = fts_query_tokens(query)
         val_mode = (validity or ("all" if include_history else "valid")).strip().lower()
         if val_mode not in ("valid", "invalid", "all"):
@@ -2147,8 +2164,8 @@ def op_search(
             """
             params_f: list[object] = [fts_q]
             if norm_scope:
-                sql_facts += " AND (f.scope = ? OR f.scope LIKE ?)"
-                params_f.extend([norm_scope, f"{norm_scope}/%"])
+                sql_facts += " AND (f.scope = ? OR f.scope LIKE ? ESCAPE '\\')"
+                params_f.extend([norm_scope, f"{esc_scope}/%"])
             else:
                 sql_facts += " AND f.scope != 'resources/books' AND f.scope NOT LIKE 'resources/books/%'"
             if category.strip():
@@ -2171,8 +2188,8 @@ def op_search(
             """
             params_n: list[object] = [fts_q]
             if norm_scope:
-                sql_notes += " AND (n.scope = ? OR n.scope LIKE ?)"
-                params_n.extend([norm_scope, f"{norm_scope}/%"])
+                sql_notes += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
+                params_n.extend([norm_scope, f"{esc_scope}/%"])
             else:
                 sql_notes += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
             sql_notes += " ORDER BY bm25(notes_fts) LIMIT ?"
@@ -2182,8 +2199,8 @@ def op_search(
             sql_facts = "SELECT * FROM facts WHERE 1=1"
             params_f = []
             if norm_scope:
-                sql_facts += " AND (scope = ? OR scope LIKE ?)"
-                params_f.extend([norm_scope, f"{norm_scope}/%"])
+                sql_facts += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
+                params_f.extend([norm_scope, f"{esc_scope}/%"])
             else:
                 sql_facts += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
             if category.strip():
@@ -2200,8 +2217,8 @@ def op_search(
             sql_notes = "SELECT path, scope, title, summary, tags, updated_by, updated_at, substr(body, 1, 240) AS snippet FROM notes WHERE 1=1"
             params_n = []
             if norm_scope:
-                sql_notes += " AND (scope = ? OR scope LIKE ?)"
-                params_n.extend([norm_scope, f"{norm_scope}/%"])
+                sql_notes += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
+                params_n.extend([norm_scope, f"{esc_scope}/%"])
             else:
                 sql_notes += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
             sql_notes += " ORDER BY updated_at DESC LIMIT ?"
@@ -2216,8 +2233,8 @@ def op_search(
         """
         params_o: list[object] = []
         if norm_scope:
-            sql_obs += " AND (n.scope = ? OR n.scope LIKE ?)"
-            params_o.extend([norm_scope, f"{norm_scope}/%"])
+            sql_obs += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
+            params_o.extend([norm_scope, f"{esc_scope}/%"])
         else:
             sql_obs += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
         if category.strip():
@@ -2646,7 +2663,10 @@ def handle_jsonrpc_message(conn: sqlite3.Connection, actor: str, msg: dict[str, 
     if method == "tools/list":
         return {"jsonrpc": "2.0", "id": req_id, "result": {"tools": MCP_TOOLS}}
     if method == "resources/list":
-        notes = op_list_notes(conn)["notes"]
+        try:
+            notes = op_list_notes(conn)["notes"]
+        except MemoryError as exc:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": str(exc)}}
         resources = [
             {
                 "uri": f"memory://{n['path']}",
@@ -2696,7 +2716,10 @@ def handle_jsonrpc_message(conn: sqlite3.Connection, actor: str, msg: dict[str, 
             },
         }
     if method == "prompts/get":
-        brief = op_briefing(conn, actor, scope=DEFAULT_SCOPE)
+        try:
+            brief = op_briefing(conn, actor, scope=DEFAULT_SCOPE)
+        except MemoryError as exc:
+            return {"jsonrpc": "2.0", "id": req_id, "error": {"code": -32602, "message": str(exc)}}
         return {
             "jsonrpc": "2.0",
             "id": req_id,
@@ -2898,41 +2921,63 @@ def render_markdown_html(md_text: str, prefix: str = "") -> str:
             out.append("</tbody></table></div>")
             in_table = False
 
-    def _render_md_link(m: re.Match[str]) -> str:
-        label_html = m.group(1)
-        raw_target = html.unescape(m.group(2).strip())
-        if raw_target.startswith(("http://", "https://", "mailto:")):
-            return f'<a class="ext-link" href="{html.escape(raw_target, quote=True)}" target="_blank" rel="noopener">{label_html}</a>'
-        if raw_target.startswith("#"):
-            return f'<a class="wikilink" href="{html.escape(raw_target, quote=True)}">{label_html}</a>'
-        clean_note = raw_target.split("#", 1)[0].strip().lstrip("./").removeprefix("memory/")
-        return f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(clean_note)}">{label_html}</a>'
-
     def inline_fmt(s: str) -> str:
         code_spans: list[str] = []
+        raw_codes: list[str] = []
+        link_spans: list[str] = []
+        clean_s = s.replace("\x00", "")
 
         def _stash_code(m: re.Match[str]) -> str:
             idx = len(code_spans)
+            raw_codes.append(m.group(1))
             code_spans.append(f"<code>{html.escape(m.group(1))}</code>")
             return f"\x00CODE{idx}\x00"
 
-        with_code_tokens = re.sub(r"`([^`]+)`", _stash_code, s)
+        def _restore_raw_codes(val: str) -> str:
+            for idx, rc in enumerate(raw_codes):
+                val = val.replace(f"\x00CODE{idx}\x00", rc)
+            return val
+
+        def _stash_link(anchor_html: str) -> str:
+            idx = len(link_spans)
+            link_spans.append(anchor_html)
+            return f"\x00LINK{idx}\x00"
+
+        def _render_md_link_local(m: re.Match[str]) -> str:
+            label_html = m.group(1)
+            raw_target = _restore_raw_codes(html.unescape(m.group(2).strip()))
+            if raw_target.startswith(("http://", "https://", "mailto:")):
+                return _stash_link(
+                    f'<a class="ext-link" href="{html.escape(raw_target, quote=True)}" target="_blank" rel="noopener">{label_html}</a>'
+                )
+            if raw_target.startswith("#"):
+                return _stash_link(f'<a class="wikilink" href="{html.escape(raw_target, quote=True)}">{label_html}</a>')
+            clean_note = raw_target.split("#", 1)[0].strip().lstrip("./").removeprefix("memory/")
+            return _stash_link(f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(clean_note)}">{label_html}</a>')
+
+        with_code_tokens = re.sub(r"`([^`]+)`", _stash_code, clean_s)
         humanized = _clean_latex_inline(with_code_tokens)
         escaped = html.escape(humanized)
         escaped = re.sub(
             r"\[\[([^\]|]+)\|([^\]]+)\]\]",
-            lambda m: f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(html.unescape(m.group(1)).strip().removeprefix("memory/"))}">{m.group(2)}</a>',
+            lambda m: _stash_link(
+                f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(_restore_raw_codes(html.unescape(m.group(1))).strip().removeprefix("memory/"))}">{m.group(2)}</a>'
+            ),
             escaped,
         )
         escaped = re.sub(
             r"\[\[([^\]]+)\]\]",
-            lambda m: f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(html.unescape(m.group(1)).strip().removeprefix("memory/"))}">{m.group(1)}</a>',
+            lambda m: _stash_link(
+                f'<a class="wikilink" href="{safe_prefix}?note={urllib.parse.quote(_restore_raw_codes(html.unescape(m.group(1))).strip().removeprefix("memory/"))}">{m.group(1)}</a>'
+            ),
             escaped,
         )
-        escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _render_md_link, escaped)
+        escaped = re.sub(r"\[([^\]]+)\]\(([^)\s]+)\)", _render_md_link_local, escaped)
         escaped = re.sub(r"\*\*([^*]+)\*\*", r"<strong>\1</strong>", escaped)
         escaped = re.sub(r"~~([^~]+)~~", r"<del>\1</del>", escaped)
         escaped = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"<em>\1</em>", escaped)
+        for idx, anchor_html in enumerate(link_spans):
+            escaped = escaped.replace(f"\x00LINK{idx}\x00", anchor_html)
         for idx, span_html in enumerate(code_spans):
             escaped = escaped.replace(f"\x00CODE{idx}\x00", span_html)
         return escaped
@@ -3112,7 +3157,11 @@ def render_dashboard_page(
     upload_csrf = _mint_upload_csrf()
     with DB_LOCK:
         sync_vault_notes(conn)
-    all_scope_notes = op_list_notes(conn, scope=scope_filter)["notes"]
+    try:
+        all_scope_notes = op_list_notes(conn, scope=scope_filter)["notes"]
+    except MemoryError:
+        scope_filter = ""
+        all_scope_notes = op_list_notes(conn, scope="")["notes"]
     if scope_filter == "daily":
         inbox_notes = op_list_notes(conn, scope="inbox")["notes"]
         seen_p = {str(n["path"]) for n in all_scope_notes}
@@ -4758,18 +4807,24 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             return
 
         if route == "/api/v1/briefing":
-            project = (query.get("project") or [""])[0]
-            scope = (query.get("scope") or [""])[0]
-            self.send_json(200, op_briefing(conn, actor, scope=scope, project=project))
+            try:
+                project = (query.get("project") or [""])[0]
+                scope = (query.get("scope") or [""])[0]
+                self.send_json(200, op_briefing(conn, actor, scope=scope, project=project))
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)})
             return
 
         if route == "/api/v1/search":
-            q = (query.get("query") or query.get("q") or [""])[0]
-            scope = (query.get("scope") or [""])[0]
-            cat = (query.get("category") or [""])[0]
-            val = (query.get("validity") or [""])[0]
-            inc = (query.get("include_history") or ["false"])[0].lower() in ("1", "true", "yes")
-            self.send_json(200, op_search(conn, query=q, scope=scope, category=cat, include_history=inc, validity=val))
+            try:
+                q = (query.get("query") or query.get("q") or [""])[0]
+                scope = (query.get("scope") or [""])[0]
+                cat = (query.get("category") or [""])[0]
+                val = (query.get("validity") or [""])[0]
+                inc = (query.get("include_history") or ["false"])[0].lower() in ("1", "true", "yes")
+                self.send_json(200, op_search(conn, query=q, scope=scope, category=cat, include_history=inc, validity=val))
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)})
             return
 
         if route == "/api/v1/context":
@@ -4782,8 +4837,11 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             return
 
         if route == "/api/v1/notes":
-            scope = (query.get("scope") or [""])[0]
-            self.send_json(200, op_list_notes(conn, scope=scope))
+            try:
+                scope = (query.get("scope") or [""])[0]
+                self.send_json(200, op_list_notes(conn, scope=scope))
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)})
             return
 
         if route == "/api/v1/note":
@@ -5198,8 +5256,8 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             user_code = f"{letters[:4]}-{letters[4:]}"
             with DB_LOCK:
                 _prune_oauth_tables(conn)
-                # ponytail: global cap, so a flood of anonymous requests can delay logins for 10 minutes; per-IP caps if that bites
-                if conn.execute("SELECT COUNT(*) FROM device_codes").fetchone()[0] >= MAX_PENDING_DEVICE_CODES:
+                # ponytail: count only unanswered (actor = '') rows so denied/approved codes free their slot immediately
+                if conn.execute("SELECT COUNT(*) FROM device_codes WHERE actor = ''").fetchone()[0] >= MAX_PENDING_DEVICE_CODES:
                     conn.commit()
                     self.send_json(429, {"error": "slow_down", "error_description": "Too many pending logins; try again later."})
                     return
@@ -5336,6 +5394,9 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 self.send_json(exc.status, {"error": str(exc)})
                 return
             if isinstance(payload, list):
+                if not payload or len(payload) > 32:
+                    self.send_json(400, {"error": "JSON-RPC batch must contain between 1 and 32 messages"})
+                    return
                 responses = [
                     r for item in payload if isinstance(item, dict)
                     if (r := handle_jsonrpc_message(conn, actor, item)) is not None

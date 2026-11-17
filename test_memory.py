@@ -1365,6 +1365,111 @@ class TestVynMemory(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_security_audit_run3_regressions(self) -> None:
+        # 1. render_markdown_html never injects <em>/<strong>/<del>/<code> inside <a href="..."> attributes
+        rendered = self.srv.render_markdown_html(
+            "[a](https://example.com/*x) and [b](https://example.com/*y)\n[c](https://example.com/`code`)"
+        )
+        self.assertIn('href="https://example.com/*x"', rendered)
+        self.assertIn('href="https://example.com/*y"', rendered)
+        self.assertIn('href="https://example.com/code"', rendered)
+        self.assertNotIn("href=\"https://example.com/<em>", rendered)
+        self.assertNotIn("href=\"https://example.com/<code>", rendered)
+
+        # 2. extract_pdf_markdown pypdf branch slices single-page text to max_chars
+        import types
+        fake_pypdf = types.ModuleType("pypdf")
+        class _FakePage:
+            def extract_text(self):
+                return "A" * 600_000
+        class _FakeReader:
+            def __init__(self, _stream):
+                self.metadata = None
+                self.pages = [_FakePage()]
+        fake_pypdf.PdfReader = _FakeReader
+        old_pypdf = sys.modules.get("pypdf")
+        sys.modules["pypdf"] = fake_pypdf
+        try:
+            _, body_md = self.srv.extract_pdf_markdown(Path("huge.pdf"), b"%PDF-1.4\n%%EOF", max_chars=50_000)
+            self.assertLessEqual(len(body_md), 51_000)
+            self.assertIn("Indexed first 1 of 1 pages (50,000 chars)", body_md)
+        finally:
+            if old_pypdf is None:
+                sys.modules.pop("pypdf", None)
+            else:
+                sys.modules["pypdf"] = old_pypdf
+
+        # 3. HTTP GET error handling (403/400 instead of RemoteDisconnected), MCP batch limit (<=32), and /device deny slot release
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        threading.Thread(target=httpd.serve_forever, daemon=True).start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            for p_403 in ("/api/v1/search?scope=personal", "/api/v1/notes?scope=personal", "/api/v1/briefing?scope=personal"):
+                req_403 = urllib.request.Request(f"{base}{p_403}", headers={"Authorization": "Bearer tok-claude-test"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx_403:
+                    urllib.request.urlopen(req_403)
+                self.assertEqual(ctx_403.exception.code, 403)
+                ctx_403.exception.close()
+
+            req_400 = urllib.request.Request(f"{base}/api/v1/notes?scope=agents/invalid", headers={"Authorization": "Bearer tok-claude-test"})
+            with self.assertRaises(urllib.error.HTTPError) as ctx_400:
+                urllib.request.urlopen(req_400)
+            self.assertEqual(ctx_400.exception.code, 400)
+            ctx_400.exception.close()
+
+            # Oversized JSON-RPC batch (>32) is rejected with 400
+            big_batch = json.dumps([{"jsonrpc": "2.0", "id": i, "method": "ping"} for i in range(33)]).encode()
+            req_batch = urllib.request.Request(
+                f"{base}/mcp",
+                data=big_batch,
+                headers={"Authorization": "Bearer tok-claude-test", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_b:
+                urllib.request.urlopen(req_batch)
+            self.assertEqual(ctx_b.exception.code, 400)
+            ctx_b.exception.close()
+
+            # Denying a pending device_code immediately frees its pending slot
+            codes = []
+            for i in range(self.srv.MAX_PENDING_DEVICE_CODES):
+                r_dc = urllib.request.Request(
+                    f"{base}/device/code",
+                    data=json.dumps({"app": "Codex", "host": f"h{i}"}).encode(),
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                with urllib.request.urlopen(r_dc) as resp:
+                    codes.append(json.loads(resp.read().decode()))
+            sess = self.srv._mint_web_session(self.conn, self.srv.owner_session_email())
+            csrf = self.srv._mint_upload_csrf()
+            deny_req = urllib.request.Request(
+                f"{base}/device",
+                data=urllib.parse.urlencode({"code": codes[0]["user_code"], "csrf_token": csrf, "role": "chatgpt", "decision": "deny"}).encode(),
+                headers={
+                    "Cookie": f"__Host-vyn_memory_token={sess}",
+                    "Sec-Fetch-Site": "same-origin",
+                    "Content-Type": "application/x-www-form-urlencoded",
+                },
+                method="POST",
+            )
+            with urllib.request.urlopen(deny_req) as resp:
+                self.assertEqual(resp.status, 200)
+            r_dc21 = urllib.request.Request(
+                f"{base}/device/code",
+                data=b'{"app":"Codex"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(r_dc21) as resp21:
+                self.assertEqual(resp21.status, 200)
+        finally:
+            self.srv._clear_auth_failures("127.0.0.1")
+            httpd.shutdown()
+            httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
