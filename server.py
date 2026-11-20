@@ -2321,22 +2321,25 @@ def op_search(
             params_f.append(cap)
             fact_rows = conn.execute(sql_facts, params_f).fetchall()
 
-            sql_notes = """
-                SELECT n.path, n.scope, n.title, n.summary, n.tags, n.updated_by, n.updated_at,
-                       snippet(notes_fts, 5, '[', ']', ' … ', 24) AS snippet
+            sql_notes_where = """
                 FROM notes_fts
                 JOIN notes n ON n.path = notes_fts.path
                 WHERE notes_fts MATCH ?
             """
             params_n: list[object] = [fts_q]
             if norm_scope:
-                sql_notes += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
+                sql_notes_where += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
                 params_n.extend([norm_scope, f"{esc_scope}/%"])
             else:
-                sql_notes += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
-            sql_notes += " ORDER BY bm25(notes_fts) LIMIT ?"
-            params_n.append(cap)
-            note_rows = conn.execute(sql_notes, params_n).fetchall()
+                sql_notes_where += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
+            notes_total = int(conn.execute("SELECT COUNT(*) " + sql_notes_where, params_n).fetchone()[0])
+            sql_notes = (
+                "SELECT n.path, n.scope, n.title, n.summary, n.tags, n.updated_by, n.updated_at, "
+                "snippet(notes_fts, 5, '[', ']', ' … ', 24) AS snippet "
+                + sql_notes_where
+                + " ORDER BY bm25(notes_fts) LIMIT ?"
+            )
+            note_rows = conn.execute(sql_notes, [*params_n, cap]).fetchall()
         else:
             sql_facts = "SELECT * FROM facts WHERE 1=1"
             params_f = []
@@ -2356,16 +2359,20 @@ def op_search(
             params_f.append(cap)
             fact_rows = conn.execute(sql_facts, params_f).fetchall()
 
-            sql_notes = "SELECT path, scope, title, summary, tags, updated_by, updated_at, substr(body, 1, 240) AS snippet FROM notes WHERE 1=1"
+            sql_notes_where = "FROM notes WHERE 1=1"
             params_n = []
             if norm_scope:
-                sql_notes += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
+                sql_notes_where += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
                 params_n.extend([norm_scope, f"{esc_scope}/%"])
             else:
-                sql_notes += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
-            sql_notes += " ORDER BY updated_at DESC LIMIT ?"
-            params_n.append(cap)
-            note_rows = conn.execute(sql_notes, params_n).fetchall()
+                sql_notes_where += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
+            notes_total = int(conn.execute("SELECT COUNT(*) " + sql_notes_where, params_n).fetchone()[0])
+            sql_notes = (
+                "SELECT path, scope, title, summary, tags, updated_by, updated_at, substr(body, 1, 240) AS snippet "
+                + sql_notes_where
+                + " ORDER BY updated_at DESC LIMIT ?"
+            )
+            note_rows = conn.execute(sql_notes, [*params_n, cap]).fetchall()
 
         sql_obs = """
             SELECT o.source_path, n.scope, o.category, o.observation, o.tags, o.line_num
@@ -2393,6 +2400,7 @@ def op_search(
             "query": query,
             "scope_filter": norm_scope or "all",
             "validity_filter": val_mode,
+            "notes_total": notes_total,
             "facts": [serialize_fact(r) for r in fact_rows],
             "observations": [
                 {
@@ -3332,8 +3340,177 @@ def _classify_confluence_bucket(path_str: str) -> str:
     return next((key for pattern, key in DASHBOARD["rules"] if re.match(pattern, low)), "other")
 
 
+_EMOJI_PREFIX_RE = re.compile(
+    r"^(?:[\U0001F000-\U0001FAFF\u2600-\u27BF\u2300-\u23FF\u2B00-\u2BFF\u2139\u24C2]"
+    r"[\uFE0E\uFE0F\u200D\U0001F3FB-\U0001F3FF]*\s*)+"
+)
+
+
+def _strip_leading_emoji(label: str) -> str:
+    """Strip leading Unicode emojis so UI chrome never renders broken tofu boxes on minimal OS fonts."""
+    cleaned = _EMOJI_PREFIX_RE.sub("", (label or "").strip()).strip()
+    return cleaned or (label or "").strip()
+
+
+_SVG_ICONS: dict[str, str] = {
+    "vault": '<path d="M4 19.5v-15A2.5 2.5 0 0 1 6.5 2H20v20H6.5a2.5 2.5 0 0 1 0-5H20"/>',
+    "folder": '<path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z"/>',
+    "grid": '<rect width="7" height="7" x="3" y="3" rx="1"/><rect width="7" height="7" x="14" y="3" rx="1"/><rect width="7" height="7" x="14" y="14" rx="1"/><rect width="7" height="7" x="3" y="14" rx="1"/>',
+    "upload": '<path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/>',
+    "sun": '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.93 4.93 1.41 1.41"/><path d="m17.66 17.66 1.41 1.41"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.34 17.66-1.41 1.41"/><path d="m19.07 4.93-1.41 1.41"/>',
+    "moon": '<path d="M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z"/>',
+    "menu": '<line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/>',
+    "lock": '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+    "spark": '<path d="M12 3v3"/><path d="M12 18v3"/><path d="m4.93 4.93 2.12 2.12"/><path d="m16.95 16.95 2.12 2.12"/><path d="M3 12h3"/><path d="M18 12h3"/><path d="m6.34 17.66 2.12-2.12"/><path d="m15.54 8.46 2.12-2.12"/>',
+}
+
+
+def _svg_icon(name: str, cls: str = "ico") -> str:
+    paths = _SVG_ICONS.get(name, _SVG_ICONS["folder"])
+    return (
+        f'<svg class="{cls}" width="15" height="15" viewBox="0 0 24 24" fill="none" '
+        f'stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" '
+        f'aria-hidden="true">{paths}</svg>'
+    )
+
+
+def _normalize_theme(raw: str | None) -> str:
+    val = (raw or "").strip().lower()
+    return val if val in ("light", "dark", "auto") else "auto"
+
+
+def _theme_cookie_header(theme_val: str) -> str:
+    val = _normalize_theme(theme_val)
+    if PUBLIC_URL.lower().startswith("https://"):
+        return f"vyn_theme={val}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000"
+    return f"vyn_theme={val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
+
+
+BASE_THEME_CSS = """
+    :root {
+      --bg: #f4f5f7;
+      --canvas: #ffffff;
+      --panel: #eceef2;
+      --panel-hover: #e2e5eb;
+      --header-bg: #fafbfc;
+      --border: #e1e4ea;
+      --border-strong: #c8cdd6;
+      --text: #18181b;
+      --text-body: #27272a;
+      --muted: #52525b;
+      --accent: #1d4ed8;
+      --accent-fg: #ffffff;
+      --accent-soft: #eaf0ff;
+      --accent-border: #93b4f6;
+      --mark-bg: #fef08a;
+      --mark-fg: #18181b;
+      --green: #14532d;
+      --green-bg: #dcfce7;
+      --amber: #78350f;
+      --amber-bg: #fef3c7;
+      --red: #991b1b;
+      --red-bg: #fee2e2;
+      --purple: #581c87;
+      --purple-bg: #f3e8ff;
+      --fact-fg: #1e3a5f;
+      --fact-bg: #e8eef6;
+      --retired-bg: #f3f4f6;
+      --retired-border: #d1d5db;
+      --code-inline-bg: #eef0f4;
+      --code-inline-fg: #18181b;
+      --pre-bg: #14171d;
+      --pre-fg: #f3f4f6;
+      --quote-bg: #f1f5fd;
+      --shadow: 0 2px 8px rgba(24, 24, 27, 0.06);
+      color-scheme: light;
+    }
+    html[data-theme="dark"] {
+      --bg: #111317;
+      --canvas: #171a21;
+      --panel: #20242e;
+      --panel-hover: #2b313e;
+      --header-bg: #0e1014;
+      --border: #262b36;
+      --border-strong: #394050;
+      --text: #f3f4f6;
+      --text-body: #dde1e9;
+      --muted: #a8b0c0;
+      --accent: #60a5fa;
+      --accent-fg: #0b1120;
+      --accent-soft: #1b2840;
+      --accent-border: #2e5086;
+      --mark-bg: #fde047;
+      --mark-fg: #111317;
+      --green: #86efac;
+      --green-bg: #132a1e;
+      --amber: #fcd34d;
+      --amber-bg: #2c210f;
+      --red: #fca5a5;
+      --red-bg: #33171a;
+      --purple: #d8b4fe;
+      --purple-bg: #271a38;
+      --fact-fg: #bfdbfe;
+      --fact-bg: #1d2838;
+      --retired-bg: #14171d;
+      --retired-border: #2c3240;
+      --code-inline-bg: #20242e;
+      --code-inline-fg: #93c5fd;
+      --pre-bg: #0b0d11;
+      --pre-fg: #f3f4f6;
+      --quote-bg: #162033;
+      --shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+      color-scheme: dark;
+    }
+    @media (prefers-color-scheme: dark) {
+      html[data-theme="auto"] {
+        --bg: #111317;
+        --canvas: #171a21;
+        --panel: #20242e;
+        --panel-hover: #2b313e;
+        --header-bg: #0e1014;
+        --border: #262b36;
+        --border-strong: #394050;
+        --text: #f3f4f6;
+        --text-body: #dde1e9;
+        --muted: #a8b0c0;
+        --accent: #60a5fa;
+        --accent-fg: #0b1120;
+        --accent-soft: #1b2840;
+        --accent-border: #2e5086;
+        --mark-bg: #fde047;
+        --mark-fg: #111317;
+        --green: #86efac;
+        --green-bg: #132a1e;
+        --amber: #fcd34d;
+        --amber-bg: #2c210f;
+        --red: #fca5a5;
+        --red-bg: #33171a;
+        --purple: #d8b4fe;
+        --purple-bg: #271a38;
+        --fact-fg: #bfdbfe;
+        --fact-bg: #1d2838;
+        --retired-bg: #14171d;
+        --retired-border: #2c3240;
+        --code-inline-bg: #20242e;
+        --code-inline-fg: #93c5fd;
+        --pre-bg: #0b0d11;
+        --pre-fg: #f3f4f6;
+        --quote-bg: #162033;
+        --shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+        color-scheme: dark;
+      }
+    }
+    ::placeholder { color: var(--muted); opacity: 1; }
+    .ico { flex-shrink: 0; vertical-align: -2px; }
+"""
+
+
 def _humanize_note_title(title: str, path_str: str) -> str:
-    cleaned = _clean_latex_inline(title.strip())
+    raw = _clean_latex_inline((title or "").strip())
+    # Strip raw inline Markdown formatting (`code`, **bold**, *italic*) that leaks into note titles
+    cleaned = re.sub(r"`([^`]+)`", r"\1", raw)
+    cleaned = re.sub(r"\*\*([^*]+)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\*)\*([^*]+)\*(?!\*)", r"\1", cleaned).strip()
     acronyms = {"c", "os", "arm", "dsa", "bsp", "api", "sql", "mcp", "rtos", "dma", "mmu", "jtag", "ui", "ux"}
 
     def _fmt_seg(seg: str) -> str:
@@ -3352,10 +3529,19 @@ def _humanize_note_title(title: str, path_str: str) -> str:
     return _fmt_seg(stem) or cleaned or title
 
 
+def _humanize_subject(subj: str) -> str:
+    cleaned = (subj or "").strip()
+    if not cleaned:
+        return ""
+    return cleaned.replace("-", " ").replace("_", " ").strip()
+
+
 def _format_search_snippet(raw_snippet: str) -> str:
     """Safely render SQLite FTS5 snippet text, highlighting [term] markers as <mark>term</mark>."""
     cleaned = re.sub(r"\s+", " ", (raw_snippet or "").strip())
-    cleaned = re.sub(r"(?:^|\s)#{1,6}\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"(?:^|\s)#{1,6}\s+", " ", cleaned)
+    cleaned = re.sub(r"`|\*\*|\|(?:\s*:?-+:?\s*\|)+", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     if len(cleaned) > 260:
         cleaned = cleaned[:257].rstrip() + "…"
     escaped = html.escape(cleaned)
@@ -3385,8 +3571,13 @@ def render_dashboard_page(
     view: str = "",
     base_path: str = "/",
     session_token: str = "",
+    theme: str = "auto",
 ) -> str:
     safe_base_path = html.escape(base_path or "/", quote=True)
+    theme_mode = _normalize_theme(theme)
+    next_theme = "light" if theme_mode == "dark" else "dark"
+    theme_btn_label = "Light" if theme_mode == "dark" else "Dark"
+    theme_btn_icon = _svg_icon("sun" if theme_mode == "dark" else "moon")
     upload_csrf = _mint_upload_csrf(purpose="upload", session_token=session_token)
     facts_csrf = _mint_upload_csrf(purpose="facts", session_token=session_token)
     with DB_LOCK:
@@ -3420,10 +3611,6 @@ def render_dashboard_page(
     preferred_defaults = DASHBOARD["landing"]
     default_landing = next((cand for cand in preferred_defaults if cand in note_paths_set), "")
 
-    # Dedicated views:
-    # - Searching without an explicit selected_note -> Search Results view (snippets + facts + scope chips)
-    # - view="topics" (or browsing a folder with no landing note and no explicit note) -> Topic Explorer view
-    # - Otherwise -> Article Reader view
     if q_clean and not selected_note:
         target_note = ""
         active_view = "search"
@@ -3452,7 +3639,7 @@ def render_dashboard_page(
     root_folders = DASHBOARD["folders"]
     all_known_scopes = DASHBOARD["scopes"]
     dashboard_title = str(DASHBOARD.get("title") or "Vyn Memory")
-    group_labels = {k: lbl for k, lbl, _ in DASHBOARD["groups"]}
+    group_labels = {k: _strip_leading_emoji(lbl) for k, lbl, _ in DASHBOARD["groups"]}
 
     def _is_folder_active(root_sc: str) -> bool:
         if not root_sc:
@@ -3469,25 +3656,26 @@ def render_dashboard_page(
     def _folder_label(sc: str) -> str:
         for s_key, s_lbl in root_folders:
             if s_key == sc:
-                return s_lbl
+                return _strip_leading_emoji(s_lbl)
         return sc.replace("-", " ").replace("_", " ").title() if sc else "Entire Vault"
 
     scope_pills = "".join(
-        f'<a class="pill {"active" if _is_folder_active(s) else ""}" '
+        f'<a class="folder-row {"active" if _is_folder_active(s) else ""}" '
         f'href="{safe_base_path}?scope={urllib.parse.quote(s)}&view=topics">'
-        f'<span class="pill-label">{label}</span>'
+        f'<span class="folder-row-left">{_svg_icon("vault" if not s else "folder")}'
+        f'<span class="pill-label">{html.escape(_strip_leading_emoji(label))}</span></span>'
         f'<span class="pill-count">{_folder_count(s)}</span></a>'
         for s, label in root_folders
     )
 
-    def _note_badge(path_str: str) -> str:
+    def _note_badge(path_str: str, bucket_key: str = "") -> str:
         low = path_str.lower()
         if low.endswith(".pdf"):
             return " <span class='badge scope-badge'>PDF</span>"
         if low.endswith(".docx"):
             return " <span class='badge scope-badge'>DOCX</span>"
         fname = low.rsplit("/", 1)[-1]
-        if fname.startswith(("00-", "master-")) or fname == "readme.md":
+        if bucket_key != "start" and (fname.startswith(("00-", "master-")) or fname == "readme.md"):
             return " <span class='badge guide-badge'>GUIDE</span>"
         return ""
 
@@ -3501,7 +3689,7 @@ def render_dashboard_page(
             pinned_links_list.append(
                 f'<a class="quick-link {is_act}" '
                 f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(p_path)}">'
-                f"{p_label}</a>"
+                f"{html.escape(_strip_leading_emoji(p_label))}</a>"
             )
     quick_links_html = (
         '<div class="quick-links"><div class="sidebar-section-label">Quick Access</div>'
@@ -3536,17 +3724,22 @@ def render_dashboard_page(
     non_empty_bucket_keys = [k for k, _, _ in DASHBOARD["groups"] if sorted_buckets.get(k)]
     tree_groups_html: list[str] = []
     q_param_suffix = f"&q={urllib.parse.quote(q_clean)}" if q_clean else ""
-    for b_key, b_label, default_open in DASHBOARD["groups"]:
+    for b_key, b_label_raw, default_open in DASHBOARD["groups"]:
         b_notes_sorted = sorted_buckets.get(b_key, [])
         if not b_notes_sorted:
             continue
+        b_label = _strip_leading_emoji(b_label_raw)
         has_active = any(str(n["path"]) == active_path_str for n in b_notes_sorted)
-        should_open = (
-            has_active
-            or default_open
-            or bool(q_clean)
-            or len(non_empty_bucket_keys) <= 3
-        ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not q_clean and len(non_empty_bucket_keys) > 1)
+        # When reading a specific note, open ONLY the active topic so the current note stays visible near top of sidebar
+        if active_view == "reader" and active_path_str:
+            should_open = has_active
+        else:
+            should_open = (
+                has_active
+                or bool(q_clean)
+                or len(non_empty_bucket_keys) <= 2
+                or (default_open and active_view != "topics")
+            ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not q_clean and len(non_empty_bucket_keys) > 1)
         items_html: list[str] = []
         for n in b_notes_sorted:
             n_path = str(n["path"])
@@ -3565,14 +3758,14 @@ def render_dashboard_page(
                 f'<li><a class="tree-item {is_act}" '
                 f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}{q_param_suffix}" '
                 f'title="{html.escape(n_path)}">'
-                f'<span class="tree-title">{sub_hint}{html.escape(clean_title)}{_note_badge(n_path)}</span>'
+                f'<span class="tree-title">{sub_hint}{html.escape(clean_title)}{_note_badge(n_path, b_key)}</span>'
                 f"</a></li>"
             )
         open_attr = " open" if should_open else ""
         tree_groups_html.append(
             f'<details class="tree-group"{open_attr}>'
             f'<summary class="tree-summary">'
-            f'<span class="tree-folder-name">{b_label}</span>'
+            f'<span class="tree-folder-name">{html.escape(b_label)}</span>'
             f'<span class="tree-count">{len(b_notes_sorted)}</span>'
             f"</summary>"
             f'<ul class="note-list">{"".join(items_html)}</ul>'
@@ -3580,7 +3773,7 @@ def render_dashboard_page(
         )
     notes_tree_html = "".join(tree_groups_html) or '<p class="muted">No matching pages in this folder.</p>'
 
-    # Breadcrumbs + Prev/Next traversal for active article
+    # Breadcrumbs (parent folders only; H1 displays the document title cleanly) + Prev/Next traversal
     breadcrumbs_html = ""
     pager_html = ""
     active_topic_badge = ""
@@ -3597,14 +3790,12 @@ def render_dashboard_page(
             crumbs.append(
                 f'<a href="{safe_base_path}?scope={urllib.parse.quote(sc_path)}&view=topics">{html.escape(folder_label)}</a>'
             )
-        doc_title = _humanize_note_title(str(active_note_meta["title"]), str(active_note_meta["path"]))
-        crumbs.append(f'<span class="crumb-current">{html.escape(doc_title)}</span>')
-        breadcrumbs_html = '<nav class="breadcrumbs" aria-label="Breadcrumb">' + ' <span class="crumb-sep">›</span> '.join(crumbs) + "</nav>"
+        breadcrumbs_html = '<nav class="breadcrumbs" aria-label="Breadcrumb">' + ' <span class="crumb-sep" aria-hidden="true">/</span> '.join(crumbs) + "</nav>"
 
         active_bucket = _classify_confluence_bucket(active_path_str)
         active_topic_label = group_labels.get(active_bucket, "")
         if active_topic_label:
-            active_topic_badge = f"<span class='badge topic-badge'>{active_topic_label}</span>"
+            active_topic_badge = f"<span class='badge topic-badge'>{html.escape(active_topic_label)}</span>"
         topic_list = sorted_buckets.get(active_bucket, [])
         if topic_list:
             idx = next((i for i, item in enumerate(topic_list) if str(item["path"]) == active_path_str), -1)
@@ -3636,11 +3827,11 @@ def render_dashboard_page(
         ext_label = "PDF" if str(active_note_meta["path"]).lower().endswith(".pdf") else "DOCX"
         dl_href = f"{safe_base_path.rstrip('/')}/download?path={urllib.parse.quote(str(active_note_meta['path']))}"
         active_download_btn = (
-            f" · <a class='dl-btn' href='{dl_href}' target='_blank' rel='noopener'>"
+            f"<a class='dl-btn' href='{dl_href}' target='_blank' rel='noopener'>"
             f"Open Original {ext_label}</a>"
         )
 
-    # Connected notes & backlinks at the bottom of the article
+    # Connected notes & backlinks at the bottom of the article (clean flat links, no nested card borders)
     connected_html = ""
     if active_note_meta and active_note_meta.get("connected_notes"):
         conn_cards: list[str] = []
@@ -3648,7 +3839,7 @@ def render_dashboard_page(
             cn_path = str(cn["path"])
             cn_title = _humanize_note_title(str(cn["title"]), cn_path)
             conn_cards.append(
-                f'<a class="conn-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(cn_path)}">'
+                f'<a class="conn-item" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(cn_path)}">'
                 f"<strong>{html.escape(cn_title)}</strong>"
                 f"<span class='muted'>{html.escape(cn_path)}</span></a>"
             )
@@ -3659,8 +3850,10 @@ def render_dashboard_page(
             "</section>"
         )
 
-    # Sticky Right-Hand "On this page" Table of Contents
-    if toc_items:
+    # Sticky Right-Hand Context Column: TOC on Reader, ALL Topics Jump on Topics, hidden on Search (Facts takes top slot)
+    if active_view == "search":
+        toc_html = ""
+    elif toc_items:
         toc_links = "".join(
             f'<a class="toc-link toc-h{item["level"]}" href="#{html.escape(str(item["id"]), quote=True)}">'
             f'{html.escape(str(item["title"]))}</a>'
@@ -3669,16 +3862,19 @@ def render_dashboard_page(
         toc_html = f'<nav class="toc-nav" aria-label="On this page"><div class="toc-header">On this page</div>{toc_links}</nav>'
     elif active_view == "topics":
         topic_jump_links = "".join(
-            f'<a class="toc-link toc-h2" href="#topic-{html.escape(b_key, quote=True)}">{group_labels.get(b_key, b_key)} ({len(sorted_buckets[b_key])})</a>'
-            for b_key in non_empty_bucket_keys[:24]
+            f'<a class="toc-link toc-h2" href="#topic-{html.escape(b_key, quote=True)}">'
+            f'<span>{html.escape(group_labels.get(b_key, b_key))}</span><span class="toc-cnt">{len(sorted_buckets[b_key])}</span></a>'
+            for b_key in non_empty_bucket_keys
         )
         toc_html = (
-            f'<nav class="toc-nav" aria-label="Jump to topic"><div class="toc-header">Jump to topic</div>{topic_jump_links}</nav>'
+            f'<nav class="toc-nav" aria-label="Jump to topic"><div class="toc-header">Jump to topic ({len(non_empty_bucket_keys)})</div>{topic_jump_links}</nav>'
             if topic_jump_links
-            else '<div class="toc-nav"><div class="toc-header">Topics</div><p class="muted">No topics in this folder yet.</p></div>'
+            else ""
         )
+    elif active_view == "reader":
+        toc_html = '<nav class="toc-nav" aria-label="On this page"><div class="toc-header">On this page</div><div class="muted">Single-section page</div></nav>'
     else:
-        toc_html = '<div class="toc-nav"><div class="toc-header">On this page</div><p class="muted">Open any page with headings to jump straight to a section.</p></div>'
+        toc_html = ""
 
     upload_scope_default = scope_filter if scope_filter in all_known_scopes and scope_filter else DEFAULT_SCOPE
     upload_scope_options = "".join(
@@ -3700,13 +3896,15 @@ def render_dashboard_page(
     current_page_url = f"{base_path or '/'}?{urllib.parse.urlencode(cur_qs)}"
 
     all_facts = list(search_res["facts"])
-    active_fact_count = sum(1 for f in all_facts if f.get("is_valid", True))
+    active_facts_only = [f for f in all_facts if f.get("is_valid", True)]
+    active_fact_count = len(active_facts_only)
     retired_fact_count = len(all_facts) - active_fact_count
     facts_html_rows: list[str] = []
     for f in all_facts:
         is_inv = not f.get("is_valid", True)
         badge_cls = f"cat-{html.escape(str(f['category']))}"
-        subj = f"<strong>[{html.escape(str(f['subject']))}]</strong> " if f.get("subject") else ""
+        subj_label = _humanize_subject(str(f.get("subject") or ""))
+        subj = f"<span class='fact-subject'>{html.escape(subj_label)}</span> " if subj_label else ""
         row_text = f"{subj}{html.escape(_clean_latex_inline(str(f['fact'])))}"
         state_badge = "<span class='badge valid-badge'>VALID</span>"
         history_note = ""
@@ -3726,14 +3924,17 @@ def render_dashboard_page(
                 history_note = f"<div class='fact-reason'>{' · '.join(extra_parts)}</div>"
         elif actor == "owner":
             action_html = (
-                f"<form class='fact-retire-form' method='post' action='{safe_base_path.rstrip('/')}/facts'>"
+                f"<details class='confirm-box'>"
+                f"<summary class='confirm-trigger' aria-label='Retire fact #{int(f['id'])}'>Retire</summary>"
+                f"<form class='confirm-pop' method='post' action='{safe_base_path.rstrip('/')}/facts'>"
                 f"<input type='hidden' name='csrf_token' value='{html.escape(facts_csrf, quote=True)}'>"
                 f"<input type='hidden' name='action' value='forget'>"
                 f"<input type='hidden' name='fact_id' value='{int(f['id'])}'>"
                 f"<input type='hidden' name='next' value='{html.escape(current_page_url, quote=True)}'>"
                 f"<input type='hidden' name='reason' value='Retired by owner in web UI'>"
-                f"<button type='submit' class='fact-retire-btn' aria-label='Retire fact #{int(f['id'])}'>Retire</button>"
-                f"</form>"
+                f"<span class='muted'>Move #{int(f['id'])} to history?</span>"
+                f"<button type='submit' class='danger-btn'>Confirm retire</button>"
+                f"</form></details>"
             )
         facts_html_rows.append(
             f"<div class='fact-card {'superseded' if is_inv else ''}'>"
@@ -3742,7 +3943,7 @@ def render_dashboard_page(
             f"<span class='badge scope-badge'>{html.escape(str(f['scope']))}</span></div>{action_html}</div>"
             f"<div class='fact-text'>{row_text}</div>"
             f"{history_note}"
-            f"<div class='fact-meta'>#{f['id']} · by <code>{html.escape(str(f['author']))}</code> · {html.escape(str(f['valid_from'])[:10])}"
+            f"<div class='fact-meta'>#{f['id']} · by <span class='meta-mono'>{html.escape(str(f['author']))}</span> · {html.escape(str(f['valid_from'])[:10])}"
             + (f" → {html.escape(str(f['valid_until'])[:10])}" if f.get("valid_until") else "")
             + "</div></div>"
         )
@@ -3769,8 +3970,10 @@ def render_dashboard_page(
         )
 
     # Build main center view (Search Results, Topic Explorer, Article Reader, or Empty Onboarding)
+    reader_surface_cls = "reader-sheet" if active_view in ("reader", "empty") else "reader-flat"
     if active_view == "search":
         matched_notes_list = list(search_res["notes"])
+        matched_notes_total = int(search_res.get("notes_total") or len(matched_notes_list))
         scope_counts: dict[str, int] = {}
         for mn in matched_notes_list:
             top_sc = str(mn["scope"]).split("/", 1)[0]
@@ -3787,41 +3990,43 @@ def render_dashboard_page(
                 f'{html.escape(sc_top.title())} ({sc_cnt})</a>'
             )
 
-        fact_hits_html = ""
-        active_fact_hits = [f for f in all_facts if f.get("is_valid", True)][:6]
-        if active_fact_hits:
-            fh_cards = "".join(
-                f"<div class='search-fact-row'>"
-                f"<span class='badge valid-badge'>FACT</span> "
-                f"<span class='badge scope-badge'>{html.escape(str(f['scope']))}</span> "
-                + (f"<strong>[{html.escape(str(f['subject']))}]</strong> " if f.get("subject") else "")
-                + f"{html.escape(_clean_latex_inline(str(f['fact'])))}"
-                f"</div>"
-                for f in active_fact_hits
+        # Compact mobile-only disclosure for Matching Verified Facts (desktop displays them once in the right rail)
+        mobile_facts_html = ""
+        if active_facts_only:
+            mf_items = "".join(
+                f"<li class='mobile-fact-item'><span class='badge scope-badge'>{html.escape(str(f['scope']))}</span> "
+                f"{html.escape(_clean_latex_inline(str(f['fact'])))}</li>"
+                for f in active_facts_only[:6]
             )
-            fact_hits_html = (
-                "<section class='search-section'>"
-                f"<h2 class='section-kicker'>Matching Verified Facts ({len(active_fact_hits)})</h2>"
-                f"<div class='search-fact-list'>{fh_cards}</div></section>"
+            mobile_facts_html = (
+                f'<details class="mobile-search-facts">'
+                f"<summary>Matching Verified Facts ({active_fact_count})</summary>"
+                f'<ul class="mobile-fact-list">{mf_items}</ul></details>'
             )
 
         page_cards_html: list[str] = []
         for mn in matched_notes_list:
             mp = str(mn["path"])
+            m_bkey = _classify_confluence_bucket(mp)
             m_title = _humanize_note_title(str(mn["title"]), mp)
-            m_bucket = group_labels.get(_classify_confluence_bucket(mp), str(mn["scope"]))
+            m_bucket = group_labels.get(m_bkey, str(mn["scope"]))
             m_snip = _format_search_snippet(str(mn.get("snippet") or mn.get("summary") or ""))
             page_cards_html.append(
                 f'<a class="result-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(mp)}&q={urllib.parse.quote(q_clean)}">'
-                f'<div class="result-top"><span class="result-title">{html.escape(m_title)}{_note_badge(mp)}</span>'
+                f'<div class="result-top"><span class="result-title">{html.escape(m_title)}{_note_badge(mp, m_bkey)}</span>'
                 f'<span class="result-date">{html.escape(str(mn.get("updated_at") or "")[:10])}</span></div>'
-                f'<div class="result-meta"><span class="badge topic-badge">{m_bucket}</span> <code>{html.escape(mp)}</code></div>'
+                f'<div class="result-meta"><span class="badge topic-badge">{html.escape(m_bucket)}</span> <span class="meta-mono">{html.escape(mp)}</span></div>'
                 + (f'<p class="result-snippet">{m_snip}</p>' if m_snip else "")
                 + "</a>"
             )
+        count_phrase = (
+            f"Showing top <strong>{len(matched_notes_list)}</strong> of <strong>{matched_notes_total}</strong> pages"
+            if matched_notes_total > len(matched_notes_list)
+            else f"Found <strong>{len(matched_notes_list)}</strong> page(s)"
+        )
         pages_section = (
             "<section class='search-section'>"
-            f"<h2 class='section-kicker'>Matching Pages ({len(matched_notes_list)})</h2>"
+            f"<h2 class='section-kicker'>Matching Pages ({matched_notes_total})</h2>"
             + (f'<div class="result-list">{"".join(page_cards_html)}</div>' if page_cards_html else
                f'<p class="muted">No pages matched <code>{html.escape(q_clean)}</code>'
                + (f' in <strong>{html.escape(_folder_label(scope_filter))}</strong>. '
@@ -3832,19 +4037,20 @@ def render_dashboard_page(
         )
         reader_body_html = (
             "<div class='search-header'>"
-            f"<h1>Search: <code>{html.escape(q_clean)}</code></h1>"
-            f"<p class='muted'>Found <strong>{len(matched_notes_list)}</strong> page(s) and <strong>{len(all_facts)}</strong> fact(s)"
+            f"<h1>Search: <span class='meta-mono'>{html.escape(q_clean)}</span></h1>"
+            f"<p class='muted'>{count_phrase} and <strong>{active_fact_count}</strong> active fact(s)"
             + (f" in <strong>{html.escape(_folder_label(scope_filter))}</strong>" if scope_filter else " across the entire vault")
             + f" · <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics'>Clear search</a></p>"
             f"<div class='filter-chip-row'>{''.join(filter_chips)}</div>"
             "</div>"
-            + fact_hits_html
+            + mobile_facts_html
             + pages_section
         )
     elif active_view == "topics":
-        recent_notes = sorted(notes, key=lambda n: str(n.get("updated_at") or ""), reverse=True)[:6]
+        recent_notes = sorted(notes, key=lambda n: str(n.get("updated_at") or ""), reverse=True)[:4]
         recent_cards = "".join(
-            f'<a class="recent-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(rn["path"]))}">'
+            f'<a class="recent-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(rn["path"]))}" '
+            f'title="{html.escape(_humanize_note_title(str(rn["title"]), str(rn["path"])))}">'
             f'<span class="recent-title">{html.escape(_humanize_note_title(str(rn["title"]), str(rn["path"])))}</span>'
             f'<span class="recent-meta">{html.escape(str(rn["scope"]))} · {html.escape(str(rn.get("updated_at") or "")[:10])}</span>'
             "</a>"
@@ -3856,23 +4062,40 @@ def render_dashboard_page(
             b_lbl = group_labels.get(b_key, b_key)
             top_links = "".join(
                 f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
-                f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]))}</a></li>'
+                f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]), b_key)}</a></li>'
                 for it in b_list[:5]
             )
             more_html = ""
             if len(b_list) > 5:
-                rest_links = "".join(
-                    f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
-                    f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]))}</a></li>'
-                    for it in b_list[5:]
+                common_scope = str(b_list[0]["scope"])
+                same_narrow_scope = common_scope and common_scope != scope_filter and all(
+                    str(it["scope"]) == common_scope or str(it["scope"]).startswith(common_scope + "/")
+                    for it in b_list
                 )
-                more_html = (
-                    f'<details class="topic-more"><summary>Show all {len(b_list)} pages</summary>'
-                    f'<ul class="topic-card-list">{rest_links}</ul></details>'
-                )
+                if same_narrow_scope and len(b_list) > 12:
+                    more_html = (
+                        f'<a class="topic-more-link" href="{safe_base_path}?scope={urllib.parse.quote(common_scope)}&view=topics">'
+                        f'Browse all {len(b_list)} pages →</a>'
+                    )
+                else:
+                    rest_cap = b_list[5:25]
+                    rest_links = "".join(
+                        f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
+                        f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]), b_key)}</a></li>'
+                        for it in rest_cap
+                    )
+                    tail_hint = (
+                        f'<p class="muted">Showing 25 of {len(b_list)} — use Search or the folder tree for the rest.</p>'
+                        if len(b_list) > 25
+                        else ""
+                    )
+                    more_html = (
+                        f'<details class="topic-more"><summary>Show more ({len(b_list) - 5} more)</summary>'
+                        f'<ul class="topic-card-list">{rest_links}</ul>{tail_hint}</details>'
+                    )
             topic_cards.append(
                 f'<section class="topic-card" id="topic-{html.escape(b_key, quote=True)}">'
-                f'<div class="topic-card-head"><h3>{b_lbl}</h3><span class="tree-count">{len(b_list)}</span></div>'
+                f'<div class="topic-card-head"><h3>{html.escape(b_lbl)}</h3><span class="tree-count">{len(b_list)}</span></div>'
                 f'<ul class="topic-card-list">{top_links}</ul>'
                 f'{more_html}</section>'
             )
@@ -3881,7 +4104,7 @@ def render_dashboard_page(
             "<div class='topics-header'>"
             f"<h1>{html.escape(heading_scope)}</h1>"
             f"<p class='muted'><strong>{len(notes)}</strong> pages organized into <strong>{len(non_empty_bucket_keys)}</strong> topics. "
-            "Pick a topic card below, jump from the outline on the right, or search across everything above.</p>"
+            "Pick a topic card below, use the topic index, or search across the vault.</p>"
             "</div>"
             + (
                 "<section class='topics-recent'>"
@@ -3896,7 +4119,7 @@ def render_dashboard_page(
     elif active_note_meta:
         back_to_search_html = (
             f"<div class='search-banner'>"
-            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {len(search_res['notes'])} results for \"{html.escape(q_clean)}\"</a>"
+            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {int(search_res.get('notes_total') or len(search_res['notes']))} results for \"{html.escape(q_clean)}\"</a>"
             f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear filter</a>"
             f"</div>"
             if q_clean
@@ -3906,24 +4129,23 @@ def render_dashboard_page(
             back_to_search_html
             + breadcrumbs_html
             + f"<div class='doc-meta-bar'>{active_topic_badge}"
-            + f"<span class='badge scope-badge'>{html.escape(str(active_note_meta['scope']))}</span>"
             + f"<span>~{read_minutes} min read</span>"
-            + f"<span>· Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>"
-            + f"<span>· <code>{html.escape(str(active_note_meta['path']))}</code></span>"
+            + f"<span>Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>"
             + f"{active_download_btn}</div>"
             + note_html
+            + f"<div class='doc-source-foot'>Source file: <span class='meta-mono'>{html.escape(str(active_note_meta['path']))}</span></div>"
             + pager_html
             + connected_html
         )
     else:
         reader_body_html = (
             "<div class='empty-state'>"
-            "<h2>Your memory vault is ready</h2>"
-            "<p>Notes, uploaded PDFs/DOCX files, and verified AI facts appear here so you and your coding/chat assistants stay in sync.</p>"
+            "<h1>Your memory vault is ready</h1>"
+            "<p>Notes, uploaded PDFs/DOCX files, and verified AI facts appear here so you and your coding or chat assistants stay in sync.</p>"
             "<ul>"
             "<li>Use <strong>Upload</strong> in the top bar to index your first <code>.md</code>, <code>.pdf</code>, or <code>.docx</code> file.</li>"
             "<li>Open <a href='/apps'>Connected apps</a> for your MCP URL and 1-command laptop login.</li>"
-            "<li>Add or retire shared facts directly in the <strong>AI Memory Facts</strong> panel on the right.</li>"
+            "<li>Add or retire shared facts directly in the <strong>AI Memory Facts</strong> panel.</li>"
             "</ul></div>"
         )
 
@@ -3934,269 +4156,241 @@ def render_dashboard_page(
             f'In {html.escape(_folder_label(scope_filter))}</option>'
         )
 
-    reader_checked = "checked"
-    notes_checked = ""
-    facts_open_attr = " open" if q_clean else ""
+    facts_heading = "Matching Verified Facts" if active_view == "search" else "AI Memory Facts"
+    facts_open_attr = " open" if active_view == "search" else ""
     writable_tooltip = html.escape("Writable folders: " + ", ".join(writable_scopes_for(actor)), quote=True)
     topics_nav_active = "active" if active_view == "topics" else ""
+    mobile_notes_tab_label = f"Matches ({len(notes)})" if q_clean else f"Notes ({len(notes)})"
+    theme_toggle_form = (
+        f'<form class="theme-form" method="post" action="{safe_base_path.rstrip("/")}/theme">'
+        f'<input type="hidden" name="theme" value="{next_theme}">'
+        f'<input type="hidden" name="next" value="{html.escape(current_page_url, quote=True)}">'
+        f'<button type="submit" class="theme-toggle" title="Switch to {theme_btn_label} mode">{theme_btn_icon}<span>{theme_btn_label}</span></button>'
+        "</form>"
+    )
 
     return f"""<!doctype html>
-<html lang="en">
+<html lang="en" data-theme="{theme_mode}">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(dashboard_title)} · Vault &amp; Memory Hub</title>
   <style>
-    html {{ scroll-behavior: smooth; }}
-    :root {{
-      --header-h: 56px;
-      --bg: #f8fafc;
-      --canvas: #ffffff;
-      --panel: #f1f5f9;
-      --panel-hover: #e2e8f0;
-      --header-bg: #ffffff;
-      --border: #e2e8f0;
-      --border-strong: #cbd5e1;
-      --text: #0f172a;
-      --text-body: #1e293b;
-      --muted: #475569;
-      --accent: #0052cc;
-      --accent-soft: #e0f2fe;
-      --accent-border: #93c5fd;
-      --mark-bg: #fef08a;
-      --mark-fg: #0f172a;
-      --green: #15803d;
-      --green-bg: #dcfce7;
-      --amber: #b45309;
-      --amber-bg: #fef3c7;
-      --red: #b91c1c;
-      --red-bg: #fee2e2;
-      --code-inline-bg: #f1f5f9;
-      --code-inline-fg: #0f172a;
-      --pre-bg: #0f172a;
-      --pre-fg: #f8fafc;
-      --quote-bg: #f0f7ff;
-      --shadow: 0 2px 6px rgba(15, 23, 42, 0.06);
-    }}
-    #theme-dark:checked ~ .app-shell {{
-      --bg: #0b1120;
-      --canvas: #0f172a;
-      --panel: #1e293b;
-      --panel-hover: #334155;
-      --header-bg: #020617;
-      --border: #1e293b;
-      --border-strong: #334155;
-      --text: #f8fafc;
-      --text-body: #e2e8f0;
-      --muted: #cbd5e1;
-      --accent: #38bdf8;
-      --accent-soft: rgba(56, 189, 248, 0.14);
-      --accent-border: #0284c7;
-      --mark-bg: #fde047;
-      --mark-fg: #020617;
-      --green: #4ade80;
-      --green-bg: rgba(74, 222, 128, 0.16);
-      --amber: #fbbf24;
-      --amber-bg: rgba(251, 191, 36, 0.16);
-      --red: #f87171;
-      --red-bg: rgba(248, 113, 113, 0.16);
-      --code-inline-bg: #1e293b;
-      --code-inline-fg: #38bdf8;
-      --pre-bg: #020617;
-      --pre-fg: #f1f5f9;
-      --quote-bg: rgba(56, 189, 248, 0.08);
-      --shadow: 0 2px 8px rgba(0, 0, 0, 0.35);
-    }}
-    * {{ box-sizing: border-box; }}
+    html {{ scroll-behavior: smooth; background: var(--bg); }}
+    {BASE_THEME_CSS}
+    :root {{ --header-h: 58px; }}
+    * {{ box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }}
     ::selection {{ background: var(--accent-soft); color: var(--accent); }}
     :focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
     body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--text); line-height: 1.65; overflow-x: hidden; caret-color: var(--accent); }}
+    .skip-link {{ position: absolute; left: -9999px; top: 8px; z-index: 100; background: var(--accent); color: var(--accent-fg); padding: 8px 14px; border-radius: 6px; font-weight: 700; text-decoration: none; }}
+    .skip-link:focus-visible {{ left: 12px; }}
     .app-shell {{ min-height: 100vh; background: var(--bg); color: var(--text); width: 100%; max-width: 100vw; overflow-x: clip; }}
-    .theme-checkbox, .mview-radio {{ position: fixed; top: 0; left: 0; width: 0; height: 0; opacity: 0; pointer-events: none; margin: 0; }}
+    .mview-radio {{ position: fixed; top: 0; left: 0; width: 0; height: 0; opacity: 0; pointer-events: none; margin: 0; }}
     header {{ min-height: var(--header-h); padding: 8px 20px; background: var(--header-bg); border-bottom: 1px solid var(--border); display: flex; flex-wrap: nowrap; gap: 12px; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 30; }}
     .brand-wrap {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
-    .brand {{ font-weight: 700; font-size: 0.98rem; color: var(--accent); letter-spacing: -0.01em; text-decoration: none; white-space: nowrap; }}
-    .nav-pill {{ font-size: 0.8rem; font-weight: 600; color: var(--text-body); text-decoration: none; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
+    .brand {{ display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 0.98rem; color: var(--text); letter-spacing: -0.015em; text-decoration: none; white-space: nowrap; min-height: 32px; padding: 2px 4px; border-radius: 6px; }}
+    .brand:hover {{ color: var(--accent); }}
+    .nav-pill {{ display: inline-flex; align-items: center; gap: 5px; font-size: 0.82rem; font-weight: 600; color: var(--text-body); text-decoration: none; min-height: 32px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
     .nav-pill:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .nav-pill.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
-    #theme-dark:checked ~ .app-shell .nav-pill.active {{ color: #020617; }}
+    .nav-pill.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
     .search-form {{ display: flex; gap: 6px; flex: 1 1 420px; max-width: 560px; min-width: 0; align-items: center; }}
-    .search-scope {{ background: var(--panel); color: var(--text-body); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.8rem; max-width: 150px; flex-shrink: 0; }}
-    .search-form input[type="search"] {{ width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.86rem; }}
+    .search-scope {{ background: var(--panel); color: var(--text-body); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.81rem; max-width: 150px; min-height: 34px; flex-shrink: 0; }}
+    .search-form input[type="search"] {{ width: 100%; min-width: 0; min-height: 34px; background: var(--canvas); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.86rem; }}
     .search-form input[type="search"]:focus {{ outline: 2px solid var(--accent); border-color: transparent; }}
-    .search-form button, .upload-form button, .fact-add-form button {{ background: var(--accent); color: #ffffff; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
-    #theme-dark:checked ~ .app-shell .search-form button, #theme-dark:checked ~ .app-shell .upload-form button, #theme-dark:checked ~ .app-shell .fact-add-form button {{ color: #020617; }}
-    .clear-search {{ font-size: 0.78rem; color: var(--muted); text-decoration: none; padding: 4px 6px; white-space: nowrap; }}
+    .search-form button, .upload-form button, .fact-add-form button {{ background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 6px 13px; min-height: 34px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
     .header-right {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
-    .upload-box {{ position: relative; }}
-    .upload-box summary {{ list-style: none; cursor: pointer; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--text-body); font-size: 0.8rem; font-weight: 600; white-space: nowrap; user-select: none; }}
-    .upload-box summary::-webkit-details-marker {{ display: none; }}
-    .upload-box[open] > summary {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .upload-box[open] > summary::before {{ content: " "; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 45; display: block; cursor: default; background: transparent; }}
-    .upload-box:not([open]) .upload-form {{ display: none; }}
-    .upload-form {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 310px; max-width: calc(100vw - 28px); padding: 14px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: 0 10px 25px rgba(15,23,42,0.18); display: flex; flex-direction: column; gap: 6px; }}
-    .form-label {{ font-size: 0.75rem; font-weight: 600; color: var(--muted); margin-top: 2px; }}
-    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.82rem; width: 100%; font-family: inherit; }}
-    .theme-toggle {{ cursor: pointer; font-size: 0.79rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }}
+    .theme-form {{ margin: 0; display: inline-flex; }}
+    .upload-box, .mobile-menu {{ position: relative; }}
+    .mobile-menu {{ display: none; }}
+    .upload-box > summary, .mobile-menu > summary {{ list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--text-body); font-size: 0.81rem; font-weight: 600; white-space: nowrap; user-select: none; }}
+    .upload-box > summary::-webkit-details-marker, .mobile-menu > summary::-webkit-details-marker {{ display: none; }}
+    .upload-box[open] > summary, .mobile-menu[open] > summary {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
+    .upload-box[open] > summary::before, .mobile-menu[open] > summary::before {{ content: " "; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 45; display: block; cursor: default; background: transparent; }}
+    .upload-box:not([open]) .upload-form, .mobile-menu:not([open]) .mobile-menu-panel {{ display: none; }}
+    .upload-form {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 310px; max-width: calc(100vw - 24px); padding: 14px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }}
+    .form-label {{ font-size: 0.76rem; font-weight: 600; color: var(--muted); margin-top: 2px; }}
+    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 9px; font-size: 0.84rem; width: 100%; font-family: inherit; }}
+    .theme-toggle {{ cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; font-size: 0.81rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }}
     .theme-toggle:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .actor-tag {{ font-size: 0.78rem; background: var(--panel); padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
+    .actor-tag {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.8rem; background: var(--panel); padding: 2px 6px 2px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
     .actor-tag strong {{ color: var(--text); }}
-    .actor-link {{ color: inherit; font-weight: 600; text-decoration: none; }}
-    .actor-link:hover {{ color: var(--accent); text-decoration: underline; }}
-    .signout-link {{ color: var(--red); text-decoration: none; font-weight: 600; }}
-    .signout-link:hover {{ text-decoration: underline; }}
-    .dl-btn {{ display: inline-block; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }}
+    .actor-link, .signout-link {{ display: inline-flex; align-items: center; min-height: 28px; padding: 2px 7px; border-radius: 5px; text-decoration: none; font-weight: 600; }}
+    .actor-link {{ color: var(--text); }}
+    .actor-link:hover {{ background: var(--panel-hover); color: var(--accent); }}
+    .signout-link {{ color: var(--red); }}
+    .signout-link:hover {{ background: var(--red-bg); }}
+    .dl-btn {{ display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }}
     .mobile-tabs {{ display: none; }}
-    .layout {{ display: grid; grid-template-columns: 296px minmax(0, 1fr) 276px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
+    .layout {{ display: grid; grid-template-columns: 288px minmax(0, 1fr) 280px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
     .sidebar {{ padding: 14px 12px 28px 14px; border-right: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); text-align: left; }}
-    .sidebar-section-label {{ font-size: 0.73rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 2px 6px 6px; text-align: left; }}
-    .scope-strip {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
-    .pill {{ display: flex; align-items: center; justify-content: space-between; gap: 4px; text-decoration: none; color: var(--text-body); background: var(--panel); padding: 5px 8px; border-radius: 6px; font-size: 0.77rem; font-weight: 500; border: 1px solid var(--border); text-align: left; transition: background-color 0.15s ease, color 0.15s ease; min-width: 0; }}
+    .sidebar-section-label {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 2px 6px 6px; text-align: left; }}
+    .scope-strip {{ display: flex; flex-direction: column; gap: 2px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
+    .folder-row {{ display: flex; align-items: center; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--text-body); padding: 6px 8px; min-height: 32px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; border: 1px solid transparent; transition: background-color 0.15s ease, color 0.15s ease; min-width: 0; }}
+    .folder-row-left {{ display: inline-flex; align-items: center; gap: 7px; min-width: 0; }}
     .pill-label {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .pill-count {{ font-size: 0.7rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
-    .pill:hover {{ background: var(--panel-hover); color: var(--accent); }}
-    .pill.active {{ color: #ffffff; background: var(--accent); border-color: var(--accent); font-weight: 600; }}
-    .pill.active .pill-count {{ color: inherit; opacity: 0.9; }}
-    #theme-dark:checked ~ .app-shell .pill.active {{ color: #020617; }}
+    .pill-count {{ font-size: 0.74rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
+    .folder-row:hover {{ background: var(--panel); color: var(--accent); }}
+    .folder-row.active {{ color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); font-weight: 600; }}
+    .folder-row.active .pill-count {{ color: var(--accent); }}
     .quick-links {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .quick-link {{ display: block; padding: 5px 9px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: var(--text-body); text-decoration: none; text-align: left; }}
-    .quick-link:hover {{ background: var(--panel-hover); color: var(--accent); }}
+    .quick-link {{ display: block; padding: 6px 8px; min-height: 30px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: var(--text-body); text-decoration: none; text-align: left; }}
+    .quick-link:hover {{ background: var(--panel); color: var(--accent); }}
     .quick-link.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; }}
     .tree-group {{ margin-bottom: 4px; border-radius: 6px; text-align: left; }}
-    .tree-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: flex-start; gap: 6px; padding: 6px 8px; border-radius: 6px; font-size: 0.82rem; font-weight: 600; color: var(--text); user-select: none; text-align: left; }}
+    .tree-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: flex-start; gap: 6px; padding: 6px 8px; min-height: 32px; border-radius: 6px; font-size: 0.82rem; font-weight: 600; color: var(--text); user-select: none; text-align: left; }}
     .tree-summary::-webkit-details-marker {{ display: none; }}
-    .tree-summary:hover {{ background: var(--panel-hover); }}
-    .tree-folder-name {{ flex: 1 1 auto; display: flex; align-items: center; justify-content: flex-start; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-align: left; }}
+    .tree-summary:hover {{ background: var(--panel); }}
+    .tree-folder-name {{ flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-align: left; }}
     .tree-group > .tree-summary::before {{ content: "▸"; font-size: 0.76rem; color: var(--muted); flex-shrink: 0; }}
     .tree-group[open] > .tree-summary::before {{ content: "▾"; color: var(--accent); }}
     .tree-count {{ font-size: 0.73rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }}
     .note-list {{ list-style: none; padding: 2px 0 6px 8px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .tree-item {{ display: block; padding: 5px 8px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border-left: 2px solid transparent; }}
-    .tree-item:hover {{ background: var(--panel-hover); color: var(--accent); }}
+    .tree-item {{ display: block; padding: 5px 8px; min-height: 28px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border-left: 2px solid transparent; }}
+    .tree-item:hover {{ background: var(--panel); color: var(--accent); }}
     .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border-left-color: var(--accent); }}
     .tree-title {{ overflow-wrap: anywhere; text-align: left; }}
     .tree-sub {{ font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
     .reader-wrap {{ padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }}
-    .reader {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 34px 44px; max-width: 880px; width: 100%; min-width: 0; overflow-wrap: break-word; word-break: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
-    #theme-dark:checked ~ .app-shell .reader {{ line-height: 1.76; letter-spacing: 0.005em; }}
+    .reader {{ max-width: 880px; width: 100%; min-width: 0; overflow-wrap: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
+    .reader-sheet {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 34px 44px; box-shadow: var(--shadow); }}
+    .reader-flat {{ background: transparent; border: none; padding: 4px 0; }}
+    html[data-theme="dark"] .reader {{ line-height: 1.76; letter-spacing: 0.005em; }}
     .search-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.84rem; color: var(--text); }}
-    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
+    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; padding: 2px 4px; }}
     .search-banner a:hover {{ text-decoration: underline; }}
-    .search-header, .topics-header {{ margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
+    .search-header, .topics-header {{ margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }}
     .filter-chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }}
-    .filter-chip {{ display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--panel); border: 1px solid var(--border); }}
+    .filter-chip {{ display: inline-flex; align-items: center; min-height: 30px; padding: 4px 11px; border-radius: 999px; font-size: 0.79rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--canvas); border: 1px solid var(--border); }}
     .filter-chip:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .filter-chip.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
-    #theme-dark:checked ~ .app-shell .filter-chip.active {{ color: #020617; }}
-    .section-kicker {{ font-size: 0.82rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; border: none; padding: 0; }}
-    .search-section {{ margin-bottom: 28px; }}
-    .search-fact-list {{ display: flex; flex-direction: column; gap: 8px; }}
-    .search-fact-row {{ padding: 10px 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); font-size: 0.88rem; line-height: 1.5; }}
+    .filter-chip.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
+    .mobile-search-facts {{ display: none; margin-bottom: 18px; background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }}
+    .mobile-search-facts summary {{ list-style: none; cursor: pointer; font-weight: 700; font-size: 0.86rem; color: var(--text); min-height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
+    .mobile-search-facts summary::-webkit-details-marker {{ display: none; }}
+    .mobile-search-facts summary::after {{ content: "▸"; color: var(--muted); font-size: 0.85rem; }}
+    .mobile-search-facts[open] summary::after {{ content: "▾"; color: var(--accent); }}
+    .mobile-fact-list {{ margin: 8px 0 0; padding-left: 1.1em; display: flex; flex-direction: column; gap: 6px; font-size: 0.86rem; }}
+    .section-kicker {{ font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; border: none; padding: 0; }}
+    .search-section {{ margin-bottom: 24px; }}
     .result-list {{ display: flex; flex-direction: column; gap: 10px; }}
-    .result-card {{ display: block; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); transition: border-color 0.15s ease; }}
+    .result-card {{ display: block; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); transition: border-color 0.15s ease; }}
     .result-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
     .result-top {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }}
     .result-title {{ font-weight: 700; font-size: 1rem; color: var(--accent); }}
-    .result-date {{ font-size: 0.76rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-    .result-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; font-size: 0.78rem; color: var(--muted); }}
-    .result-snippet {{ margin: 8px 0 0; font-size: 0.88rem; line-height: 1.55; color: var(--text-body); max-width: none; }}
+    .result-date {{ font-size: 0.78rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }}
+    .result-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; font-size: 0.8rem; color: var(--muted); }}
+    .result-snippet {{ margin: 8px 0 0; font-size: 0.89rem; line-height: 1.55; color: var(--text-body); max-width: none; }}
     mark {{ background: var(--mark-bg); color: var(--mark-fg); padding: 0 3px; border-radius: 3px; font-weight: 600; }}
-    .topics-recent {{ margin-bottom: 28px; }}
-    .recent-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }}
-    .recent-card {{ display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); }}
+    .topics-recent {{ margin-bottom: 24px; }}
+    .recent-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
+    .recent-card {{ display: flex; flex-direction: column; justify-content: space-between; gap: 4px; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); }}
     .recent-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
-    .recent-title {{ font-weight: 600; font-size: 0.88rem; color: var(--text); line-height: 1.35; }}
-    .recent-meta {{ font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
+    .recent-title {{ font-weight: 600; font-size: 0.88rem; color: var(--text); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
+    .recent-meta {{ font-size: 0.77rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
     .topic-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }}
-    .topic-card {{ padding: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 72px; }}
+    .topic-card {{ padding: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 72px; }}
     .topic-card-head {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
     .topic-card-head h3 {{ margin: 0; font-size: 0.96rem; line-height: 1.3; color: var(--text); }}
-    .topic-card-list {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; max-width: none; }}
+    .topic-card-list {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-width: none; }}
     .topic-card-list li {{ margin: 0; }}
-    .topic-card-list a {{ text-decoration: none; color: var(--text-body); font-size: 0.86rem; line-height: 1.4; display: inline-block; }}
+    .topic-card-list a {{ display: block; padding: 4px 0; min-height: 28px; text-decoration: none; color: var(--text-body); font-size: 0.86rem; line-height: 1.4; }}
     .topic-card-list a:hover {{ color: var(--accent); text-decoration: underline; }}
-    .topic-more summary {{ cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--accent); margin-top: 4px; }}
+    .topic-more-link {{ display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); text-decoration: none; margin-top: 2px; }}
+    .topic-more-link:hover {{ text-decoration: underline; }}
+    .topic-more summary {{ cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); margin-top: 2px; }}
     .topic-more .topic-card-list {{ margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }}
     .empty-state {{ padding: 8px 0; }}
-    .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; }}
-    .breadcrumbs a {{ color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }}
-    .breadcrumbs a:hover {{ color: var(--accent); text-decoration: underline; }}
-    .crumb-sep {{ color: var(--border-strong); }}
-    .crumb-current {{ color: var(--text); font-weight: 600; }}
-    .doc-meta-bar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.79rem; color: var(--muted); padding-bottom: 16px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }}
+    .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }}
+    .breadcrumbs a {{ display: inline-flex; align-items: center; min-height: 28px; padding: 2px 4px; border-radius: 4px; color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }}
+    .breadcrumbs a:hover {{ color: var(--accent); background: var(--panel); }}
+    .crumb-sep {{ color: var(--muted); opacity: 0.6; }}
+    .doc-meta-bar {{ display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; font-size: 0.81rem; color: var(--muted); padding-bottom: 16px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }}
+    .doc-source-foot {{ margin-top: 28px; padding-top: 12px; border-top: 1px dashed var(--border); font-size: 0.81rem; color: var(--muted); }}
+    .meta-mono {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.96em; color: var(--muted); }}
     .reader h1, .reader h2, .reader h3, .reader h4 {{ color: var(--text); font-weight: 700; line-height: 1.28; letter-spacing: -0.02em; scroll-margin-top: 72px; text-wrap: balance; }}
     .reader h1 {{ font-size: 2rem; margin: 0 0 0.65em; }}
     .reader h2 {{ font-size: 1.45rem; margin-top: 1.85em; margin-bottom: 0.55em; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
-    .reader h2.section-kicker {{ font-size: 0.82rem; margin: 0 0 12px; border: none; padding: 0; letter-spacing: 0.06em; color: var(--muted); }}
+    .reader h2.section-kicker {{ font-size: 0.78rem; margin: 0 0 12px; border: none; padding: 0; letter-spacing: 0.06em; color: var(--muted); }}
     .reader h3 {{ font-size: 1.14rem; margin-top: 1.45em; margin-bottom: 0.45em; }}
     .reader h4 {{ font-size: 0.96rem; margin-top: 1.2em; margin-bottom: 0.4em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
     .reader p {{ margin: 0 0 1.05em; max-width: 68ch; text-wrap: pretty; }}
     .reader ul, .reader ol {{ margin: 0 0 1.15em; padding-left: 1.5em; max-width: 68ch; }}
     .reader li {{ margin-bottom: 0.4em; text-wrap: pretty; }}
     .reader hr {{ border: none; border-top: 1px solid var(--border); margin: 1.8em 0; }}
-    code {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-inline-bg); color: var(--code-inline-fg); padding: 2px 6px; border-radius: 5px; font-size: 0.86em; border: 1px solid var(--border); word-break: break-word; }}
+    code {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-inline-bg); color: var(--code-inline-fg); padding: 2px 5px; border-radius: 4px; font-size: 0.86em; word-break: break-word; }}
     .code-block {{ margin: 14px 0 18px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-strong); background: var(--pre-bg); }}
-    .code-lang {{ background: rgba(255,255,255,0.06); color: #cbd5e1; font-size: 0.74rem; font-family: ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
+    .code-lang {{ background: rgba(255,255,255,0.06); color: #cbd5e1; font-size: 0.76rem; font-family: ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
     pre {{ background: var(--pre-bg); color: var(--pre-fg); margin: 0; padding: 14px 16px; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; line-height: 1.55; font-size: 0.86rem; }}
-    pre code {{ word-break: normal; padding: 0; background: transparent; color: inherit; border: none; font-size: inherit; }}
-    blockquote {{ margin: 16px 0; padding: 12px 16px; border: 1px solid var(--accent-border); background: var(--quote-bg); border-radius: 8px; }}
+    pre code {{ word-break: normal; padding: 0; background: transparent; color: inherit; font-size: inherit; }}
+    blockquote {{ margin: 16px 0; padding: 12px 16px; max-width: 72ch; border-left: 3px solid var(--accent); background: var(--quote-bg); border-radius: 0 8px 8px 0; }}
     blockquote p:last-child {{ margin-bottom: 0; }}
-    .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 16px 0 20px; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 0.88rem; background: var(--canvas); border: 1px solid var(--border); font-variant-numeric: tabular-nums; }}
-    th, td {{ border: 1px solid var(--border); padding: 10px 14px; text-align: left; vertical-align: top; overflow-wrap: break-word; }}
-    th {{ background: var(--panel); color: var(--text); font-weight: 600; }}
+    .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 18px 0 22px; border-top: 1.5px solid var(--border-strong); border-bottom: 1.5px solid var(--border-strong); }}
+    .table-wrap table {{ width: 100%; min-width: 540px; border-collapse: collapse; font-size: 0.88rem; background: transparent; font-variant-numeric: tabular-nums; }}
+    th, td {{ border-bottom: 1px solid var(--border); padding: 10px 14px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }}
+    tbody tr:last-child td {{ border-bottom: none; }}
+    th {{ background: var(--panel); color: var(--text); font-weight: 600; border-bottom: 1.5px solid var(--border-strong); }}
     a.wikilink, a.ext-link {{ color: var(--accent); text-decoration: none; font-weight: 500; border-bottom: 1px solid var(--accent-border); text-underline-offset: 3px; }}
     a.wikilink:hover, a.ext-link:hover {{ background: var(--accent-soft); }}
-    .pager-nav {{ margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center; }}
-    .pager-link {{ display: flex; flex-direction: column; gap: 2px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); min-width: 0; }}
-    .pager-link:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .pager-nav {{ margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center; }}
+    .pager-link {{ display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); min-width: 0; }}
+    .pager-link:hover {{ background: var(--accent-soft); }}
     .pager-next {{ text-align: right; }}
     .pager-dir {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
     .pager-title {{ font-size: 0.86rem; font-weight: 600; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .pager-mid {{ font-size: 0.78rem; font-weight: 600; color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
-    .pager-mid:hover {{ color: var(--accent); border-color: var(--accent); }}
-    .connected-section {{ margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); }}
-    .connected-section .connected-title {{ font-size: 1.18rem; margin: 0 0 12px; border: none; padding: 0; }}
-    .connected-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }}
-    .conn-card {{ display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; transition: border-color 0.15s ease; }}
-    .conn-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .pager-mid {{ display: inline-flex; align-items: center; min-height: 32px; font-size: 0.78rem; font-weight: 600; color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; background: var(--panel); white-space: nowrap; }}
+    .pager-mid:hover {{ color: var(--accent); background: var(--accent-soft); }}
+    .connected-section {{ margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }}
+    .connected-section .connected-title {{ font-size: 1.14rem; margin: 0 0 10px; border: none; padding: 0; }}
+    .connected-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 8px; }}
+    .conn-item {{ display: flex; flex-direction: column; gap: 2px; padding: 9px 11px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; }}
+    .conn-item:hover {{ background: var(--accent-soft); color: var(--accent); }}
     .facts-col {{ padding: 16px 14px 28px 12px; border-left: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); }}
-    .toc-nav {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 3px; }}
-    .toc-header {{ font-size: 0.73rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }}
-    .toc-link {{ display: block; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 4px 8px; border-left: 1px solid var(--border-strong); border-radius: 0 4px 4px 0; }}
+    .toc-nav {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }}
+    .toc-header {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }}
+    .toc-link {{ display: flex; align-items: baseline; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 5px 8px; min-height: 28px; border-left: 2px solid var(--border-strong); border-radius: 0 4px 4px 0; }}
     .toc-link:hover {{ color: var(--accent); border-left-color: var(--accent); background: var(--panel); }}
+    .toc-cnt {{ font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
     .toc-h3 {{ padding-left: 16px; font-size: 0.77rem; }}
-    .facts-drawer summary {{ cursor: pointer; font-size: 0.8rem; font-weight: 700; color: var(--text); padding: 7px 10px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); list-style: none; display: flex; align-items: center; justify-content: space-between; }}
-    .facts-drawer summary::-webkit-details-marker {{ display: none; }}
+    .facts-drawer > summary {{ cursor: pointer; font-size: 0.81rem; font-weight: 700; color: var(--text); padding: 8px 10px; min-height: 36px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 6px; }}
+    .facts-drawer > summary::-webkit-details-marker {{ display: none; }}
+    .facts-drawer-title {{ display: inline-flex; align-items: center; gap: 6px; }}
     .facts-drawer-body {{ margin-top: 10px; }}
-    .facts-summary-line {{ margin: 0 0 8px; font-size: 0.78rem; color: var(--muted); }}
+    .facts-summary-line {{ margin: 0 0 10px; font-size: 0.78rem; color: var(--muted); text-wrap: pretty; }}
     .fact-add {{ margin: 0 0 10px; }}
-    .fact-add > summary {{ font-size: 0.78rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); padding: 6px 10px; }}
+    .fact-add > summary {{ cursor: pointer; display: flex; align-items: center; min-height: 32px; font-size: 0.79rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; padding: 5px 10px; list-style: none; }}
+    .fact-add > summary::-webkit-details-marker {{ display: none; }}
     .fact-add-form {{ display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); }}
-    .muted {{ color: var(--muted); font-size: 0.79rem; }}
-    .fact-card {{ padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.82rem; overflow-wrap: break-word; }}
-    .fact-card.superseded {{ opacity: 0.78; }}
+    .muted {{ color: var(--muted); font-size: 0.8rem; }}
+    .fact-card {{ padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.83rem; overflow-wrap: break-word; }}
+    .fact-card.superseded {{ background: var(--retired-bg); border-color: var(--retired-border); border-style: dashed; }}
     .fact-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }}
     .fact-badges {{ display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
-    .fact-retire-form {{ margin: 0; flex-shrink: 0; }}
-    .fact-retire-btn {{ background: transparent; color: var(--muted); border: 1px solid var(--border-strong); border-radius: 5px; padding: 2px 7px; font-size: 0.72rem; font-weight: 600; cursor: pointer; }}
-    .fact-retire-btn:hover {{ color: var(--red); border-color: var(--red); background: var(--red-bg); }}
-    .fact-text {{ margin-top: 5px; color: var(--text-body); }}
-    .fact-reason {{ margin-top: 4px; font-size: 0.75rem; color: var(--muted); }}
-    .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.71rem; font-weight: 700; text-transform: uppercase; }}
+    .confirm-box {{ position: relative; flex-shrink: 0; }}
+    .confirm-trigger {{ list-style: none; cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; padding: 3px 9px; border-radius: 5px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--muted); font-size: 0.74rem; font-weight: 600; }}
+    .confirm-trigger::-webkit-details-marker {{ display: none; }}
+    .confirm-trigger:hover {{ color: var(--red); border-color: var(--red); background: var(--red-bg); }}
+    .confirm-pop {{ position: absolute; right: 0; top: calc(100% + 4px); z-index: 40; width: 175px; padding: 8px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }}
+    .danger-btn {{ background: var(--red); color: #ffffff; border: none; border-radius: 5px; padding: 6px 10px; min-height: 30px; font-size: 0.76rem; font-weight: 700; cursor: pointer; }}
+    .fact-subject {{ font-weight: 700; color: var(--text); text-transform: capitalize; }}
+    .fact-text {{ margin-top: 6px; color: var(--text-body); line-height: 1.48; }}
+    .fact-reason {{ margin-top: 4px; font-size: 0.76rem; color: var(--muted); }}
+    .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.71rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }}
     .guide-badge {{ background: var(--panel); color: var(--muted); border: 1px solid var(--border-strong); }}
     .topic-badge {{ background: var(--panel); color: var(--text); border: 1px solid var(--border); text-transform: none; font-weight: 600; }}
     .valid-badge {{ background: var(--green-bg); color: var(--green); }}
     .invalid-badge {{ background: var(--red-bg); color: var(--red); }}
+    .cat-fact {{ background: var(--fact-bg); color: var(--fact-fg); }}
+    .cat-question {{ background: var(--purple-bg); color: var(--purple); }}
     .cat-weakness {{ background: var(--red-bg); color: var(--red); }}
     .cat-strength, .cat-progress {{ background: var(--green-bg); color: var(--green); }}
     .cat-decision, .cat-preference {{ background: var(--amber-bg); color: var(--amber); }}
     .scope-badge {{ background: var(--accent-soft); color: var(--accent); }}
-    .fact-meta {{ margin-top: 4px; font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
+    .fact-meta {{ margin-top: 5px; font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
     @media (max-width: 1120px) {{
       header {{ flex-wrap: wrap; padding: 8px 14px; gap: 8px; position: static; }}
+      .mobile-search-facts {{ display: block; }}
       .mobile-tabs {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--canvas); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 25; }}
-      .mtab {{ text-align: center; padding: 10px 6px; font-size: 0.83rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+      .mtab {{ display: flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 6px; font-size: 0.84rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
       .layout {{ display: block; min-height: auto; }}
       .sidebar, .reader-wrap, .facts-col {{ display: none; border: none; height: auto; max-height: none; position: static; width: 100%; }}
       #tab-reader:checked ~ .app-shell .layout .reader-wrap {{ display: block; }}
@@ -4207,50 +4401,65 @@ def render_dashboard_page(
       #tab-facts:checked ~ .app-shell .mobile-tabs .mtab-facts {{
         color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft);
       }}
+      #tab-reader:focus-visible ~ .app-shell .mobile-tabs .mtab-reader,
+      #tab-notes:focus-visible ~ .app-shell .mobile-tabs .mtab-notes,
+      #tab-facts:focus-visible ~ .app-shell .mobile-tabs .mtab-facts {{
+        outline: 2px solid var(--accent); outline-offset: -2px;
+      }}
     }}
     @media (max-width: 768px) {{
-      header {{ padding: 8px 10px; gap: 6px; }}
-      .brand {{ font-size: 0.88rem; }}
-      .brand-long, .actor-name, .search-scope {{ display: none; }}
-      .header-right {{ gap: 5px; }}
-      .upload-box summary, .theme-toggle, .actor-tag, .nav-pill {{ padding: 4px 8px; font-size: 0.75rem; }}
+      header {{ padding: 8px 12px; gap: 8px; }}
+      .brand {{ font-size: 0.94rem; min-height: 40px; }}
+      .brand-long, .desktop-actions {{ display: none; }}
+      .mobile-menu {{ display: block; }}
+      .mobile-menu > summary {{ min-height: 44px; min-width: 44px; justify-content: center; padding: 8px 12px; }}
+      .mobile-menu-panel {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 60; width: 280px; max-width: calc(100vw - 24px); padding: 12px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }}
+      .mobile-menu-row {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }}
+      .mobile-menu-links {{ display: flex; flex-direction: column; gap: 6px; }}
+      .mobile-menu-links a {{ display: flex; align-items: center; min-height: 40px; padding: 6px 10px; border-radius: 6px; background: var(--panel); text-decoration: none; font-weight: 600; font-size: 0.86rem; color: var(--text); }}
+      .mobile-menu-links a.signout-link {{ color: var(--red); background: var(--red-bg); }}
+      .mobile-upload-form {{ display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }}
+      .mobile-upload-form select, .mobile-upload-form input {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px; font-size: 15px; width: 100%; }}
+      .mobile-upload-form button {{ background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 10px; min-height: 42px; font-weight: 700; cursor: pointer; }}
+      .nav-pill {{ min-height: 40px; padding: 6px 12px; font-size: 0.82rem; }}
       .search-form {{ order: 3; flex: 1 1 100%; max-width: 100%; }}
-      .search-form input[type="search"] {{ font-size: 16px; padding: 6px 10px; }}
-      .upload-form {{ position: fixed; left: 12px; right: 12px; top: 96px; width: auto; max-width: none; }}
-      .reader-wrap {{ padding: 10px 8px 36px; }}
-      .reader {{ padding: 18px 14px; border-radius: 10px; }}
+      .search-scope {{ max-width: 112px; min-height: 40px; font-size: 0.8rem; }}
+      .search-form input[type="search"] {{ font-size: 16px; min-height: 40px; padding: 6px 10px; }}
+      .search-form button {{ min-height: 40px; padding: 6px 12px; }}
+      .reader-wrap {{ padding: 14px 16px 36px; }}
+      .reader-sheet {{ padding: 20px 16px; border-radius: 10px; }}
+      .recent-grid {{ grid-template-columns: 1fr; }}
       .sidebar, .facts-col {{ padding: 12px; }}
       .pager-nav {{ grid-template-columns: 1fr; }}
       .pager-next {{ text-align: left; }}
       .reader h1 {{ font-size: 1.56rem; }}
       .reader h2 {{ font-size: 1.2rem; }}
       .reader h3 {{ font-size: 1.04rem; }}
-      table {{ font-size: 0.8rem; }}
-      th, td {{ padding: 6px 7px; }}
+      .table-wrap table {{ font-size: 0.84rem; }}
+      th, td {{ padding: 9px 11px; }}
       pre {{ padding: 12px; font-size: 0.81rem; }}
     }}
   </style>
 </head>
 <body>
-  <input type="checkbox" id="theme-dark" class="theme-checkbox">
-  <input type="radio" name="mview" id="tab-reader" class="mview-radio" {reader_checked}>
-  <input type="radio" name="mview" id="tab-notes" class="mview-radio" {notes_checked}>
+  <a class="skip-link" href="#main-content">Skip to main content</a>
+  <input type="radio" name="mview" id="tab-reader" class="mview-radio" checked>
+  <input type="radio" name="mview" id="tab-notes" class="mview-radio">
   <input type="radio" name="mview" id="tab-facts" class="mview-radio">
   <div class="app-shell">
     <header>
       <div class="brand-wrap">
-        <a class="brand" href="{safe_base_path}?scope=" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">{html.escape(dashboard_title)}<span class="brand-long"> Vault</span></a>
-        <a class="nav-pill {topics_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">Topics</a>
+        <a class="brand" href="{safe_base_path}?scope=&view=topics" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">{_svg_icon("vault")}<span>{html.escape(dashboard_title)}<span class="brand-long"> Vault</span></span></a>
+        <a class="nav-pill {topics_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">{_svg_icon("grid")}<span>Topics</span></a>
       </div>
       <form class="search-form" method="get" action="{safe_base_path}">
         <select class="search-scope" name="scope" aria-label="Search scope">{search_scope_options}</select>
-        <input type="search" name="q" value="{html.escape(q_clean)}" aria-label="Search notes and facts" placeholder="Search notes, topics, facts...">
+        <input type="search" name="q" value="{html.escape(q_clean)}" accesskey="/" aria-label="Search notes and facts" placeholder="Search notes, topics, facts...">
         <button type="submit">Search</button>
-        {f'<a class="clear-search" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics" aria-label="Clear search">✕</a>' if q_clean else ''}
       </form>
-      <div class="header-right">
+      <div class="header-right desktop-actions">
         <details class="upload-box">
-          <summary>Upload</summary>
+          <summary>{_svg_icon("upload")}<span>Upload</span></summary>
           <form class="upload-form" method="post" action="{safe_base_path.rstrip('/')}/upload" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{html.escape(upload_csrf, quote=True)}">
             <label class="form-label" for="upload-scope">Folder</label>
@@ -4262,13 +4471,36 @@ def render_dashboard_page(
             <button type="submit">Upload &amp; Index</button>
           </form>
         </details>
-        <label for="theme-dark" class="theme-toggle" title="Switch between Light and Dark mode">Theme</label>
-        <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a class="actor-link" href="/apps">Apps</a> · <a class="signout-link" href="/logout">Sign Out</a></div>
+        {theme_toggle_form}
+        <div class="actor-tag" title="{writable_tooltip}"><strong>{html.escape(actor)}</strong><a class="actor-link" href="/apps">Apps</a><a class="signout-link" href="/logout">Sign Out</a></div>
       </div>
+      <details class="mobile-menu">
+        <summary aria-label="Menu">{_svg_icon("menu")}<span>Menu</span></summary>
+        <div class="mobile-menu-panel">
+          <div class="mobile-menu-row">
+            <span class="muted">Signed in as <strong>{html.escape(actor)}</strong></span>
+            {theme_toggle_form}
+          </div>
+          <div class="mobile-menu-links">
+            <a href="/apps">Connected apps &amp; MCP setup</a>
+            <a class="signout-link" href="/logout">Sign Out</a>
+          </div>
+          <form class="mobile-upload-form" method="post" action="{safe_base_path.rstrip('/')}/upload" enctype="multipart/form-data">
+            <input type="hidden" name="csrf_token" value="{html.escape(upload_csrf, quote=True)}">
+            <label class="form-label" for="m-upload-scope">Upload to folder</label>
+            <select id="m-upload-scope" name="scope">{upload_scope_options}</select>
+            <label class="form-label" for="m-upload-file">File (.md, .pdf, .docx, .txt)</label>
+            <input id="m-upload-file" type="file" name="file" accept=".pdf,.docx,.md,.txt" required>
+            <label class="form-label" for="m-upload-title">Title (optional)</label>
+            <input id="m-upload-title" type="text" name="title" placeholder="Uses filename if blank">
+            <button type="submit">Upload &amp; Index</button>
+          </form>
+        </div>
+      </details>
     </header>
     <nav class="mobile-tabs" aria-label="Mobile view switcher">
       <label for="tab-reader" class="mtab mtab-reader">Read</label>
-      <label for="tab-notes" class="mtab mtab-notes">Folders ({len(notes)})</label>
+      <label for="tab-notes" class="mtab mtab-notes">{mobile_notes_tab_label}</label>
       <label for="tab-facts" class="mtab mtab-facts">Outline &amp; Facts</label>
     </nav>
     <div class="layout">
@@ -4280,16 +4512,16 @@ def render_dashboard_page(
         {notes_tree_html}
       </aside>
       <div class="reader-wrap">
-        <main class="reader">
+        <main id="main-content" tabindex="-1" class="reader {reader_surface_cls}">
           {reader_body_html}
         </main>
       </div>
       <aside class="facts-col" aria-label="Page outline and AI facts">
         {toc_html}
         <details class="facts-drawer"{facts_open_attr}>
-          <summary><span>AI Memory Facts</span><span class="tree-count">{active_fact_count}</span></summary>
+          <summary><span class="facts-drawer-title">{_svg_icon("spark")}<span>{facts_heading}</span></span><span class="tree-count">{active_fact_count}</span></summary>
           <div class="facts-drawer-body">
-            <p class="facts-summary-line"><strong>{active_fact_count}</strong> active · {retired_fact_count} history — shared across all connected agents.</p>
+            <p class="facts-summary-line"><strong>{active_fact_count}</strong> active · {retired_fact_count} history. Shared across connected agents.</p>
             {add_fact_html}
             {facts_block}
           </div>
@@ -4639,37 +4871,97 @@ def _omni_configured() -> bool:
     return bool((os.environ.get("OMNI_PUBLIC_URL", "") or OMNI_PUBLIC_URL).strip())
 
 
-CARD_CSS = """body{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;padding:40px 16px;margin:0}
-.card{background:#1e293b;padding:24px 20px;border-radius:12px;border:1px solid #334155;max-width:var(--w);width:100%;box-sizing:border-box}
-h2{margin:0 0 12px;font-size:1.3rem}
-p,td,li{color:#cbd5e1;font-size:14px;line-height:1.5}
-.muted{color:#94a3b8;font-size:13px}
-.err-box{color:#fecaca;background:#450a0a;padding:10px 12px;border-radius:6px;border:1px solid #991b1b;font-size:14px}
-.code{font:600 1.6rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;margin:4px 0 16px}
-label{display:block;color:#cbd5e1;font-size:13px;font-weight:600;margin-top:8px}
-input,select,button,.cta-btn{width:100%;padding:11px;margin:6px 0;border-radius:6px;font-size:16px;box-sizing:border-box}
-input,select{border:1px solid #475569;background:#020617;color:#f8fafc}
-button,.cta-btn{background:#38bdf8;color:#020617;border:none;font-weight:700;cursor:pointer;display:block;text-align:center;text-decoration:none}
-button.secondary{background:#334155;color:#f8fafc;border:1px solid #475569;font-weight:600}
-td button{width:auto;margin:0;padding:6px 12px;font-size:13px}
-button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
-a{color:#38bdf8;text-underline-offset:3px}
-code{color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9em}
-pre{background:#020617;color:#f8fafc;border:1px solid #334155;border-radius:8px;padding:10px 12px;overflow-x:auto;font-size:13px;line-height:1.5}
-details{margin:14px 0;border-top:1px solid #334155;padding-top:12px}
-summary{color:#cbd5e1;font-size:13px;font-weight:600;cursor:pointer}
-::selection{background:#38bdf8;color:#020617}
-table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin:8px 0 16px}
-th{text-align:left;color:#94a3b8;font-size:12px;font-weight:600;padding:8px 6px;border-bottom:1px solid #334155}
-td{padding:10px 6px;border-bottom:1px solid #263449;vertical-align:top}
-@media (max-width:640px){thead{display:none}tr{display:block;padding:10px 0;border-bottom:1px solid #334155}td{display:block;border:0;padding:2px 0}}"""
+CARD_CSS = BASE_THEME_CSS + """
+*{box-sizing:border-box}
+body{background:var(--bg);color:var(--text);font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;display:flex;justify-content:center;align-items:flex-start;min-height:100vh;padding:44px 16px;margin:0;line-height:1.55}
+.card{background:var(--canvas);padding:28px 28px 24px;border-radius:12px;border:1px solid var(--border);box-shadow:var(--shadow);max-width:var(--w);width:100%}
+.card-top{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:18px;padding-bottom:14px;border-bottom:1px solid var(--border)}
+.card-brand{display:inline-flex;align-items:center;gap:8px;color:var(--text);text-decoration:none;font-size:14px;font-weight:700;letter-spacing:-0.01em;min-height:36px}
+.card-brand:hover{color:var(--accent)}
+.card-brand .ico{color:var(--accent)}
+.theme-form{margin:0}
+.theme-btn{display:inline-flex;align-items:center;justify-content:center;gap:6px;width:auto;min-height:36px;padding:6px 12px;margin:0;border-radius:8px;border:1px solid var(--border);background:var(--panel);color:var(--text);font-size:13px;font-weight:600;cursor:pointer}
+.theme-btn:hover{background:var(--panel-hover);border-color:var(--border-strong)}
+h1{margin:0 0 12px;font-size:1.45rem;font-weight:750;letter-spacing:-0.02em;line-height:1.22;color:var(--text)}
+p,td,li{color:var(--text-body);font-size:14.5px;line-height:1.6}
+p{margin:0 0 14px;text-wrap:pretty}
+.muted{color:var(--muted);font-size:13px}
+.err-box{color:var(--red);background:var(--red-bg);padding:11px 14px;border-radius:8px;border:1px solid var(--border-strong);font-size:14px;font-weight:500}
+.status-ok{color:var(--green);background:var(--green-bg);padding:10px 14px;border-radius:8px;font-size:14px;font-weight:500}
+.code{font:700 1.65rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.14em;margin:8px 0 18px;padding:12px 16px;border-radius:8px;background:var(--panel);color:var(--text);text-align:center}
+label{display:block;color:var(--text);font-size:13px;font-weight:600;margin:10px 0 4px}
+input,select,button,.cta-btn{width:100%;min-height:44px;padding:10px 14px;margin:6px 0;border-radius:8px;font-size:15px;font-family:inherit}
+input,select{border:1px solid var(--border-strong);background:var(--canvas);color:var(--text)}
+input::placeholder{color:var(--muted);opacity:1}
+button,.cta-btn{background:var(--accent);color:var(--accent-fg);border:none;font-weight:650;cursor:pointer;display:inline-flex;align-items:center;justify-content:center;gap:8px;text-align:center;text-decoration:none}
+button:hover,.cta-btn:hover{opacity:0.93}
+button.secondary{background:var(--panel);color:var(--text);border:1px solid var(--border-strong);font-weight:600}
+button.secondary:hover{background:var(--panel-hover)}
+button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+a{color:var(--accent);text-underline-offset:3px}
+code{background:var(--code-inline-bg);color:var(--code-inline-fg);padding:2px 5px;border-radius:4px;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.88em}
+pre{background:var(--pre-bg);color:var(--pre-fg);border-radius:8px;padding:12px 14px;overflow-x:auto;font-size:13px;line-height:1.5;margin:10px 0 14px}
+details{margin:16px 0;border-top:1px solid var(--border);padding-top:14px}
+summary{color:var(--text);font-size:13.5px;font-weight:600;cursor:pointer;min-height:36px;display:flex;align-items:center;gap:6px;list-style:none}
+summary::-webkit-details-marker{display:none}
+details:not(.confirm-box)>summary::before{content:"▸";color:var(--muted);font-size:13px}
+details:not(.confirm-box)[open]>summary::before{content:"▾";color:var(--accent)}
+::selection{background:var(--accent);color:var(--accent-fg)}
+.badge{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11.5px;font-weight:600;vertical-align:middle;margin-left:6px}
+.valid-badge{background:var(--green-bg);color:var(--green)}
+.table-wrap{overflow-x:auto;margin:12px 0 18px}
+table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin:0}
+th{text-align:left;color:var(--muted);font-size:12px;font-weight:700;text-transform:uppercase;letter-spacing:0.04em;padding:10px 10px;border-bottom:1px solid var(--border)}
+td{padding:12px 10px;border-bottom:1px solid var(--border);vertical-align:middle}
+tr:last-child td{border-bottom:0}
+.confirm-box{margin:0;border:0;padding:0;display:inline-block;position:relative}
+.confirm-trigger{list-style:none;display:inline-flex;align-items:center;justify-content:center;min-height:36px;padding:6px 12px;border-radius:8px;border:1px solid var(--border-strong);background:var(--panel);color:var(--text);font-size:13px;font-weight:600;cursor:pointer}
+.confirm-trigger::-webkit-details-marker{display:none}
+.confirm-trigger:hover{background:var(--panel-hover)}
+.confirm-pop{margin:6px 0 0;display:flex;align-items:center;gap:6px}
+.danger-btn{width:auto;min-height:36px;margin:0;padding:6px 12px;background:var(--red-bg);color:var(--red);border:1px solid var(--border-strong);font-size:12.5px;font-weight:700;border-radius:8px}
+.danger-btn:hover{opacity:0.9}
+.card-footer{display:flex;flex-wrap:wrap;gap:14px;align-items:center;margin-top:16px;padding-top:14px;border-top:1px solid var(--border)}
+.card-footer a{display:inline-flex;align-items:center;min-height:36px;font-size:13.5px;font-weight:600;text-decoration:none}
+.card-footer a:hover{text-decoration:underline}
+.ico{display:inline-block;vertical-align:middle;flex-shrink:0}
+@media (max-width:640px){
+  body{padding:20px 12px}
+  .card{padding:20px 16px}
+  thead{display:none}
+  tr{display:block;padding:12px 0;border-bottom:1px solid var(--border)}
+  td{display:block;border:0;padding:3px 0}
+}"""
 
 
-def render_card_page(title: str, body: str, width: int = 430) -> str:
+def render_card_page(
+    title: str,
+    body: str,
+    width: int = 460,
+    *,
+    theme: str = "auto",
+    next_path: str = "/?scope=&view=topics",
+    show_theme: bool = True,
+) -> str:
+    norm_theme = _normalize_theme(theme)
+    next_theme = "light" if norm_theme == "dark" else "dark"
+    theme_ico = _svg_icon("sun" if norm_theme == "dark" else "moon")
+    theme_lbl = "Light" if norm_theme == "dark" else "Dark"
+    theme_ctrl = (
+        f'<form method="post" action="/theme" class="theme-form">'
+        f'<input type="hidden" name="theme" value="{next_theme}">'
+        f'<input type="hidden" name="next" value="{html.escape(_sanitize_next_path(next_path, default="/?scope=&view=topics"), quote=True)}">'
+        f'<button type="submit" class="theme-btn" aria-label="Switch to {theme_lbl} mode">{theme_ico} {theme_lbl}</button>'
+        f"</form>"
+        if show_theme
+        else ""
+    )
     return f"""<!doctype html>
-<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<html lang="en" data-theme="{norm_theme}"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>{html.escape(title)} · Vyn Memory</title><style>{CARD_CSS}</style>
-</head><body><main class="card" style="--w:{width}px"><h2>{html.escape(title)}</h2>{body}</main></body></html>"""
+</head><body><main class="card" style="--w:{width}px">
+<div class="card-top"><a class="card-brand" href="/?scope=&amp;view=topics">{_svg_icon("vault")} <span>Vyn Memory</span></a>{theme_ctrl}</div>
+<h1>{html.escape(title)}</h1>{body}</main></body></html>"""
 
 
 def _device_label(info: dict[str, object]) -> str:
@@ -4687,7 +4979,7 @@ def _device_role_hint(label: str) -> str:
     return "antigravity" if "antigravity" in app or "gemini" in app else "claude"
 
 
-def render_device_lookup_page(error_msg: str = "") -> str:
+def render_device_lookup_page(error_msg: str = "", *, theme: str = "auto") -> str:
     err_html = f'<p class="err-box">{html.escape(error_msg)}</p>' if error_msg else ""
     body = f"""<p>Enter the 8-letter code shown in your terminal after running <code>memory.py login</code>.</p>
 {err_html}
@@ -4696,11 +4988,11 @@ def render_device_lookup_page(error_msg: str = "") -> str:
 <input id="device-code" type="text" name="code" placeholder="BCDF-GHJK" autocomplete="off" required>
 <button type="submit">Continue</button>
 </form>
-<p class="muted"><a href="/apps">Connected apps</a> · <a href="/">Back to the vault</a></p>"""
-    return render_card_page("Approve device login", body)
+<div class="card-footer"><a href="/apps">Connected apps</a><a href="/?scope=&amp;view=topics">Back to the vault</a></div>"""
+    return render_card_page("Approve device login", body, theme=theme, next_path="/device")
 
 
-def render_device_page(row: sqlite3.Row, *, session_token: str = "") -> str:
+def render_device_page(row: sqlite3.Row, *, session_token: str = "", theme: str = "auto") -> str:
     options = "".join(
         f'<option value="{r}"{" selected" if r == row["role_hint"] else ""}>{label}</option>'
         for r, label in DEVICE_ROLES.items()
@@ -4719,22 +5011,39 @@ def render_device_page(row: sqlite3.Row, *, session_token: str = "") -> str:
 <button name="decision" value="approve">Approve</button>
 <button class="secondary" name="decision" value="deny">Deny</button>
 </form>"""
-    return render_card_page("Approve device login", body)
+    return render_card_page("Approve device login", body, theme=theme, next_path=f"/device?code={urllib.parse.quote(str(row['user_code']))}")
 
 
-def render_apps_page(conn: sqlite3.Connection, *, session_token: str = "") -> str:
+def render_apps_page(conn: sqlite3.Connection, *, session_token: str = "", theme: str = "auto") -> str:
     def when(ts: float) -> str:
         return datetime.fromtimestamp(ts, LOCAL_TZ).strftime("%d %b %Y, %H:%M") if ts else "–"
 
     csrf = html.escape(_mint_upload_csrf(purpose="apps", session_token=session_token), quote=True)
+    cur_sess_hash = hashlib.sha256(session_token.encode()).hexdigest() if session_token else ""
 
-    def row_html(name: str, kind: str, acts_as: str, added: float, used: float, rev_kind: str, rowid: int) -> str:
+    def row_html(
+        name: str,
+        kind: str,
+        acts_as: str,
+        added: float,
+        used: float,
+        rev_kind: str,
+        rowid: int,
+        *,
+        is_current: bool = False,
+    ) -> str:
+        safe_name = html.escape(name, quote=True)
+        cur_badge = '<span class="badge valid-badge">Current session</span>' if is_current else ""
         return (
-            f'<tr><td><strong>{html.escape(name)}</strong><br><span class="muted">{kind}</span></td>'
+            f'<tr><td><strong>{html.escape(name)}</strong>{cur_badge}<br><span class="muted">{kind}</span></td>'
             f"<td>{html.escape(acts_as)}</td><td>{when(added)}</td><td>{when(used)}</td>"
-            f'<td><form method="post" action="/apps"><input type="hidden" name="csrf_token" value="{csrf}">'
+            f'<td><details class="confirm-box">'
+            f'<summary class="confirm-trigger" aria-label="Revoke {safe_name}">Revoke</summary>'
+            f'<form method="post" action="/apps" class="confirm-pop">'
+            f'<input type="hidden" name="csrf_token" value="{csrf}">'
             f'<input type="hidden" name="kind" value="{rev_kind}"><input type="hidden" name="id" value="{rowid}">'
-            f'<button class="secondary" aria-label="Revoke {html.escape(name, quote=True)}">Revoke</button></form></td></tr>'
+            f'<button type="submit" class="danger-btn">Confirm revoke</button>'
+            f"</form></details></td></tr>"
         )
 
     with DB_LOCK:
@@ -4754,6 +5063,7 @@ def render_apps_page(conn: sqlite3.Connection, *, session_token: str = "") -> st
         row_html(
             "Owner token sign-in" if str(w["email"]).startswith("owner@token:") else str(w["email"]),
             "Browser session", "owner", w["created_at"], 0, "session", w["rowid"],
+            is_current=bool(cur_sess_hash and hmac.compare_digest(str(w["token_hash"]), cur_sess_hash)),
         )
         for w in sessions
         if owner_email_ok(str(w["email"]))
@@ -4762,52 +5072,57 @@ def render_apps_page(conn: sqlite3.Connection, *, session_token: str = "") -> st
     mcp_url = html.escape(f"{PUBLIC_URL}/mcp")
     pub_url = html.escape(PUBLIC_URL)
     body = (
-        '<p class="muted">Everything that can reach your memory now. Revoke ends access at once; '
-        "a device can log in again with <code>memory.py login</code>.</p>"
-        "<table><thead><tr><th>App</th><th>Acts as</th><th>Added</th><th>Last used</th><th></th></tr></thead>"
-        f'<tbody>{"".join(rows) or "<tr><td colspan=5>Nothing connected yet.</td></tr>"}</tbody></table>'
+        '<p class="muted">Everything that currently has access to your memory. Revoking ends access immediately; '
+        "a device can sign in again with <code>memory.py login</code>.</p>"
+        '<div class="table-wrap"><table><thead><tr><th>App</th><th>Acts as</th><th>Added</th><th>Last used</th><th>Action</th></tr></thead>'
+        f'<tbody>{"".join(rows) or "<tr><td colspan=5>Nothing connected yet.</td></tr>"}</tbody></table></div>'
         "<details>"
         "<summary>Connect a new app, MCP client, or laptop</summary>"
         f"<p><strong>Claude / ChatGPT (MCP Connector):</strong> add <code>{mcp_url}</code> as a remote MCP server and sign in when prompted.</p>"
         f"<p><strong>Laptop CLI (Claude Code, Codex, Antigravity):</strong> run this once, then approve the code at <a href='/device'>/device</a>:</p>"
         f"<pre>python3 memory.py login {pub_url}</pre>"
         "</details>"
-        f'<p class="muted">The server also has role tokens for: {html.escape(roles)}. '
-        "To revoke one, change it in the server's env file and restart.</p>"
-        '<p><a href="/">Back to the vault</a> · <a href="/device">Approve a device code</a></p>'
+        f'<p class="muted">Server role tokens configured: {html.escape(roles)}. '
+        "To rotate or revoke one, update it in the server env file and restart.</p>"
+        '<div class="card-footer"><a href="/?scope=&amp;view=topics">← Back to the vault</a><a href="/device">Approve a device code</a></div>'
     )
-    return render_card_page("Connected apps", body, width=880)
+    return render_card_page("Connected apps", body, width=880, theme=theme, next_path="/apps")
 
 
-def render_login_page(next_path: str = f"/?scope={DEFAULT_SCOPE}", error_msg: str = "") -> str:
+def render_login_page(
+    next_path: str = f"/?scope={DEFAULT_SCOPE}",
+    error_msg: str = "",
+    *,
+    theme: str = "auto",
+) -> str:
     safe_next = _sanitize_next_path(next_path)
     err_html = f'<p class="err-box">{html.escape(error_msg)}</p>' if error_msg else ""
     token_form = (
         '<form method="post" action="/login">'
         f'<input type="hidden" name="next" value="{html.escape(safe_next, quote=True)}">'
-        '<label for="owner-token">Owner token (<code>MEMORY_OWNER_TOKEN</code>)</label>'
-        '<input id="owner-token" type="password" name="token" placeholder="Paste MEMORY_OWNER_TOKEN" autocomplete="current-password" required>'
-        '<button type="submit">Sign In with Token</button>'
+        '<label for="owner-token">Owner access token</label>'
+        '<input id="owner-token" type="password" name="token" placeholder="Paste owner token (MEMORY_OWNER_TOKEN)" autocomplete="current-password" required>'
+        '<button type="submit">Sign In with Access Token</button>'
         "</form>"
     )
     if _omni_configured():
         omni_start_href = f"/auth/start?next={urllib.parse.quote(safe_next, safe='')}"
         body = (
-            "<p>Sign in with your <strong>Omni</strong> owner account (email OTP / active Omni session):</p>"
+            "<p>Sign in with your <strong>Omni</strong> owner account to open your notes and AI memory.</p>"
             f"{err_html}"
-            f'<a class="cta-btn" href="{html.escape(omni_start_href, quote=True)}">🔐 Sign in with Omni (Owner Email)</a>'
+            f'<a class="cta-btn" href="{html.escape(omni_start_href, quote=True)}">{_svg_icon("lock")} Sign in with Omni (Owner Email)</a>'
             "<details>"
-            "<summary>Fallback: sign in with MEMORY_OWNER_TOKEN</summary>"
+            "<summary>Use owner access token instead</summary>"
             f"{token_form}"
             "</details>"
         )
     else:
         body = (
-            "<p>Enter your <code>MEMORY_OWNER_TOKEN</code> from your server env file to open the vault.</p>"
+            "<p>Enter the owner access token from your server configuration (<code>MEMORY_OWNER_TOKEN</code>) to open your notes and AI memory.</p>"
             f"{err_html}"
             f"{token_form}"
         )
-    return render_card_page("Sign In to Vyn Memory", body)
+    return render_card_page("Sign In to Vyn Memory", body, theme=theme, next_path=f"/login?next={urllib.parse.quote(safe_next, safe='')}")
 
 
 def validate_oauth_redirect_uri(uri: str) -> str:
@@ -5068,6 +5383,27 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 pass
         return ""
 
+    def _extract_theme_cookie(self) -> str:
+        raw_headers = self.headers.get_all("Cookie") if hasattr(self.headers, "get_all") else None
+        if not raw_headers:
+            single = self.headers.get("Cookie", "")
+            raw_headers = [single] if single else []
+        for raw_cookie in raw_headers:
+            for part in raw_cookie.split(";"):
+                if "=" not in part:
+                    continue
+                k, v = part.split("=", 1)
+                if k.strip() == "vyn_theme":
+                    return _normalize_theme(urllib.parse.unquote(v.strip().strip('"')))
+            try:
+                c = SimpleCookie()
+                c.load(raw_cookie)
+                if "vyn_theme" in c:
+                    return _normalize_theme(urllib.parse.unquote(c["vyn_theme"].value))
+            except Exception:
+                pass
+        return "auto"
+
     def _is_same_origin_browser_post(self) -> bool:
         sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
         if sec_site and sec_site not in ("same-origin", "none"):
@@ -5154,7 +5490,14 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         ):
             return form, email
         _record_auth_failure(self.client_ip())
-        self.send_html(403, render_card_page("Not allowed", "<p>Sign in again and retry from the page.</p>"))
+        self.send_html(
+            403,
+            render_card_page(
+                "Not allowed",
+                "<p>Sign in again and retry from the page.</p>",
+                theme=self._extract_theme_cookie(),
+            ),
+        )
         return None
 
     def require_auth(self, actor: str | None) -> bool:
@@ -5228,15 +5571,17 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             self.send_json(200, {"status": "ok", "service": "vyn-memory"})
             return
 
+        theme = self._extract_theme_cookie()
+
         if route == "/login":
             next_p = (query.get("next") or [f"/?scope={DEFAULT_SCOPE}"])[0]
-            self.send_html(200, render_login_page(next_path=next_p))
+            self.send_html(200, render_login_page(next_path=next_p, theme=theme))
             return
 
         if route == "/auth/start":
             omni_pub = (os.environ.get("OMNI_PUBLIC_URL", "") or OMNI_PUBLIC_URL).rstrip("/")
             if not omni_pub:
-                self.send_html(404, render_login_page(error_msg="Omni sign-in is not configured; use the owner token."))
+                self.send_html(404, render_login_page(error_msg="Omni sign-in is not configured; use the owner token.", theme=theme))
                 return
             next_p = (query.get("next") or [f"/?scope={DEFAULT_SCOPE}"])[0].strip()
             safe_next = _sanitize_next_path(next_p)
@@ -5265,7 +5610,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 _record_auth_failure(ip)
                 self.send_html(
                     400,
-                    render_login_page(error_msg="Invalid or expired sign-in state. Please start sign-in again."),
+                    render_login_page(error_msg="Invalid or expired sign-in state. Please start sign-in again.", theme=theme),
                 )
                 return
             state_hash = hashlib.sha256(state.encode()).hexdigest()
@@ -5281,7 +5626,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 _record_auth_failure(ip)
                 self.send_html(
                     400,
-                    render_login_page(error_msg="Sign-in session expired. Please try again."),
+                    render_login_page(error_msg="Sign-in session expired. Please try again.", theme=theme),
                 )
                 return
             next_path = _sanitize_next_path(str(st_row["next_path"] or f"/?scope={DEFAULT_SCOPE}"))
@@ -5289,7 +5634,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 person = exchange_omni_handoff(code)
             except MemoryError as exc:
                 _record_auth_failure(ip)
-                self.send_html(401, render_login_page(next_path=next_path, error_msg=str(exc)))
+                self.send_html(401, render_login_page(next_path=next_path, error_msg=str(exc), theme=theme))
                 return
             email = str(person.get("email") or "").strip().lower()
             is_admin = bool(person.get("is_admin"))
@@ -5301,6 +5646,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     render_login_page(
                         next_path=next_path,
                         error_msg="Access denied: only the owner account is authorized for Vyn Memory.",
+                        theme=theme,
                     ),
                 )
                 return
@@ -5320,7 +5666,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             if (sec_site and sec_site not in ("same-origin", "none")) or "prefetch" in purpose or "prerender" in purpose:
                 self.send_html(
                     400,
-                    render_login_page(error_msg="Cross-site or prerendered sign-out request ignored."),
+                    render_login_page(error_msg="Cross-site or prerendered sign-out request ignored.", theme=theme),
                 )
                 return
             cookie_tokens = [t for t in self._extract_cookie_tokens() if t.startswith("vms_")]
@@ -5335,7 +5681,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             clear_cookie = _session_cookie_header("", max_age=0)
             self.send_html(
                 200,
-                render_login_page(error_msg="Signed out. Your browser session has been revoked and cleared."),
+                render_login_page(error_msg="Signed out. Your browser session has been revoked and cleared.", theme=theme),
                 extra_headers={"Set-Cookie": clear_cookie},
             )
             return
@@ -5396,7 +5742,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 )
                 session_label = "Omni Owner Session" if _omni_configured() else "Owner Session"
                 auth_body_html = (
-                    f'<p>✅ Signed in via <strong>{session_label}</strong>. Select the AI agent scope to grant this connector:</p>'
+                    f'<p class="status-ok">Signed in via <strong>{session_label}</strong>. Select the AI agent scope to grant this connector:</p>'
                     '<input type="hidden" name="omni_session" value="1">'
                     f'<input type="hidden" name="csrf_token" value="{html.escape(oauth_csrf, quote=True)}">'
                     '<label for="oauth-role">Agent role</label>'
@@ -5408,11 +5754,11 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 cur_oauth_target = "/oauth/authorize" + (f"?{parsed_cur.query}" if parsed_cur.query else "")
                 if _omni_configured():
                     signin_href = f"/auth/start?next={urllib.parse.quote(cur_oauth_target, safe='')}"
-                    signin_label = "🔐 Sign in with Omni to Approve Access"
+                    signin_label = f'{_svg_icon("lock")} Sign in with Omni to Approve Access'
                     signin_intro = "Sign in with your <strong>Omni</strong> owner account to approve this MCP connector:"
                 else:
                     signin_href = f"/login?next={urllib.parse.quote(cur_oauth_target, safe='')}"
-                    signin_label = "Sign in as Owner to Approve Access"
+                    signin_label = f'{_svg_icon("lock")} Sign in as Owner to Approve Access'
                     signin_intro = "Sign in as the vault owner to approve this MCP connector, or paste an agent token below:"
                 auth_body_html = (
                     f"<p>{signin_intro}</p>"
@@ -5437,20 +5783,20 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 f"{auth_body_html}"
                 "</form>"
             )
-            self.send_html(200, render_card_page("Authorize Vyn Memory", oauth_body), csp=OAUTH_CSP)
+            self.send_html(200, render_card_page("Authorize Vyn Memory", oauth_body, theme=theme, show_theme=False), csp=OAUTH_CSP)
             return
 
         if route in ("/device", "/apps"):
             if actor != "owner":
-                self.send_html(401, render_login_page(next_path=self.path))
+                self.send_html(401, render_login_page(next_path=self.path, theme=theme))
                 return
             sess_tok = self.owner_cookie_token()
             if route == "/apps":
-                self.send_html(200, render_apps_page(conn, session_token=sess_tok))
+                self.send_html(200, render_apps_page(conn, session_token=sess_tok, theme=theme))
                 return
             req_code = (query.get("code") or [""])[0].strip().upper()
             if not req_code:
-                self.send_html(200, render_device_lookup_page())
+                self.send_html(200, render_device_lookup_page(theme=theme))
                 return
             with DB_LOCK:
                 row = conn.execute(
@@ -5458,12 +5804,13 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     (req_code, time.time()),
                 ).fetchone()
             if row:
-                self.send_html(200, render_device_page(row, session_token=sess_tok))
+                self.send_html(200, render_device_page(row, session_token=sess_tok, theme=theme))
             else:
                 self.send_html(
                     404,
                     render_device_lookup_page(
-                        error_msg="Login code not found, expired, or already answered. Check your terminal or run memory.py login again."
+                        error_msg="Login code not found, expired, or already answered. Check your terminal or run memory.py login again.",
+                        theme=theme,
                     ),
                 )
             return
@@ -5475,7 +5822,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         if route == "/" and actor is None and "text/html" in self.headers.get("Accept", ""):
             parsed_req = urllib.parse.urlsplit(self.path)
             next_target = "/" + (f"?{parsed_req.query}" if parsed_req.query else f"?scope={DEFAULT_SCOPE}")
-            self.send_html(401, render_login_page(next_path=next_target))
+            self.send_html(401, render_login_page(next_path=next_target, theme=theme))
             return
 
         if not self.require_auth(actor):
@@ -5651,6 +5998,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 search_query=(query.get("q") or [""])[0],
                 view=(query.get("view") or [""])[0],
                 session_token=self.owner_cookie_token(),
+                theme=theme,
             )
             self.send_html(200, page)
             return
@@ -5668,6 +6016,27 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             route, query, actor = self.parse_route_and_auth(allow_cookie=False)
         except MemoryError as exc:
             self.send_json(exc.status, {"error": str(exc)})
+            return
+
+        theme = self._extract_theme_cookie()
+
+        if route == "/theme":
+            if not self._is_same_origin_browser_post():
+                self.send_json(403, {"error": "Cross-origin theme changes are forbidden."}, cors=False)
+                return
+            try:
+                raw_form = self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace")
+                form = urllib.parse.parse_qs(raw_form)
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)}, cors=False)
+                return
+            chosen = _normalize_theme((form.get("theme") or ["auto"])[0])
+            next_p = _sanitize_next_path((form.get("next") or [""])[0], default="/?scope=&view=topics")
+            self.send_response(303)
+            self.send_header("Location", next_p)
+            self.send_header("Set-Cookie", _theme_cookie_header(chosen))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
             return
 
         if route == "/upload":
@@ -5749,6 +6118,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     render_card_page(
                         "Could not update fact",
                         f'<p class="err-box">{html.escape(str(exc))}</p><p><a href="{html.escape(next_p, quote=True)}">Back to the vault</a></p>',
+                        theme=theme,
                     ),
                 )
                 return
@@ -5779,7 +6149,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     if resolved
                     else "Invalid MEMORY_OWNER_TOKEN. Check your server env file and try again."
                 )
-                self.send_html(401, render_login_page(next_path=next_p, error_msg=msg))
+                self.send_html(401, render_login_page(next_path=next_p, error_msg=msg, theme=theme))
                 return
             _clear_auth_failures(ip)
             sess_tok = _mint_web_session(conn, owner_session_email())
@@ -5859,7 +6229,16 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     resolved = selected_role
             if not resolved:
                 _record_auth_failure(ip)
-                self.send_html(401, render_card_page("Unauthorized", "<p>Sign in as owner or provide a valid agent token.</p>"), csp=OAUTH_CSP)
+                self.send_html(
+                    401,
+                    render_card_page(
+                        "Unauthorized",
+                        "<p>Sign in as owner or provide a valid agent token.</p>",
+                        theme=theme,
+                        show_theme=False,
+                    ),
+                    csp=OAUTH_CSP,
+                )
                 return
             _clear_auth_failures(ip)
             state = (form.get("state") or [""])[0]
@@ -6118,14 +6497,15 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
             if not cur.rowcount:
-                self.send_html(404, render_card_page("Login request not found", "<p>It expired or was already answered.</p>"))
+                self.send_html(404, render_card_page("Login request not found", "<p>It expired or was already answered.</p>", theme=theme))
             elif approve:
                 self.send_html(200, render_card_page(
                     "Approved",
-                    "<p>Go back to your terminal; the login finishes on its own.</p><p><a href=\"/apps\">Connected apps</a></p>",
+                    '<p>Go back to your terminal; the login finishes on its own.</p><div class="card-footer"><a href="/apps">Connected apps</a><a href="/?scope=&amp;view=topics">Back to the vault</a></div>',
+                    theme=theme,
                 ))
             else:
-                self.send_html(200, render_card_page("Denied", "<p>That device gets no token.</p>"))
+                self.send_html(200, render_card_page("Denied", "<p>That device gets no token.</p>", theme=theme))
             return
 
         if route == "/apps":

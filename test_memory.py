@@ -1869,6 +1869,119 @@ class TestVynMemory(unittest.TestCase):
         self.assertIn("/health", compose_text)
         self.assertIn("MEMORY_OWNER_TOKEN=", env_ex_text)
 
+    def test_web_ui_archival_polish_and_theme_cookie(self) -> None:
+        # 1. Emoji stripping & Markdown title cleanup
+        self.assertEqual(self.srv._strip_leading_emoji("💼 Career"), "Career")
+        self.assertEqual(self.srv._strip_leading_emoji("📄 Notes"), "Notes")
+        self.assertEqual(
+            self.srv._humanize_note_title("Mind Alchemy (`₹4,999`) **Guide**", "business/mind.md"),
+            "Mind Alchemy (₹4,999) Guide",
+        )
+
+        # 2. op_search returns exact pre-LIMIT notes_total
+        self.srv.op_write_note(
+            self.conn,
+            "claude",
+            path="projects/beta/01-dma.md",
+            content="# Beta DMA\n\nDMA controller notes.\n",
+            scope="projects/beta",
+        )
+        self.srv.op_remember_fact(
+            self.conn,
+            "claude",
+            fact="Beta uses scatter-gather DMA.",
+            scope="projects/beta",
+            subject="beta-dma",
+            category="fact",
+        )
+        res = self.srv.op_search(self.conn, query="DMA", limit=1)
+        self.assertGreaterEqual(res["notes_total"], 1)
+        self.assertLessEqual(len(res["notes"]), 1)
+
+        # 3. Search view uses flat canvas (no nested card) & mobile-only collapsible facts in center
+        search_html = self.srv.render_dashboard_page(
+            self.conn, "owner", scope_filter="", search_query="DMA", session_token="s1", theme="dark"
+        )
+        self.assertIn('data-theme="dark"', search_html)
+        self.assertIn('class="reader reader-flat"', search_html)
+        self.assertIn('class="mobile-search-facts"', search_html)
+        self.assertIn('class="skip-link"', search_html)
+
+        # 4. Live HTTP: POST /theme persists vyn_theme cookie across GET / and GET /apps (with Current session + <h1>)
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            sess_tok = self.srv._mint_web_session(self.conn, "owner@example.com")
+
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            no_redir = urllib.request.build_opener(NoRedirect)
+            req_theme = urllib.request.Request(
+                f"{base}/theme",
+                data=urllib.parse.urlencode({"theme": "dark", "next": "/apps"}).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": base,
+                    "Sec-Fetch-Site": "same-origin",
+                },
+                method="POST",
+            )
+            try:
+                no_redir.open(req_theme)
+                self.fail("Expected 303 redirect from POST /theme")
+            except urllib.error.HTTPError as exc:
+                self.assertEqual(exc.code, 303)
+                self.assertEqual(exc.headers.get("Location"), "/apps")
+                set_cookie = exc.headers.get("Set-Cookie") or ""
+                self.assertIn("vyn_theme=dark", set_cookie)
+                exc.close()
+
+            # Cross-origin POST /theme is rejected with 403
+            req_xorigin = urllib.request.Request(
+                f"{base}/theme",
+                data=b"theme=dark&next=/",
+                headers={
+                    "Content-Type": "application/x-www-form-urlencoded",
+                    "Origin": "https://evil.example",
+                    "Sec-Fetch-Site": "cross-site",
+                },
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_xo:
+                no_redir.open(req_xorigin)
+            self.assertEqual(ctx_xo.exception.code, 403)
+            ctx_xo.exception.close()
+
+            # GET /apps with vyn_theme=dark renders data-theme="dark", <h1>Connected apps</h1>, Current session badge, and two-step confirm
+            req_apps = urllib.request.Request(
+                f"{base}/apps",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}; vyn_theme=dark"},
+            )
+            with urllib.request.urlopen(req_apps) as resp:
+                apps_html = resp.read().decode("utf-8")
+            self.assertIn('data-theme="dark"', apps_html)
+            self.assertIn("<h1>Connected apps</h1>", apps_html)
+            self.assertIn("Current session", apps_html)
+            self.assertIn("Confirm revoke", apps_html)
+
+            # GET / with vyn_theme=dark renders data-theme="dark"
+            req_dash = urllib.request.Request(
+                f"{base}/?scope=&view=topics",
+                headers={"Cookie": f"__Host-vyn_memory_token={sess_tok}; vyn_theme=dark"},
+            )
+            with urllib.request.urlopen(req_dash) as resp:
+                dash_html = resp.read().decode("utf-8")
+            self.assertIn('data-theme="dark"', dash_html)
+        finally:
+            httpd.shutdown()
+            httpd.server_close()
+
 
 if __name__ == "__main__":
     unittest.main()
