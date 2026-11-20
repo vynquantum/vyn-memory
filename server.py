@@ -3334,11 +3334,45 @@ def _classify_confluence_bucket(path_str: str) -> str:
 
 def _humanize_note_title(title: str, path_str: str) -> str:
     cleaned = _clean_latex_inline(title.strip())
-    if cleaned and not re.match(r"^[a-z0-9_\-]+$", cleaned):
+    acronyms = {"c", "os", "arm", "dsa", "bsp", "api", "sql", "mcp", "rtos", "dma", "mmu", "jtag", "ui", "ux"}
+
+    def _fmt_seg(seg: str) -> str:
+        low = seg.lower()
+        if low in acronyms:
+            return low.upper()
+        return seg.replace("-", " ").replace("_", " ").title()
+
+    if cleaned and not re.match(r"^[a-z0-9_\-]+$", cleaned) and cleaned.lower() not in ("readme", "index"):
         return cleaned
-    stem = path_str.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+    parts = [p for p in path_str.strip("/").split("/") if p]
+    stem = (parts[-1].rsplit(".", 1)[0] if parts else "").strip()
+    if stem.lower() in ("readme", "index") and len(parts) >= 2:
+        return f"{_fmt_seg(parts[-2])} — Overview"
     stem = re.sub(r"^00-", "", stem)
-    return stem.replace("-", " ").replace("_", " ").title() or title
+    return _fmt_seg(stem) or cleaned or title
+
+
+def _format_search_snippet(raw_snippet: str) -> str:
+    """Safely render SQLite FTS5 snippet text, highlighting [term] markers as <mark>term</mark>."""
+    cleaned = re.sub(r"\s+", " ", (raw_snippet or "").strip())
+    cleaned = re.sub(r"(?:^|\s)#{1,6}\s+", " ", cleaned).strip()
+    if len(cleaned) > 260:
+        cleaned = cleaned[:257].rstrip() + "…"
+    escaped = html.escape(cleaned)
+    return re.sub(r"\[([^\[\]]{1,48})\]", r"<mark>\1</mark>", escaped)
+
+
+def _estimate_read_minutes(md_text: str) -> int:
+    words = len(re.findall(r"\b\w+\b", md_text or ""))
+    return max(1, round(words / 220)) if words else 1
+
+
+def _note_matches_root_folder(note_scope: str, root_sc: str) -> bool:
+    if not root_sc:
+        return True
+    if root_sc == "daily":
+        return note_scope in ("daily", "inbox") or note_scope.startswith(("daily/", "inbox/"))
+    return note_scope == root_sc or note_scope.startswith(root_sc + "/")
 
 
 def render_dashboard_page(
@@ -3348,6 +3382,7 @@ def render_dashboard_page(
     selected_note: str = "",
     scope_filter: str = "",
     search_query: str = "",
+    view: str = "",
     base_path: str = "/",
     session_token: str = "",
 ) -> str:
@@ -3356,18 +3391,26 @@ def render_dashboard_page(
     facts_csrf = _mint_upload_csrf(purpose="facts", session_token=session_token)
     with DB_LOCK:
         sync_vault_notes(conn)
-    try:
-        all_scope_notes = op_list_notes(conn, scope=scope_filter)["notes"]
-    except MemoryError:
-        scope_filter = ""
-        all_scope_notes = op_list_notes(conn, scope="")["notes"]
-    if scope_filter == "daily":
-        inbox_notes = op_list_notes(conn, scope="inbox")["notes"]
-        seen_p = {str(n["path"]) for n in all_scope_notes}
-        all_scope_notes = list(inbox_notes) + [n for n in all_scope_notes if str(n["path"]) not in seen_p]
-    search_res = op_search(conn, query=search_query, scope=scope_filter, include_history=True, limit=40)
 
-    if search_query.strip():
+    all_vault_notes = op_list_notes(conn, scope="")["notes"]
+    norm_scope_filter = ""
+    if (scope_filter or "").strip():
+        try:
+            norm_scope_filter = normalize_scope(scope_filter)
+        except MemoryError:
+            norm_scope_filter = ""
+    scope_filter = norm_scope_filter
+
+    if scope_filter:
+        all_scope_notes = [n for n in all_vault_notes if _note_matches_root_folder(str(n["scope"]), scope_filter)]
+    else:
+        all_scope_notes = list(all_vault_notes)
+
+    q_clean = (search_query or "").strip()
+    view_mode = (view or "").strip().lower()
+    search_res = op_search(conn, query=q_clean, scope=scope_filter, include_history=True, limit=40)
+
+    if q_clean:
         matched_paths = {str(n["path"]) for n in search_res["notes"]}
         notes = [n for n in all_scope_notes if str(n["path"]) in matched_paths] or list(search_res["notes"])
     else:
@@ -3375,27 +3418,41 @@ def render_dashboard_page(
 
     note_paths_set = {str(n["path"]) for n in all_scope_notes}
     preferred_defaults = DASHBOARD["landing"]
-    default_landing = next(
-        (cand for cand in preferred_defaults if cand in note_paths_set),
-        str(notes[0]["path"]) if notes else "",
-    )
-    target_note = selected_note or (default_landing if not search_query else (str(notes[0]["path"]) if notes else ""))
+    default_landing = next((cand for cand in preferred_defaults if cand in note_paths_set), "")
+
+    # Dedicated views:
+    # - Searching without an explicit selected_note -> Search Results view (snippets + facts + scope chips)
+    # - view="topics" (or browsing a folder with no landing note and no explicit note) -> Topic Explorer view
+    # - Otherwise -> Article Reader view
+    if q_clean and not selected_note:
+        target_note = ""
+        active_view = "search"
+    elif view_mode == "topics" and not selected_note:
+        target_note = ""
+        active_view = "topics"
+    else:
+        target_note = selected_note or default_landing
+        active_view = "reader" if target_note else ("topics" if notes else "empty")
 
     note_html = ""
     active_note_meta = None
     toc_items: list[dict[str, object]] = []
+    read_minutes = 1
     if target_note:
         try:
             active_note_meta = op_read_note(conn, target_note)
             raw_md = str(active_note_meta["content"])
             note_html = render_markdown_html(raw_md, prefix=base_path)
             toc_items = extract_toc_headings(raw_md)
+            read_minutes = _estimate_read_minutes(raw_md)
         except MemoryError:
             active_note_meta = None
+            active_view = "topics" if notes else "empty"
 
     root_folders = DASHBOARD["folders"]
     all_known_scopes = DASHBOARD["scopes"]
     dashboard_title = str(DASHBOARD.get("title") or "Vyn Memory")
+    group_labels = {k: lbl for k, lbl, _ in DASHBOARD["groups"]}
 
     def _is_folder_active(root_sc: str) -> bool:
         if not root_sc:
@@ -3404,9 +3461,22 @@ def render_dashboard_page(
             return True
         return scope_filter == root_sc or scope_filter.startswith(root_sc + "/")
 
+    def _folder_count(root_sc: str) -> int:
+        if not root_sc:
+            return len(all_vault_notes)
+        return sum(1 for n in all_vault_notes if _note_matches_root_folder(str(n["scope"]), root_sc))
+
+    def _folder_label(sc: str) -> str:
+        for s_key, s_lbl in root_folders:
+            if s_key == sc:
+                return s_lbl
+        return sc.replace("-", " ").replace("_", " ").title() if sc else "Entire Vault"
+
     scope_pills = "".join(
         f'<a class="pill {"active" if _is_folder_active(s) else ""}" '
-        f'href="{safe_base_path}?scope={urllib.parse.quote(s)}">{label}</a>'
+        f'href="{safe_base_path}?scope={urllib.parse.quote(s)}&view=topics">'
+        f'<span class="pill-label">{label}</span>'
+        f'<span class="pill-count">{_folder_count(s)}</span></a>'
         for s, label in root_folders
     )
 
@@ -3416,6 +3486,9 @@ def render_dashboard_page(
             return " <span class='badge scope-badge'>PDF</span>"
         if low.endswith(".docx"):
             return " <span class='badge scope-badge'>DOCX</span>"
+        fname = low.rsplit("/", 1)[-1]
+        if fname.startswith(("00-", "master-")) or fname == "readme.md":
+            return " <span class='badge guide-badge'>GUIDE</span>"
         return ""
 
     # Quick-access pinned links tailored to the active root folder
@@ -3431,14 +3504,14 @@ def render_dashboard_page(
                 f"{p_label}</a>"
             )
     quick_links_html = (
-        '<div class="quick-links"><div class="sidebar-section-label">⚡ Quick Access</div>'
+        '<div class="quick-links"><div class="sidebar-section-label">Quick Access</div>'
         + "".join(pinned_links_list)
         + "</div>"
         if pinned_links_list
         else ""
     )
 
-    # Group notes into collapsible folder tree
+    # Group notes into collapsible topic tree and track sorted order per bucket for Prev/Next traversal
     buckets: dict[str, list[dict[str, object]]] = {k: [] for k, _, _ in DASHBOARD["groups"]}
     for n in notes:
         b_key = _classify_confluence_bucket(str(n["path"]))
@@ -3450,28 +3523,33 @@ def render_dashboard_page(
         is_overview = 0 if (fname.startswith("00-") or fname == "readme.md" or fname.startswith("master-")) else 1
         return (is_overview, _humanize_note_title(str(n["title"]), p).lower())
 
-    non_empty_bucket_keys = [k for k, _, _ in DASHBOARD["groups"] if buckets.get(k)]
-    tree_groups_html: list[str] = []
-    for b_key, b_label, default_open in DASHBOARD["groups"]:
+    sorted_buckets: dict[str, list[dict[str, object]]] = {}
+    for b_key, _, _ in DASHBOARD["groups"]:
         b_notes = buckets.get(b_key, [])
         if not b_notes:
             continue
         if b_key == "daily":
-            b_notes_sorted = sorted(b_notes, key=lambda x: str(x["path"]), reverse=True)
+            sorted_buckets[b_key] = sorted(b_notes, key=lambda x: str(x["path"]), reverse=True)
         else:
-            b_notes_sorted = sorted(b_notes, key=_note_sort_key)
+            sorted_buckets[b_key] = sorted(b_notes, key=_note_sort_key)
+
+    non_empty_bucket_keys = [k for k, _, _ in DASHBOARD["groups"] if sorted_buckets.get(k)]
+    tree_groups_html: list[str] = []
+    q_param_suffix = f"&q={urllib.parse.quote(q_clean)}" if q_clean else ""
+    for b_key, b_label, default_open in DASHBOARD["groups"]:
+        b_notes_sorted = sorted_buckets.get(b_key, [])
+        if not b_notes_sorted:
+            continue
         has_active = any(str(n["path"]) == active_path_str for n in b_notes_sorted)
         should_open = (
             has_active
             or default_open
-            or bool(search_query.strip())
+            or bool(q_clean)
             or len(non_empty_bucket_keys) <= 3
-        ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not search_query.strip() and len(non_empty_bucket_keys) > 1)
+        ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not q_clean and len(non_empty_bucket_keys) > 1)
         items_html: list[str] = []
         for n in b_notes_sorted:
             n_path = str(n["path"])
-            n_fname = n_path.rsplit("/", 1)[-1].lower()
-            icon = "📘" if (n_fname.startswith("00-") or n_fname == "readme.md") else "📄"
             is_act = "active-note" if active_path_str == n_path else ""
             clean_title = _humanize_note_title(str(n["title"]), n_path)
             sub_hint = ""
@@ -3485,9 +3563,8 @@ def render_dashboard_page(
                     sub_hint = f"<span class='tree-sub'>{html.escape(parts[1].upper())}</span> "
             items_html.append(
                 f'<li><a class="tree-item {is_act}" '
-                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}" '
+                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}{q_param_suffix}" '
                 f'title="{html.escape(n_path)}">'
-                f'<span class="tree-icon">{icon}</span>'
                 f'<span class="tree-title">{sub_hint}{html.escape(clean_title)}{_note_badge(n_path)}</span>'
                 f"</a></li>"
             )
@@ -3503,11 +3580,13 @@ def render_dashboard_page(
         )
     notes_tree_html = "".join(tree_groups_html) or '<p class="muted">No matching pages in this folder.</p>'
 
-    # Breadcrumbs for the active article
+    # Breadcrumbs + Prev/Next traversal for active article
     breadcrumbs_html = ""
+    pager_html = ""
+    active_topic_badge = ""
     if active_note_meta:
         parts = str(active_note_meta["path"]).split("/")
-        crumbs: list[str] = [f'<a href="{safe_base_path}?scope=">🏠 Vault</a>']
+        crumbs: list[str] = [f'<a href="{safe_base_path}?scope=&view=topics">Vault</a>']
         accum: list[str] = []
         for folder in parts[:-1]:
             accum.append(folder)
@@ -3516,11 +3595,41 @@ def render_dashboard_page(
             if folder.lower() in ("c", "os", "arm", "dsa", "bsp"):
                 folder_label = folder.upper()
             crumbs.append(
-                f'<a href="{safe_base_path}?scope={urllib.parse.quote(sc_path)}">{html.escape(folder_label)}</a>'
+                f'<a href="{safe_base_path}?scope={urllib.parse.quote(sc_path)}&view=topics">{html.escape(folder_label)}</a>'
             )
         doc_title = _humanize_note_title(str(active_note_meta["title"]), str(active_note_meta["path"]))
         crumbs.append(f'<span class="crumb-current">{html.escape(doc_title)}</span>')
         breadcrumbs_html = '<nav class="breadcrumbs" aria-label="Breadcrumb">' + ' <span class="crumb-sep">›</span> '.join(crumbs) + "</nav>"
+
+        active_bucket = _classify_confluence_bucket(active_path_str)
+        active_topic_label = group_labels.get(active_bucket, "")
+        if active_topic_label:
+            active_topic_badge = f"<span class='badge topic-badge'>{active_topic_label}</span>"
+        topic_list = sorted_buckets.get(active_bucket, [])
+        if topic_list:
+            idx = next((i for i, item in enumerate(topic_list) if str(item["path"]) == active_path_str), -1)
+            prev_item = topic_list[idx - 1] if idx > 0 else None
+            next_item = topic_list[idx + 1] if 0 <= idx < len(topic_list) - 1 else None
+            if prev_item or next_item:
+                prev_html = (
+                    f'<a class="pager-link pager-prev" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(prev_item["path"]))}">'
+                    f'<span class="pager-dir">← Previous</span>'
+                    f'<span class="pager-title">{html.escape(_humanize_note_title(str(prev_item["title"]), str(prev_item["path"])))}</span></a>'
+                    if prev_item
+                    else '<span class="pager-spacer"></span>'
+                )
+                mid_html = (
+                    f'<a class="pager-mid" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">'
+                    f'All topics ({idx + 1}/{len(topic_list)})</a>'
+                )
+                next_html = (
+                    f'<a class="pager-link pager-next" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(next_item["path"]))}">'
+                    f'<span class="pager-dir">Next →</span>'
+                    f'<span class="pager-title">{html.escape(_humanize_note_title(str(next_item["title"]), str(next_item["path"])))}</span></a>'
+                    if next_item
+                    else '<span class="pager-spacer"></span>'
+                )
+                pager_html = f'<nav class="pager-nav" aria-label="Topic page navigation">{prev_html}{mid_html}{next_html}</nav>'
 
     active_download_btn = ""
     if active_note_meta and str(active_note_meta["path"]).lower().endswith((".pdf", ".docx")):
@@ -3528,7 +3637,7 @@ def render_dashboard_page(
         dl_href = f"{safe_base_path.rstrip('/')}/download?path={urllib.parse.quote(str(active_note_meta['path']))}"
         active_download_btn = (
             f" · <a class='dl-btn' href='{dl_href}' target='_blank' rel='noopener'>"
-            f"⬇️ Open Original {ext_label}</a>"
+            f"Open Original {ext_label}</a>"
         )
 
     # Connected notes & backlinks at the bottom of the article
@@ -3540,12 +3649,12 @@ def render_dashboard_page(
             cn_title = _humanize_note_title(str(cn["title"]), cn_path)
             conn_cards.append(
                 f'<a class="conn-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(cn_path)}">'
-                f"<strong>📄 {html.escape(cn_title)}</strong>"
+                f"<strong>{html.escape(cn_title)}</strong>"
                 f"<span class='muted'>{html.escape(cn_path)}</span></a>"
             )
         connected_html = (
             '<section class="connected-section">'
-            '<h2 class="connected-title">🔗 Connected Pages &amp; Backlinks</h2>'
+            '<h2 class="connected-title">Connected Pages &amp; Backlinks</h2>'
             f'<div class="connected-grid">{"".join(conn_cards)}</div>'
             "</section>"
         )
@@ -3557,9 +3666,19 @@ def render_dashboard_page(
             f'{html.escape(str(item["title"]))}</a>'
             for item in toc_items
         )
-        toc_html = f'<nav class="toc-nav" aria-label="On this page"><div class="toc-header">📑 On this page</div>{toc_links}</nav>'
+        toc_html = f'<nav class="toc-nav" aria-label="On this page"><div class="toc-header">On this page</div>{toc_links}</nav>'
+    elif active_view == "topics":
+        topic_jump_links = "".join(
+            f'<a class="toc-link toc-h2" href="#topic-{html.escape(b_key, quote=True)}">{group_labels.get(b_key, b_key)} ({len(sorted_buckets[b_key])})</a>'
+            for b_key in non_empty_bucket_keys[:24]
+        )
+        toc_html = (
+            f'<nav class="toc-nav" aria-label="Jump to topic"><div class="toc-header">Jump to topic</div>{topic_jump_links}</nav>'
+            if topic_jump_links
+            else '<div class="toc-nav"><div class="toc-header">Topics</div><p class="muted">No topics in this folder yet.</p></div>'
+        )
     else:
-        toc_html = '<div class="toc-nav"><div class="toc-header">📑 On this page</div><p class="muted">Open any page with headings to jump straight to a section.</p></div>'
+        toc_html = '<div class="toc-nav"><div class="toc-header">On this page</div><p class="muted">Open any page with headings to jump straight to a section.</p></div>'
 
     upload_scope_default = scope_filter if scope_filter in all_known_scopes and scope_filter else DEFAULT_SCOPE
     upload_scope_options = "".join(
@@ -3574,8 +3693,10 @@ def render_dashboard_page(
     cur_qs: list[tuple[str, str]] = [("scope", scope_filter)]
     if active_path_str:
         cur_qs.append(("note", active_path_str))
-    if search_query.strip():
-        cur_qs.append(("q", search_query.strip()))
+    elif active_view == "topics":
+        cur_qs.append(("view", "topics"))
+    if q_clean:
+        cur_qs.append(("q", q_clean))
     current_page_url = f"{base_path or '/'}?{urllib.parse.urlencode(cur_qs)}"
 
     all_facts = list(search_res["facts"])
@@ -3647,37 +3768,152 @@ def render_dashboard_page(
             f"</form></details>"
         )
 
-    search_banner_html = ""
-    if search_query.strip():
-        search_banner_html = (
-            f"<div class='search-banner'>"
-            f"<span>Showing <strong>{len(notes)}</strong> page(s) and <strong>{len(all_facts)}</strong> fact(s) for "
-            f"<code>{html.escape(search_query.strip())}</code></span>"
-            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}'>Clear search</a>"
-            f"</div>"
-        )
+    # Build main center view (Search Results, Topic Explorer, Article Reader, or Empty Onboarding)
+    if active_view == "search":
+        matched_notes_list = list(search_res["notes"])
+        scope_counts: dict[str, int] = {}
+        for mn in matched_notes_list:
+            top_sc = str(mn["scope"]).split("/", 1)[0]
+            scope_counts[top_sc] = scope_counts.get(top_sc, 0) + 1
+        filter_chips: list[str] = [
+            f'<a class="filter-chip {"active" if not scope_filter else ""}" '
+            f'href="{safe_base_path}?scope=&q={urllib.parse.quote(q_clean)}">All vault</a>'
+        ]
+        for sc_top, sc_cnt in sorted(scope_counts.items(), key=lambda kv: (-kv[1], kv[0])):
+            is_act = scope_filter == sc_top or scope_filter.startswith(sc_top + "/")
+            filter_chips.append(
+                f'<a class="filter-chip {"active" if is_act else ""}" '
+                f'href="{safe_base_path}?scope={urllib.parse.quote(sc_top)}&q={urllib.parse.quote(q_clean)}">'
+                f'{html.escape(sc_top.title())} ({sc_cnt})</a>'
+            )
 
-    if active_note_meta:
+        fact_hits_html = ""
+        active_fact_hits = [f for f in all_facts if f.get("is_valid", True)][:6]
+        if active_fact_hits:
+            fh_cards = "".join(
+                f"<div class='search-fact-row'>"
+                f"<span class='badge valid-badge'>FACT</span> "
+                f"<span class='badge scope-badge'>{html.escape(str(f['scope']))}</span> "
+                + (f"<strong>[{html.escape(str(f['subject']))}]</strong> " if f.get("subject") else "")
+                + f"{html.escape(_clean_latex_inline(str(f['fact'])))}"
+                f"</div>"
+                for f in active_fact_hits
+            )
+            fact_hits_html = (
+                "<section class='search-section'>"
+                f"<h2 class='section-kicker'>Matching Verified Facts ({len(active_fact_hits)})</h2>"
+                f"<div class='search-fact-list'>{fh_cards}</div></section>"
+            )
+
+        page_cards_html: list[str] = []
+        for mn in matched_notes_list:
+            mp = str(mn["path"])
+            m_title = _humanize_note_title(str(mn["title"]), mp)
+            m_bucket = group_labels.get(_classify_confluence_bucket(mp), str(mn["scope"]))
+            m_snip = _format_search_snippet(str(mn.get("snippet") or mn.get("summary") or ""))
+            page_cards_html.append(
+                f'<a class="result-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(mp)}&q={urllib.parse.quote(q_clean)}">'
+                f'<div class="result-top"><span class="result-title">{html.escape(m_title)}{_note_badge(mp)}</span>'
+                f'<span class="result-date">{html.escape(str(mn.get("updated_at") or "")[:10])}</span></div>'
+                f'<div class="result-meta"><span class="badge topic-badge">{m_bucket}</span> <code>{html.escape(mp)}</code></div>'
+                + (f'<p class="result-snippet">{m_snip}</p>' if m_snip else "")
+                + "</a>"
+            )
+        pages_section = (
+            "<section class='search-section'>"
+            f"<h2 class='section-kicker'>Matching Pages ({len(matched_notes_list)})</h2>"
+            + (f'<div class="result-list">{"".join(page_cards_html)}</div>' if page_cards_html else
+               f'<p class="muted">No pages matched <code>{html.escape(q_clean)}</code>'
+               + (f' in <strong>{html.escape(_folder_label(scope_filter))}</strong>. '
+                  f'<a href="{safe_base_path}?scope=&q={urllib.parse.quote(q_clean)}">Search the entire vault instead →</a>'
+                  if scope_filter else '. Try shorter keywords.')
+               + "</p>")
+            + "</section>"
+        )
         reader_body_html = (
-            search_banner_html
+            "<div class='search-header'>"
+            f"<h1>Search: <code>{html.escape(q_clean)}</code></h1>"
+            f"<p class='muted'>Found <strong>{len(matched_notes_list)}</strong> page(s) and <strong>{len(all_facts)}</strong> fact(s)"
+            + (f" in <strong>{html.escape(_folder_label(scope_filter))}</strong>" if scope_filter else " across the entire vault")
+            + f" · <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics'>Clear search</a></p>"
+            f"<div class='filter-chip-row'>{''.join(filter_chips)}</div>"
+            "</div>"
+            + fact_hits_html
+            + pages_section
+        )
+    elif active_view == "topics":
+        recent_notes = sorted(notes, key=lambda n: str(n.get("updated_at") or ""), reverse=True)[:6]
+        recent_cards = "".join(
+            f'<a class="recent-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(rn["path"]))}">'
+            f'<span class="recent-title">{html.escape(_humanize_note_title(str(rn["title"]), str(rn["path"])))}</span>'
+            f'<span class="recent-meta">{html.escape(str(rn["scope"]))} · {html.escape(str(rn.get("updated_at") or "")[:10])}</span>'
+            "</a>"
+            for rn in recent_notes
+        )
+        topic_cards: list[str] = []
+        for b_key in non_empty_bucket_keys:
+            b_list = sorted_buckets[b_key]
+            b_lbl = group_labels.get(b_key, b_key)
+            top_links = "".join(
+                f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
+                f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]))}</a></li>'
+                for it in b_list[:5]
+            )
+            more_html = ""
+            if len(b_list) > 5:
+                rest_links = "".join(
+                    f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
+                    f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]))}</a></li>'
+                    for it in b_list[5:]
+                )
+                more_html = (
+                    f'<details class="topic-more"><summary>Show all {len(b_list)} pages</summary>'
+                    f'<ul class="topic-card-list">{rest_links}</ul></details>'
+                )
+            topic_cards.append(
+                f'<section class="topic-card" id="topic-{html.escape(b_key, quote=True)}">'
+                f'<div class="topic-card-head"><h3>{b_lbl}</h3><span class="tree-count">{len(b_list)}</span></div>'
+                f'<ul class="topic-card-list">{top_links}</ul>'
+                f'{more_html}</section>'
+            )
+        heading_scope = _folder_label(scope_filter)
+        reader_body_html = (
+            "<div class='topics-header'>"
+            f"<h1>{html.escape(heading_scope)}</h1>"
+            f"<p class='muted'><strong>{len(notes)}</strong> pages organized into <strong>{len(non_empty_bucket_keys)}</strong> topics. "
+            "Pick a topic card below, jump from the outline on the right, or search across everything above.</p>"
+            "</div>"
+            + (
+                "<section class='topics-recent'>"
+                "<h2 class='section-kicker'>Recently Updated</h2>"
+                f"<div class='recent-grid'>{recent_cards}</div></section>"
+                if recent_cards else ""
+            )
+            + "<section class='topics-directory'>"
+            "<h2 class='section-kicker'>Browse by Topic</h2>"
+            f"<div class='topic-grid'>{''.join(topic_cards)}</div></section>"
+        )
+    elif active_note_meta:
+        back_to_search_html = (
+            f"<div class='search-banner'>"
+            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {len(search_res['notes'])} results for \"{html.escape(q_clean)}\"</a>"
+            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear filter</a>"
+            f"</div>"
+            if q_clean
+            else ""
+        )
+        reader_body_html = (
+            back_to_search_html
             + breadcrumbs_html
-            + f"<div class='doc-meta-bar'><span class='badge scope-badge'>{html.escape(str(active_note_meta['scope']))}</span>"
-            + f"<span>📄 <code>{html.escape(str(active_note_meta['path']))}</code></span>"
+            + f"<div class='doc-meta-bar'>{active_topic_badge}"
+            + f"<span class='badge scope-badge'>{html.escape(str(active_note_meta['scope']))}</span>"
+            + f"<span>~{read_minutes} min read</span>"
             + f"<span>· Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>"
+            + f"<span>· <code>{html.escape(str(active_note_meta['path']))}</code></span>"
             + f"{active_download_btn}</div>"
             + note_html
+            + pager_html
             + connected_html
-        )
-    elif search_query.strip():
-        reader_body_html = (
-            search_banner_html
-            + "<div class='empty-state'><h2>No pages matched that search</h2>"
-            + "<p class='muted'>Try fewer keywords, switch to Entire Vault on the left, or check matching AI Memory Facts on the right.</p></div>"
-        )
-    elif notes:
-        reader_body_html = (
-            "<div class='empty-state'><h2>Select a page from the folder tree</h2>"
-            "<p class='muted'>Browse folders on the left, search notes and facts above, or upload a <code>.md</code>, <code>.pdf</code>, or <code>.docx</code> document.</p></div>"
         )
     else:
         reader_body_html = (
@@ -3691,10 +3927,18 @@ def render_dashboard_page(
             "</ul></div>"
         )
 
-    reader_checked = "checked" if active_note_meta else ""
-    notes_checked = "" if active_note_meta else "checked"
-    facts_open_attr = " open" if search_query.strip() else ""
+    search_scope_options = f'<option value="" {"selected" if not scope_filter else ""}>All vault</option>'
+    if scope_filter:
+        search_scope_options += (
+            f'<option value="{html.escape(scope_filter, quote=True)}" selected>'
+            f'In {html.escape(_folder_label(scope_filter))}</option>'
+        )
+
+    reader_checked = "checked"
+    notes_checked = ""
+    facts_open_attr = " open" if q_clean else ""
     writable_tooltip = html.escape("Writable folders: " + ", ".join(writable_scopes_for(actor)), quote=True)
+    topics_nav_active = "active" if active_view == "topics" else ""
 
     return f"""<!doctype html>
 <html lang="en">
@@ -3705,7 +3949,7 @@ def render_dashboard_page(
   <style>
     html {{ scroll-behavior: smooth; }}
     :root {{
-      --header-h: 54px;
+      --header-h: 56px;
       --bg: #f8fafc;
       --canvas: #ffffff;
       --panel: #f1f5f9;
@@ -3719,6 +3963,8 @@ def render_dashboard_page(
       --accent: #0052cc;
       --accent-soft: #e0f2fe;
       --accent-border: #93c5fd;
+      --mark-bg: #fef08a;
+      --mark-fg: #0f172a;
       --green: #15803d;
       --green-bg: #dcfce7;
       --amber: #b45309;
@@ -3746,6 +3992,8 @@ def render_dashboard_page(
       --accent: #38bdf8;
       --accent-soft: rgba(56, 189, 248, 0.14);
       --accent-border: #0284c7;
+      --mark-bg: #fde047;
+      --mark-fg: #020617;
       --green: #4ade80;
       --green-bg: rgba(74, 222, 128, 0.16);
       --amber: #fbbf24;
@@ -3768,8 +4016,13 @@ def render_dashboard_page(
     header {{ min-height: var(--header-h); padding: 8px 20px; background: var(--header-bg); border-bottom: 1px solid var(--border); display: flex; flex-wrap: nowrap; gap: 12px; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 30; }}
     .brand-wrap {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
     .brand {{ font-weight: 700; font-size: 0.98rem; color: var(--accent); letter-spacing: -0.01em; text-decoration: none; white-space: nowrap; }}
-    .search-form {{ display: flex; gap: 6px; flex: 1 1 380px; max-width: 480px; min-width: 0; align-items: center; }}
-    .search-form input[type="search"] {{ width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.85rem; }}
+    .nav-pill {{ font-size: 0.8rem; font-weight: 600; color: var(--text-body); text-decoration: none; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
+    .nav-pill:hover {{ border-color: var(--accent); color: var(--accent); }}
+    .nav-pill.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
+    #theme-dark:checked ~ .app-shell .nav-pill.active {{ color: #020617; }}
+    .search-form {{ display: flex; gap: 6px; flex: 1 1 420px; max-width: 560px; min-width: 0; align-items: center; }}
+    .search-scope {{ background: var(--panel); color: var(--text-body); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.8rem; max-width: 150px; flex-shrink: 0; }}
+    .search-form input[type="search"] {{ width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.86rem; }}
     .search-form input[type="search"]:focus {{ outline: 2px solid var(--accent); border-color: transparent; }}
     .search-form button, .upload-form button, .fact-add-form button {{ background: var(--accent); color: #ffffff; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
     #theme-dark:checked ~ .app-shell .search-form button, #theme-dark:checked ~ .app-shell .upload-form button, #theme-dark:checked ~ .app-shell .fact-add-form button {{ color: #020617; }}
@@ -3794,53 +4047,92 @@ def render_dashboard_page(
     .signout-link:hover {{ text-decoration: underline; }}
     .dl-btn {{ display: inline-block; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }}
     .mobile-tabs {{ display: none; }}
-    .layout {{ display: grid; grid-template-columns: 290px minmax(0, 1fr) 280px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
+    .layout {{ display: grid; grid-template-columns: 296px minmax(0, 1fr) 276px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
     .sidebar {{ padding: 14px 12px 28px 14px; border-right: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); text-align: left; }}
-    .sidebar-section-label {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 2px 8px 6px; text-align: left; }}
+    .sidebar-section-label {{ font-size: 0.73rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 2px 6px 6px; text-align: left; }}
     .scope-strip {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
-    .pill {{ display: flex; align-items: center; justify-content: flex-start; gap: 5px; text-decoration: none; color: var(--text-body); background: var(--panel); padding: 5px 9px; border-radius: 6px; font-size: 0.78rem; font-weight: 500; border: 1px solid var(--border); text-align: left; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: background-color 0.15s ease, color 0.15s ease; }}
+    .pill {{ display: flex; align-items: center; justify-content: space-between; gap: 4px; text-decoration: none; color: var(--text-body); background: var(--panel); padding: 5px 8px; border-radius: 6px; font-size: 0.77rem; font-weight: 500; border: 1px solid var(--border); text-align: left; transition: background-color 0.15s ease, color 0.15s ease; min-width: 0; }}
+    .pill-label {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .pill-count {{ font-size: 0.7rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
     .pill:hover {{ background: var(--panel-hover); color: var(--accent); }}
     .pill.active {{ color: #ffffff; background: var(--accent); border-color: var(--accent); font-weight: 600; }}
+    .pill.active .pill-count {{ color: inherit; opacity: 0.9; }}
     #theme-dark:checked ~ .app-shell .pill.active {{ color: #020617; }}
     .quick-links {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
     .quick-link {{ display: block; padding: 5px 9px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: var(--text-body); text-decoration: none; text-align: left; }}
     .quick-link:hover {{ background: var(--panel-hover); color: var(--accent); }}
     .quick-link.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; }}
-    .tree-group {{ margin-bottom: 3px; border-radius: 6px; text-align: left; }}
+    .tree-group {{ margin-bottom: 4px; border-radius: 6px; text-align: left; }}
     .tree-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: flex-start; gap: 6px; padding: 6px 8px; border-radius: 6px; font-size: 0.82rem; font-weight: 600; color: var(--text); user-select: none; text-align: left; }}
     .tree-summary::-webkit-details-marker {{ display: none; }}
     .tree-summary:hover {{ background: var(--panel-hover); }}
     .tree-folder-name {{ flex: 1 1 auto; display: flex; align-items: center; justify-content: flex-start; gap: 5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-align: left; }}
     .tree-group > .tree-summary::before {{ content: "▸"; font-size: 0.76rem; color: var(--muted); flex-shrink: 0; }}
     .tree-group[open] > .tree-summary::before {{ content: "▾"; color: var(--accent); }}
-    .tree-count {{ font-size: 0.74rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 6px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }}
-    .note-list {{ list-style: none; padding: 2px 0 6px 10px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .tree-item {{ display: flex; align-items: baseline; justify-content: flex-start; gap: 6px; padding: 4px 8px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.81rem; line-height: 1.35; text-align: left; }}
+    .tree-count {{ font-size: 0.73rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }}
+    .note-list {{ list-style: none; padding: 2px 0 6px 8px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
+    .tree-item {{ display: block; padding: 5px 8px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border-left: 2px solid transparent; }}
     .tree-item:hover {{ background: var(--panel-hover); color: var(--accent); }}
-    .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border: 1px solid var(--accent-border); }}
-    .tree-icon {{ font-size: 0.78rem; flex-shrink: 0; }}
+    .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border-left-color: var(--accent); }}
     .tree-title {{ overflow-wrap: anywhere; text-align: left; }}
-    .tree-sub {{ font-size: 0.72rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
+    .tree-sub {{ font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
     .reader-wrap {{ padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }}
-    .reader {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 32px 42px; max-width: 860px; width: 100%; min-width: 0; overflow-wrap: break-word; word-break: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
-    .search-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.83rem; color: var(--text); }}
-    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; white-space: nowrap; }}
+    .reader {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 34px 44px; max-width: 880px; width: 100%; min-width: 0; overflow-wrap: break-word; word-break: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
+    #theme-dark:checked ~ .app-shell .reader {{ line-height: 1.76; letter-spacing: 0.005em; }}
+    .search-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.84rem; color: var(--text); }}
+    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
     .search-banner a:hover {{ text-decoration: underline; }}
+    .search-header, .topics-header {{ margin-bottom: 24px; padding-bottom: 16px; border-bottom: 1px solid var(--border); }}
+    .filter-chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }}
+    .filter-chip {{ display: inline-block; padding: 4px 10px; border-radius: 999px; font-size: 0.78rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--panel); border: 1px solid var(--border); }}
+    .filter-chip:hover {{ border-color: var(--accent); color: var(--accent); }}
+    .filter-chip.active {{ background: var(--accent); color: #ffffff; border-color: var(--accent); }}
+    #theme-dark:checked ~ .app-shell .filter-chip.active {{ color: #020617; }}
+    .section-kicker {{ font-size: 0.82rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; border: none; padding: 0; }}
+    .search-section {{ margin-bottom: 28px; }}
+    .search-fact-list {{ display: flex; flex-direction: column; gap: 8px; }}
+    .search-fact-row {{ padding: 10px 12px; border-radius: 8px; background: var(--bg); border: 1px solid var(--border); font-size: 0.88rem; line-height: 1.5; }}
+    .result-list {{ display: flex; flex-direction: column; gap: 10px; }}
+    .result-card {{ display: block; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); transition: border-color 0.15s ease; }}
+    .result-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .result-top {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }}
+    .result-title {{ font-weight: 700; font-size: 1rem; color: var(--accent); }}
+    .result-date {{ font-size: 0.76rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }}
+    .result-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 4px; font-size: 0.78rem; color: var(--muted); }}
+    .result-snippet {{ margin: 8px 0 0; font-size: 0.88rem; line-height: 1.55; color: var(--text-body); max-width: none; }}
+    mark {{ background: var(--mark-bg); color: var(--mark-fg); padding: 0 3px; border-radius: 3px; font-weight: 600; }}
+    .topics-recent {{ margin-bottom: 28px; }}
+    .recent-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 10px; }}
+    .recent-card {{ display: flex; flex-direction: column; gap: 4px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); }}
+    .recent-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .recent-title {{ font-weight: 600; font-size: 0.88rem; color: var(--text); line-height: 1.35; }}
+    .recent-meta {{ font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
+    .topic-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }}
+    .topic-card {{ padding: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 72px; }}
+    .topic-card-head {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
+    .topic-card-head h3 {{ margin: 0; font-size: 0.96rem; line-height: 1.3; color: var(--text); }}
+    .topic-card-list {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 5px; max-width: none; }}
+    .topic-card-list li {{ margin: 0; }}
+    .topic-card-list a {{ text-decoration: none; color: var(--text-body); font-size: 0.86rem; line-height: 1.4; display: inline-block; }}
+    .topic-card-list a:hover {{ color: var(--accent); text-decoration: underline; }}
+    .topic-more summary {{ cursor: pointer; font-size: 0.8rem; font-weight: 600; color: var(--accent); margin-top: 4px; }}
+    .topic-more .topic-card-list {{ margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }}
     .empty-state {{ padding: 8px 0; }}
-    .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.81rem; color: var(--muted); margin-bottom: 8px; }}
+    .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.82rem; color: var(--muted); margin-bottom: 10px; }}
     .breadcrumbs a {{ color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }}
     .breadcrumbs a:hover {{ color: var(--accent); text-decoration: underline; }}
     .crumb-sep {{ color: var(--border-strong); }}
     .crumb-current {{ color: var(--text); font-weight: 600; }}
-    .doc-meta-bar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.78rem; color: var(--muted); padding-bottom: 16px; margin-bottom: 22px; border-bottom: 1px solid var(--border); }}
-    .reader h1, .reader h2, .reader h3, .reader h4 {{ color: var(--text); font-weight: 700; line-height: 1.28; letter-spacing: -0.02em; scroll-margin-top: 70px; text-wrap: balance; }}
+    .doc-meta-bar {{ display: flex; flex-wrap: wrap; gap: 8px; align-items: center; font-size: 0.79rem; color: var(--muted); padding-bottom: 16px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }}
+    .reader h1, .reader h2, .reader h3, .reader h4 {{ color: var(--text); font-weight: 700; line-height: 1.28; letter-spacing: -0.02em; scroll-margin-top: 72px; text-wrap: balance; }}
     .reader h1 {{ font-size: 2rem; margin: 0 0 0.65em; }}
-    .reader h2 {{ font-size: 1.48rem; margin-top: 1.8em; margin-bottom: 0.55em; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
-    .reader h3 {{ font-size: 1.15rem; margin-top: 1.45em; margin-bottom: 0.45em; }}
+    .reader h2 {{ font-size: 1.45rem; margin-top: 1.85em; margin-bottom: 0.55em; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
+    .reader h2.section-kicker {{ font-size: 0.82rem; margin: 0 0 12px; border: none; padding: 0; letter-spacing: 0.06em; color: var(--muted); }}
+    .reader h3 {{ font-size: 1.14rem; margin-top: 1.45em; margin-bottom: 0.45em; }}
     .reader h4 {{ font-size: 0.96rem; margin-top: 1.2em; margin-bottom: 0.4em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
-    .reader p {{ margin: 0 0 1.05em; max-width: 72ch; }}
-    .reader ul, .reader ol {{ margin: 0 0 1.15em; padding-left: 1.5em; max-width: 72ch; }}
-    .reader li {{ margin-bottom: 0.38em; }}
+    .reader p {{ margin: 0 0 1.05em; max-width: 68ch; text-wrap: pretty; }}
+    .reader ul, .reader ol {{ margin: 0 0 1.15em; padding-left: 1.5em; max-width: 68ch; }}
+    .reader li {{ margin-bottom: 0.4em; text-wrap: pretty; }}
     .reader hr {{ border: none; border-top: 1px solid var(--border); margin: 1.8em 0; }}
     code {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-inline-bg); color: var(--code-inline-fg); padding: 2px 6px; border-radius: 5px; font-size: 0.86em; border: 1px solid var(--border); word-break: break-word; }}
     .code-block {{ margin: 14px 0 18px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-strong); background: var(--pre-bg); }}
@@ -3855,14 +4147,22 @@ def render_dashboard_page(
     th {{ background: var(--panel); color: var(--text); font-weight: 600; }}
     a.wikilink, a.ext-link {{ color: var(--accent); text-decoration: none; font-weight: 500; border-bottom: 1px solid var(--accent-border); text-underline-offset: 3px; }}
     a.wikilink:hover, a.ext-link:hover {{ background: var(--accent-soft); }}
-    .connected-section {{ margin-top: 32px; padding-top: 18px; border-top: 1px solid var(--border); }}
-    .connected-section .connected-title {{ font-size: 1.25rem; margin: 0 0 12px; border: none; padding: 0; }}
+    .pager-nav {{ margin-top: 36px; padding-top: 18px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center; }}
+    .pager-link {{ display: flex; flex-direction: column; gap: 2px; padding: 10px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); min-width: 0; }}
+    .pager-link:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
+    .pager-next {{ text-align: right; }}
+    .pager-dir {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
+    .pager-title {{ font-size: 0.86rem; font-weight: 600; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .pager-mid {{ font-size: 0.78rem; font-weight: 600; color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
+    .pager-mid:hover {{ color: var(--accent); border-color: var(--accent); }}
+    .connected-section {{ margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); }}
+    .connected-section .connected-title {{ font-size: 1.18rem; margin: 0 0 12px; border: none; padding: 0; }}
     .connected-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 10px; margin-top: 10px; }}
-    .conn-card {{ display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; transition: border-color 0.15s ease; }}
+    .conn-card {{ display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; transition: border-color 0.15s ease; }}
     .conn-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
     .facts-col {{ padding: 16px 14px 28px 12px; border-left: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); }}
     .toc-nav {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 3px; }}
-    .toc-header {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-bottom: 5px; }}
+    .toc-header {{ font-size: 0.73rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }}
     .toc-link {{ display: block; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 4px 8px; border-left: 1px solid var(--border-strong); border-radius: 0 4px 4px 0; }}
     .toc-link:hover {{ color: var(--accent); border-left-color: var(--accent); background: var(--panel); }}
     .toc-h3 {{ padding-left: 16px; font-size: 0.77rem; }}
@@ -3874,7 +4174,7 @@ def render_dashboard_page(
     .fact-add > summary {{ font-size: 0.78rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); padding: 6px 10px; }}
     .fact-add-form {{ display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); }}
     .muted {{ color: var(--muted); font-size: 0.79rem; }}
-    .fact-card {{ padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.82rem; overflow-wrap: break-word; }}
+    .fact-card {{ padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.82rem; overflow-wrap: break-word; }}
     .fact-card.superseded {{ opacity: 0.78; }}
     .fact-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }}
     .fact-badges {{ display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
@@ -3883,7 +4183,9 @@ def render_dashboard_page(
     .fact-retire-btn:hover {{ color: var(--red); border-color: var(--red); background: var(--red-bg); }}
     .fact-text {{ margin-top: 5px; color: var(--text-body); }}
     .fact-reason {{ margin-top: 4px; font-size: 0.75rem; color: var(--muted); }}
-    .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }}
+    .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.71rem; font-weight: 700; text-transform: uppercase; }}
+    .guide-badge {{ background: var(--panel); color: var(--muted); border: 1px solid var(--border-strong); }}
+    .topic-badge {{ background: var(--panel); color: var(--text); border: 1px solid var(--border); text-transform: none; font-weight: 600; }}
     .valid-badge {{ background: var(--green-bg); color: var(--green); }}
     .invalid-badge {{ background: var(--red-bg); color: var(--red); }}
     .cat-weakness {{ background: var(--red-bg); color: var(--red); }}
@@ -3909,18 +4211,20 @@ def render_dashboard_page(
     @media (max-width: 768px) {{
       header {{ padding: 8px 10px; gap: 6px; }}
       .brand {{ font-size: 0.88rem; }}
-      .brand-long, .actor-name {{ display: none; }}
+      .brand-long, .actor-name, .search-scope {{ display: none; }}
       .header-right {{ gap: 5px; }}
-      .upload-box summary, .theme-toggle, .actor-tag {{ padding: 4px 8px; font-size: 0.75rem; }}
+      .upload-box summary, .theme-toggle, .actor-tag, .nav-pill {{ padding: 4px 8px; font-size: 0.75rem; }}
       .search-form {{ order: 3; flex: 1 1 100%; max-width: 100%; }}
       .search-form input[type="search"] {{ font-size: 16px; padding: 6px 10px; }}
       .upload-form {{ position: fixed; left: 12px; right: 12px; top: 96px; width: auto; max-width: none; }}
       .reader-wrap {{ padding: 10px 8px 36px; }}
       .reader {{ padding: 18px 14px; border-radius: 10px; }}
       .sidebar, .facts-col {{ padding: 12px; }}
-      .reader h1 {{ font-size: 1.38rem; }}
-      .reader h2 {{ font-size: 1.16rem; }}
-      .reader h3 {{ font-size: 1.02rem; }}
+      .pager-nav {{ grid-template-columns: 1fr; }}
+      .pager-next {{ text-align: left; }}
+      .reader h1 {{ font-size: 1.56rem; }}
+      .reader h2 {{ font-size: 1.2rem; }}
+      .reader h3 {{ font-size: 1.04rem; }}
       table {{ font-size: 0.8rem; }}
       th, td {{ padding: 6px 7px; }}
       pre {{ padding: 12px; font-size: 0.81rem; }}
@@ -3935,17 +4239,18 @@ def render_dashboard_page(
   <div class="app-shell">
     <header>
       <div class="brand-wrap">
-        <a class="brand" href="{safe_base_path}?scope=" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">📘 {html.escape(dashboard_title)}<span class="brand-long"> Vault</span></a>
+        <a class="brand" href="{safe_base_path}?scope=" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">{html.escape(dashboard_title)}<span class="brand-long"> Vault</span></a>
+        <a class="nav-pill {topics_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">Topics</a>
       </div>
       <form class="search-form" method="get" action="{safe_base_path}">
-        <input type="hidden" name="scope" value="{html.escape(scope_filter)}">
-        <input type="search" name="q" value="{html.escape(search_query)}" aria-label="Search notes and facts" placeholder="Search notes, topics, facts...">
+        <select class="search-scope" name="scope" aria-label="Search scope">{search_scope_options}</select>
+        <input type="search" name="q" value="{html.escape(q_clean)}" aria-label="Search notes and facts" placeholder="Search notes, topics, facts...">
         <button type="submit">Search</button>
-        {f'<a class="clear-search" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}" aria-label="Clear search">✕</a>' if search_query else ''}
+        {f'<a class="clear-search" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics" aria-label="Clear search">✕</a>' if q_clean else ''}
       </form>
       <div class="header-right">
         <details class="upload-box">
-          <summary>📤 Upload</summary>
+          <summary>Upload</summary>
           <form class="upload-form" method="post" action="{safe_base_path.rstrip('/')}/upload" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{html.escape(upload_csrf, quote=True)}">
             <label class="form-label" for="upload-scope">Folder</label>
@@ -3957,21 +4262,21 @@ def render_dashboard_page(
             <button type="submit">Upload &amp; Index</button>
           </form>
         </details>
-        <label for="theme-dark" class="theme-toggle" title="Switch between Light and Dark mode">🌓 Theme</label>
+        <label for="theme-dark" class="theme-toggle" title="Switch between Light and Dark mode">Theme</label>
         <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a class="actor-link" href="/apps">Apps</a> · <a class="signout-link" href="/logout">Sign Out</a></div>
       </div>
     </header>
     <nav class="mobile-tabs" aria-label="Mobile view switcher">
-      <label for="tab-reader" class="mtab mtab-reader">📖 Read</label>
-      <label for="tab-notes" class="mtab mtab-notes">📁 Folders ({len(notes)})</label>
-      <label for="tab-facts" class="mtab mtab-facts">📑 Outline &amp; Facts</label>
+      <label for="tab-reader" class="mtab mtab-reader">Read</label>
+      <label for="tab-notes" class="mtab mtab-notes">Folders ({len(notes)})</label>
+      <label for="tab-facts" class="mtab mtab-facts">Outline &amp; Facts</label>
     </nav>
     <div class="layout">
       <aside class="sidebar" aria-label="Folder navigation">
-        <div class="sidebar-section-label">📁 Root Folders</div>
+        <div class="sidebar-section-label">Folders</div>
         <div class="scope-strip">{scope_pills}</div>
         {quick_links_html}
-        <div class="sidebar-section-label">🗂️ Folder Tree ({len(notes)} pages)</div>
+        <div class="sidebar-section-label">Topics &amp; Pages ({len(notes)})</div>
         {notes_tree_html}
       </aside>
       <div class="reader-wrap">
@@ -3982,7 +4287,7 @@ def render_dashboard_page(
       <aside class="facts-col" aria-label="Page outline and AI facts">
         {toc_html}
         <details class="facts-drawer"{facts_open_attr}>
-          <summary><span>⚡ AI Memory Facts</span><span class="tree-count">{active_fact_count}</span></summary>
+          <summary><span>AI Memory Facts</span><span class="tree-count">{active_fact_count}</span></summary>
           <div class="facts-drawer-body">
             <p class="facts-summary-line"><strong>{active_fact_count}</strong> active · {retired_fact_count} history — shared across all connected agents.</p>
             {add_fact_html}
@@ -4002,7 +4307,7 @@ def build_openapi_schema(server_url: str) -> dict[str, object]:
         "openapi": "3.1.0",
         "info": {
             "title": "Vyn Unified Cross-Agent Memory & Obsidian Vault API",
-            "version": "1.2.0",
+            "version": "1.3.0",
             "description": (
                 "Complete shared memory and Obsidian vault API across ChatGPT, Claude, Hermes (and its profiles), "
                 f"and Antigravity. Every agent can read all scopes ({', '.join(READABLE_SCOPES)}). "
@@ -5344,6 +5649,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 selected_note=(query.get("note") or [""])[0],
                 scope_filter=(query.get("scope") or [""])[0],
                 search_query=(query.get("q") or [""])[0],
+                view=(query.get("view") or [""])[0],
                 session_token=self.owner_cookie_token(),
             )
             self.send_html(200, page)

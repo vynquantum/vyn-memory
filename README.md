@@ -28,7 +28,21 @@ One Python file, standard library only (`pypdf` is optional, for PDF text).
 The skill only loads its instructions when a task needs memory, so it costs far fewer
 tokens per request than an always-loaded MCP tool list.
 
-## Run it
+## Run it (30-second Quick Start)
+
+### Option 1: Docker Compose (zero build, standard library only)
+
+```sh
+git clone https://github.com/vynquantum/vyn-memory.git && cd vyn-memory
+cp .env.example .env
+# Generate fresh random role tokens and append them to .env:
+python3 -c 'import secrets; [print(f"MEMORY_{r}_TOKEN={secrets.token_urlsafe(32)}") for r in ("OWNER","CLAUDE","CHATGPT","ANTIGRAVITY","HERMES")]' >> .env
+docker compose up -d
+```
+
+Open `http://127.0.0.1:8770`, sign in with `MEMORY_OWNER_TOKEN` from `.env`, and click **Apps** for your MCP URL and laptop login command. (Keep `.env` private; `.gitignore` already excludes `.env`, `data/`, `vault/`, and `settings.json`.)
+
+### Option 2: Plain Python (no Docker)
 
 ```sh
 export MEMORY_DATA_DIR=./data MEMORY_VAULT_DIR=./vault   # database here; your Obsidian vault there

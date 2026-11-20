@@ -1789,6 +1789,86 @@ class TestVynMemory(unittest.TestCase):
         with self.assertRaises(ValueError):
             cli_mod._validate_hub_url("http://memory.example.com")
 
+    def test_web_ui_search_topics_and_traversal(self) -> None:
+        # 1. Humanized README title uses parent folder name
+        self.assertEqual(self.srv._humanize_note_title("README", "agents/decisions/README.md"), "Decisions — Overview")
+        self.assertEqual(self.srv._humanize_note_title("", "career/embedded/c/README.md"), "C — Overview")
+
+        # 2. Populate sibling notes in one topic + a verified fact
+        self.srv.op_write_note(
+            self.conn,
+            "claude",
+            path="projects/alpha/00-overview.md",
+            content="# Alpha Overview\n\nDMA ring buffer design for Alpha.\n",
+            scope="projects/alpha",
+        )
+        self.srv.op_write_note(
+            self.conn,
+            "claude",
+            path="projects/alpha/01-ring-buffer.md",
+            content="# Ring Buffer Deep Dive\n\nCache coherency and DMA descriptors.\n",
+            scope="projects/alpha",
+        )
+        self.srv.op_write_note(
+            self.conn,
+            "claude",
+            path="projects/alpha/02-testing.md",
+            content="# Testing Plan\n\nHardware loopback tests.\n",
+            scope="projects/alpha",
+        )
+        self.srv.op_remember_fact(
+            self.conn,
+            "claude",
+            fact="Alpha uses 64-byte aligned DMA descriptors.",
+            scope="projects/alpha",
+            subject="dma-align",
+            category="decision",
+        )
+
+        # 3. Search view renders highlighted <mark> snippets, matching facts, and scope chips
+        search_html = self.srv.render_dashboard_page(self.conn, "owner", search_query="DMA", session_token="s1")
+        self.assertIn("Matching Verified Facts", search_html)
+        self.assertIn("Matching Pages", search_html)
+        self.assertIn("<mark>DMA</mark>", search_html)
+        self.assertIn("filter-chip", search_html)
+
+        # Opening a search hit preserves back-to-results link
+        hit_html = self.srv.render_dashboard_page(
+            self.conn,
+            "owner",
+            selected_note="projects/alpha/01-ring-buffer.md",
+            search_query="DMA",
+            session_token="s1",
+        )
+        self.assertIn("← Back to", hit_html)
+
+        # 4. Topic Explorer view renders Recently Updated + Browse by Topic cards
+        topics_html = self.srv.render_dashboard_page(self.conn, "owner", view="topics", session_token="s1")
+        self.assertIn("Recently Updated", topics_html)
+        self.assertIn("Browse by Topic", topics_html)
+        self.assertIn("topic-card", topics_html)
+
+        # 5. Reader renders Previous / Next page traversal bar & reading time
+        mid_html = self.srv.render_dashboard_page(
+            self.conn,
+            "owner",
+            selected_note="projects/alpha/01-ring-buffer.md",
+            scope_filter="projects",
+            session_token="s1",
+        )
+        self.assertIn("pager-nav", mid_html)
+        self.assertIn("← Previous", mid_html)
+        self.assertIn("Next →", mid_html)
+        self.assertIn("min read", mid_html)
+
+        # 6. Upstream 30-second self-starter files exist and match server.py contract
+        repo_root = Path(__file__).resolve().parent
+        compose_text = (repo_root / "docker-compose.yml").read_text(encoding="utf-8")
+        env_ex_text = (repo_root / ".env.example").read_text(encoding="utf-8")
+        self.assertIn("/app/server.py", compose_text)
+        self.assertIn("/health", compose_text)
+        self.assertIn("MEMORY_OWNER_TOKEN=", env_ex_text)
+
 
 if __name__ == "__main__":
     unittest.main()
