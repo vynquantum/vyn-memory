@@ -48,7 +48,25 @@ from pathlib import Path
 
 def _load_settings() -> dict:
     path = os.environ.get("MEMORY_SETTINGS", "").strip()
-    return json.loads(Path(path).read_text(encoding="utf-8")) if path else {}
+    if not path:
+        return {}
+    raw = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError("MEMORY_SETTINGS must be a JSON object")
+    for k in ("open_scopes", "briefing_areas", "areas", "nested_scopes"):
+        if k in raw and (not isinstance(raw[k], list) or not all(isinstance(x, str) for x in raw[k])):
+            raise ValueError(f"MEMORY_SETTINGS.{k} must be a list of strings")
+    for k in ("scope_aliases", "hermes", "dashboard"):
+        if k in raw and not isinstance(raw[k], dict):
+            raise ValueError(f"MEMORY_SETTINGS.{k} must be an object")
+    if "hermes" in raw:
+        h = raw["hermes"]
+        for k in ("subagents", "extra_write"):
+            if k in h and (not isinstance(h[k], list) or not all(isinstance(x, str) for x in h[k])):
+                raise ValueError(f"MEMORY_SETTINGS.hermes.{k} must be a list of strings")
+        if "aliases" in h and not isinstance(h["aliases"], dict):
+            raise ValueError("MEMORY_SETTINGS.hermes.aliases must be an object")
+    return raw
 
 
 SETTINGS: dict = _load_settings()
@@ -56,6 +74,7 @@ LOCAL_TZ = ZoneInfo(SETTINGS.get("timezone") or "UTC")
 SUPPORTED_VAULT_EXTENSIONS = (".md", ".docx", ".pdf")
 MAX_BINARY_DOC_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_BODY_BYTES = 32 * 1024 * 1024
+MAX_DOCX_ZIP_ENTRIES = 10_000
 AGENTS = ("claude", "chatgpt", "hermes", "antigravity")
 _HERMES = SETTINGS.get("hermes", {})
 HERMES_SUBAGENTS: tuple[str, ...] = tuple(_HERMES.get("subagents", ["default"]))
@@ -323,7 +342,7 @@ def area_scope_depth(parts: list[str]) -> int:
     return 2
 
 
-def normalize_scope(raw_scope: str | None) -> str:
+def _normalize_scope_once(raw_scope: str | None) -> str:
     s = (raw_scope or "").strip().strip("/")
     if not s or s.lower() in ("common", "global", "shared"):
         return "shared"
@@ -362,6 +381,13 @@ def normalize_scope(raw_scope: str | None) -> str:
     return f"projects/{slugify_segment(lower).lower()}"
 
 
+def normalize_scope(raw_scope: str | None) -> str:
+    """Normalize a scope string to a canonical fixpoint (idempotent across aliases and slugification)."""
+    first = _normalize_scope_once(raw_scope)
+    second = _normalize_scope_once(first)
+    return second
+
+
 def _scope_matches(norm: str, pattern: str) -> bool:
     base = pattern.removesuffix("/*")
     return norm == base or norm.startswith(base + "/")
@@ -371,7 +397,7 @@ def writable_scopes_for(actor: str) -> list[str]:
     norm_actor = (actor or "").strip().lower()
     hermes_shared = [*HERMES_SHARED_AGENT_SCOPES, *HERMES_EXTRA_WRITE]
     if norm_actor == "owner":
-        return list(dict.fromkeys([*OPEN_SCOPES, "agents/*", *(f"{a}/*" for a in AREAS)]))
+        return list(dict.fromkeys([*OPEN_SCOPES, "agents/*", *(f"{a}/*" for a in AREAS), "daily", "inbox"]))
     if norm_actor in ("claude", "chatgpt", "antigravity"):
         return [*OPEN_SCOPES, f"agents/{norm_actor}"]
     if norm_actor == "hermes":
@@ -450,7 +476,7 @@ def normalize_note_path(
         rel_parts = parts[1:]
     elif top in ("agents", "agent") and len(parts) >= 2:
         if parts[1].lower() == "hermes" and len(parts) >= 3 and parts[2].lower() in HERMES_SUBAGENTS:
-            scope = f"agents/{parts[2].lower()}"
+            scope = f"agents/{HERMES_ALIASES.get(parts[2].lower(), parts[2].lower())}"
             rel_parts = parts[3:]
         else:
             scope = normalize_scope(f"agents/{parts[1]}")
@@ -466,7 +492,7 @@ def normalize_note_path(
         scope = top
         rel_parts = parts[1:]
     elif top in valid_agent_scope_names() and len(parts) >= 2:
-        scope = f"agents/{top}"
+        scope = f"agents/{HERMES_ALIASES.get(top, top)}"
         rel_parts = parts[1:]
     elif len(parts) >= 2:
         scope = normalize_scope(f"projects/{parts[0]}")
@@ -794,7 +820,10 @@ def extract_docx_markdown(file_path: Path, data: bytes, max_chars: int = 250_000
 
     try:
         with zipfile.ZipFile(io.BytesIO(data), "r") as zf:
-            if "docProps/core.xml" in zf.namelist():
+            if len(zf.infolist()) > MAX_DOCX_ZIP_ENTRIES:
+                return doc_title, f"# {doc_title}\n\n*(DOCX archive rejected: exceeds {MAX_DOCX_ZIP_ENTRIES:,} ZIP entries.)*\n"
+            names = set(zf.namelist())
+            if "docProps/core.xml" in names:
                 with zf.open("docProps/core.xml") as fp:
                     core_bytes = fp.read(1024 * 1024 + 1)
                 if len(core_bytes) <= 1024 * 1024 and not _declares_doctype(core_bytes):
@@ -803,7 +832,7 @@ def extract_docx_markdown(file_path: Path, data: bytes, max_chars: int = 250_000
                     if t_el is not None and t_el.text and t_el.text.strip():
                         doc_title = t_el.text.strip()
 
-            if "word/document.xml" not in zf.namelist():
+            if "word/document.xml" not in names:
                 return doc_title, f"# {doc_title}\n\n*(No word/document.xml stream found in DOCX archive.)*\n"
             with zf.open("word/document.xml") as fp:
                 doc_bytes = fp.read(8 * 1024 * 1024 + 1)
@@ -1585,11 +1614,120 @@ def op_remember_fact(
         conn.commit()
         refresh_human_dashboards(conn)
         created = conn.execute("SELECT * FROM facts WHERE id = ?", (new_id,)).fetchone()
+        # Surface any other active facts in the same scope that share keywords so agents catch contradictions early.
+        fts_q = fts_query_tokens(f"{subj} {text}")
+        potential_conflicts: list[dict[str, object]] = []
+        if fts_q:
+            conflict_rows = conn.execute(
+                """
+                SELECT f.*
+                FROM facts_fts fts
+                JOIN facts f ON f.id = fts.rowid
+                WHERE facts_fts MATCH ? AND f.scope = ? AND f.status = 'active' AND f.id != ?
+                ORDER BY bm25(facts_fts), f.id DESC
+                LIMIT 3
+                """,
+                (fts_q, norm_scope, new_id),
+            ).fetchall()
+            potential_conflicts = [serialize_fact(r) for r in conflict_rows]
         return {
             "status": "saved",
             "actor": actor,
             "fact": serialize_fact(created),
             "superseded_ids": to_supersede,
+            "potential_conflicts": potential_conflicts,
+        }
+
+
+def op_check_facts(
+    conn: sqlite3.Connection,
+    *,
+    statement: str = "",
+    scope: str = "",
+    subject: str = "",
+    limit: int = 8,
+) -> dict[str, object]:
+    """Fact-check a claim or topic against active facts, retired/superseded history, and vault notes before saving."""
+    with DB_LOCK:
+        sync_vault_notes(conn)
+        cap = max(1, min(int(limit or 8), 25))
+        norm_scope = normalize_scope(scope) if (scope or "").strip() else ""
+        esc_scope = _escape_like(norm_scope)
+        subj = slugify_segment(subject).lower() if (subject or "").strip() else ""
+        stmt = (statement or "").strip()
+        if not stmt and not subj:
+            raise MemoryError("Either statement or subject is required for fact checking")
+
+        active_by_id: dict[int, dict[str, object]] = {}
+        history_by_id: dict[int, dict[str, object]] = {}
+
+        if subj:
+            sql_subj = "SELECT * FROM facts WHERE subject = ?"
+            params_s: list[object] = [subj]
+            if norm_scope:
+                sql_subj += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
+                params_s.extend([norm_scope, f"{esc_scope}/%"])
+            sql_subj += " ORDER BY id DESC LIMIT ?"
+            params_s.append(cap * 2)
+            for r in conn.execute(sql_subj, params_s).fetchall():
+                item = serialize_fact(r)
+                if item["is_valid"]:
+                    active_by_id[int(r["id"])] = item
+                else:
+                    history_by_id[int(r["id"])] = item
+
+        fts_q = fts_query_tokens(f"{subj} {stmt}")
+        if fts_q:
+            sql_fts = """
+                SELECT f.*
+                FROM facts_fts fts
+                JOIN facts f ON f.id = fts.rowid
+                WHERE facts_fts MATCH ?
+            """
+            params_f: list[object] = [fts_q]
+            if norm_scope:
+                sql_fts += " AND (f.scope = ? OR f.scope LIKE ? ESCAPE '\\')"
+                params_f.extend([norm_scope, f"{esc_scope}/%"])
+            else:
+                sql_fts += " AND f.scope != 'resources/books' AND f.scope NOT LIKE 'resources/books/%'"
+            sql_fts += " ORDER BY bm25(facts_fts), f.id DESC LIMIT ?"
+            params_f.append(cap * 2)
+            for r in conn.execute(sql_fts, params_f).fetchall():
+                item = serialize_fact(r)
+                fid = int(r["id"])
+                if item["is_valid"]:
+                    active_by_id.setdefault(fid, item)
+                else:
+                    history_by_id.setdefault(fid, item)
+
+        matching_active = list(active_by_id.values())[:cap]
+        matching_history = list(history_by_id.values())[:cap]
+        related_notes = (
+            op_search(conn, query=stmt or subj, scope=norm_scope, limit=min(cap, 5))["notes"]
+            if (stmt or subj)
+            else []
+        )
+        if matching_active:
+            guidance = (
+                f"Found {len(matching_active)} active fact(s) on this topic. "
+                "Verify whether your statement matches, supersedes (pass supersedes_id or same subject), "
+                "or contradicts an existing active fact (retire stale ones with forget)."
+            )
+        elif matching_history:
+            guidance = (
+                f"No active facts matched, but {len(matching_history)} retired/superseded fact(s) exist in history. "
+                "Review history before re-asserting an outdated claim."
+            )
+        else:
+            guidance = "No conflicting active or historical facts found."
+        return {
+            "statement": stmt,
+            "scope_filter": norm_scope or "all",
+            "subject": subj,
+            "matching_active_facts": matching_active,
+            "matching_history_facts": matching_history,
+            "related_notes": related_notes,
+            "guidance": guidance,
         }
 
 
@@ -1662,6 +1800,7 @@ def op_write_note(
     with DB_LOCK:
         resolved_scope, rel_path = normalize_note_path(path, explicit_scope=scope)
         check_write_permission(actor, resolved_scope)
+        check_write_permission(actor, infer_vault_scope(rel_path))
         if mode not in ("replace", "append", "section"):
             raise MemoryError("mode must be one of: 'replace', 'append', 'section'")
         if not (content or "").strip():
@@ -1786,6 +1925,7 @@ def op_upload_document(
             allow_binary_ext=True,
         )
         check_write_permission(actor, resolved_scope)
+        check_write_permission(actor, infer_vault_scope(rel_path))
         if ext_low == ".md":
             text_content = raw_bytes.decode("utf-8", errors="replace")
             return op_write_note(
@@ -1808,6 +1948,8 @@ def op_upload_document(
                 raise MemoryError("Invalid DOCX file: missing ZIP header")
             try:
                 with zipfile.ZipFile(io.BytesIO(raw_bytes), "r") as zf_check:
+                    if len(zf_check.infolist()) > MAX_DOCX_ZIP_ENTRIES:
+                        raise MemoryError(f"Invalid DOCX file: exceeds {MAX_DOCX_ZIP_ENTRIES:,} ZIP entries")
                     if "word/document.xml" not in zf_check.namelist():
                         raise MemoryError("Invalid DOCX file: missing word/document.xml stream")
             except zipfile.BadZipFile as exc:
@@ -2446,13 +2588,33 @@ MCP_TOOLS = [
         },
     },
     {
+        "name": "memory_check_facts",
+        "description": (
+            "Fact-check a claim, decision, or topic against active facts, superseded/invalidated history, and vault notes "
+            "before answering or saving new memory. Returns matching_active_facts, matching_history_facts, related_notes, "
+            "and concrete reconciliation guidance so agents catch contradictions and stale claims."
+        ),
+        "annotations": {"readOnlyHint": True, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "statement": {"type": "string", "description": "Claim, question, or statement to verify against memory."},
+                "scope": {"type": "string", "description": "Optional scope or prefix filter (e.g. 'shared', 'projects/<slug>').", "default": ""},
+                "subject": {"type": "string", "description": "Optional topic slug to check exact subject history (e.g. 'release-process').", "default": ""},
+                "limit": {"type": "integer", "description": "Max matching facts per bucket (1-25).", "default": 8},
+            },
+        },
+    },
+    {
         "name": "memory_remember_fact",
         "description": (
             "Save or update an atomic AI-to-AI temporal fact (marked 'valid' from now). "
+            "Call memory_check_facts first when unsure whether an older fact exists. "
             f"Write rules: {', '.join(OPEN_SCOPES)} are writable by all agents; "
             "'agents/<agent>' is writable ONLY by that owning agent or Hermes profile. "
-            "When 'subject' is set (e.g. 'dma-coherency'), older active facts on the same subject in that scope "
-            "are automatically marked 'superseded' (invalid) with valid_until timestamp."
+            "Set 'subject' (e.g. 'release-process') so older active facts on the same subject in that scope "
+            "are automatically marked 'superseded' with a valid_until timestamp. Also returns 'potential_conflicts' "
+            "for other active facts in the same scope sharing keywords."
         ),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False, "openWorldHint": False},
         "inputSchema": {
@@ -2465,7 +2627,7 @@ MCP_TOOLS = [
                     "description": f"Target scope ({DEFAULT_SCOPE!r} by default), e.g. 'shared', 'projects/<slug>', or your own 'agents/<your-agent-or-profile>'.",
                     "default": DEFAULT_SCOPE,
                 },
-                "subject": {"type": "string", "description": "Short topic slug (e.g. 'release-process', 'preferred-editor').", "default": ""},
+                "subject": {"type": "string", "description": "Short topic slug (e.g. 'release-process', 'preferred-editor') so future updates supersede this fact cleanly.", "default": ""},
                 "category": {
                     "type": "string",
                     "enum": list(VALID_CATEGORIES),
@@ -2480,7 +2642,11 @@ MCP_TOOLS = [
     },
     {
         "name": "memory_forget_fact",
-        "description": "Invalidate an outdated or incorrect AI-to-AI fact (marks it 'invalidated' or 'superseded' with a valid_until timestamp, preserving audit history). Requires write access to the fact's scope.",
+        "description": (
+            "Retire an outdated, contradicted, or incorrect AI-to-AI fact (marks it 'invalidated' or 'superseded' "
+            "with a valid_until timestamp, preserving audit history). Always provide a brief 'reason' when retiring a wrong or stale claim. "
+            "Requires write access to the fact's scope."
+        ),
         "annotations": {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
         "inputSchema": {
             "type": "object",
@@ -2566,6 +2732,14 @@ def call_mcp_tool(conn: sqlite3.Connection, actor: str, name: str, arguments: di
             validity=str(args.get("validity") or ""),
             limit=_safe_int(args.get("limit"), "limit", default=15),
         )
+    if name == "memory_check_facts":
+        return op_check_facts(
+            conn,
+            statement=str(args.get("statement") or ""),
+            scope=str(args.get("scope") or ""),
+            subject=str(args.get("subject") or ""),
+            limit=_safe_int(args.get("limit"), "limit", default=8),
+        )
     if name == "memory_build_context":
         return op_build_context(
             conn,
@@ -2649,12 +2823,15 @@ def handle_jsonrpc_message(conn: sqlite3.Connection, actor: str, msg: dict[str, 
                 },
                 "serverInfo": {
                     "name": "vyn-memory",
-                    "version": "1.2.0",
+                    "version": "1.3.0",
                 },
                 "instructions": (
                     f"Authenticated as '{actor}'. You have complete read access across the unified Obsidian vault "
                     f"({', '.join(READABLE_SCOPES)}). "
-                    f"You can write to {', '.join(writable_scopes_for(actor))}."
+                    f"You can write to {', '.join(writable_scopes_for(actor))}. "
+                    "Before saving or relying on a changing claim, call memory_check_facts to check active facts and retired history; "
+                    "always pass a stable 'subject' slug on memory_remember_fact so newer state supersedes older facts cleanly, "
+                    "and reconcile any returned potential_conflicts with memory_forget_fact."
                 ),
             },
         }
@@ -3073,16 +3250,31 @@ _FALLBACK_CSRF_SECRET = secrets.token_hex(32)
 
 def _upload_csrf_secret() -> bytes:
     owner_tok = configured_tokens().get("owner", "").strip()
-    return (owner_tok or _FALLBACK_CSRF_SECRET).encode("utf-8")
+    raw = (owner_tok or _FALLBACK_CSRF_SECRET).encode("utf-8")
+    return hashlib.sha256(b"vyn-memory-csrf:" + raw).digest()
 
 
-def _mint_upload_csrf(now_ts: float | None = None) -> str:
+def _csrf_session_tag(session_token: str) -> str:
+    cleaned = (session_token or "").strip()
+    return hashlib.sha256(cleaned.encode("utf-8")).hexdigest()[:16] if cleaned else ""
+
+
+def _mint_upload_csrf(now_ts: float | None = None, *, purpose: str = "upload", session_token: str = "") -> str:
     ts = str(int(now_ts if now_ts is not None else time.time()))
-    sig = hmac.new(_upload_csrf_secret(), f"upload:{ts}".encode("utf-8"), hashlib.sha256).hexdigest()
+    purpose_clean = (purpose or "upload").strip().lower()
+    sess_tag = _csrf_session_tag(session_token)
+    msg = f"{purpose_clean}:{sess_tag}:{ts}".encode("utf-8")
+    sig = hmac.new(_upload_csrf_secret(), msg, hashlib.sha256).hexdigest()
     return f"{ts}.{sig}"
 
 
-def _verify_upload_csrf(token: str, max_age: int = 86400 * 7) -> bool:
+def _verify_upload_csrf(
+    token: str,
+    max_age: int = 86400 * 7,
+    *,
+    purpose: str = "upload",
+    session_token: str = "",
+) -> bool:
     cleaned = (token or "").strip()
     if "." not in cleaned:
         return False
@@ -3090,14 +3282,19 @@ def _verify_upload_csrf(token: str, max_age: int = 86400 * 7) -> bool:
     if not ts_str.isdigit():
         return False
     ts = int(ts_str)
-    if abs(time.time() - ts) > max_age:
+    age = time.time() - ts
+    if age < -60 or age > max_age:
         return False
-    expected = hmac.new(_upload_csrf_secret(), f"upload:{ts_str}".encode("utf-8"), hashlib.sha256).hexdigest()
+    purpose_clean = (purpose or "upload").strip().lower()
+    sess_tag = _csrf_session_tag(session_token)
+    msg = f"{purpose_clean}:{sess_tag}:{ts_str}".encode("utf-8")
+    expected = hmac.new(_upload_csrf_secret(), msg, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, sig)
 
 
 # Dashboard layout; settings "dashboard" replaces any of these keys.
 DASHBOARD: dict = {
+    "title": "Vyn Memory",
     # Sidebar groups in display order: [key, label, open by default].
     "groups": [
         ["projects", "🚀 Projects", True],
@@ -3152,9 +3349,11 @@ def render_dashboard_page(
     scope_filter: str = "",
     search_query: str = "",
     base_path: str = "/",
+    session_token: str = "",
 ) -> str:
     safe_base_path = html.escape(base_path or "/", quote=True)
-    upload_csrf = _mint_upload_csrf()
+    upload_csrf = _mint_upload_csrf(purpose="upload", session_token=session_token)
+    facts_csrf = _mint_upload_csrf(purpose="facts", session_token=session_token)
     with DB_LOCK:
         sync_vault_notes(conn)
     try:
@@ -3196,6 +3395,7 @@ def render_dashboard_page(
 
     root_folders = DASHBOARD["folders"]
     all_known_scopes = DASHBOARD["scopes"]
+    dashboard_title = str(DASHBOARD.get("title") or "Vyn Memory")
 
     def _is_folder_active(root_sc: str) -> bool:
         if not root_sc:
@@ -3238,7 +3438,7 @@ def render_dashboard_page(
         else ""
     )
 
-    # Group notes into Confluence collapsible folder tree
+    # Group notes into collapsible folder tree
     buckets: dict[str, list[dict[str, object]]] = {k: [] for k, _, _ in DASHBOARD["groups"]}
     for n in notes:
         b_key = _classify_confluence_bucket(str(n["path"]))
@@ -3359,36 +3559,138 @@ def render_dashboard_page(
         )
         toc_html = f'<nav class="toc-nav" aria-label="On this page"><div class="toc-header">📑 On this page</div>{toc_links}</nav>'
     else:
-        toc_html = '<div class="toc-nav"><div class="toc-header">📑 On this page</div><p class="muted">Select a study guide with sections to jump directly to headings.</p></div>'
+        toc_html = '<div class="toc-nav"><div class="toc-header">📑 On this page</div><p class="muted">Open any page with headings to jump straight to a section.</p></div>'
 
     upload_scope_default = scope_filter if scope_filter in all_known_scopes and scope_filter else DEFAULT_SCOPE
     upload_scope_options = "".join(
         f'<option value="{html.escape(sc)}" {"selected" if sc == upload_scope_default else ""}>{html.escape(sc)}</option>'
         for sc in DASHBOARD["upload_scopes"]
     )
+    category_options = "".join(
+        f'<option value="{html.escape(cat)}" {"selected" if cat == "fact" else ""}>{html.escape(cat)}</option>'
+        for cat in VALID_CATEGORIES
+    )
 
+    cur_qs: list[tuple[str, str]] = [("scope", scope_filter)]
+    if active_path_str:
+        cur_qs.append(("note", active_path_str))
+    if search_query.strip():
+        cur_qs.append(("q", search_query.strip()))
+    current_page_url = f"{base_path or '/'}?{urllib.parse.urlencode(cur_qs)}"
+
+    all_facts = list(search_res["facts"])
+    active_fact_count = sum(1 for f in all_facts if f.get("is_valid", True))
+    retired_fact_count = len(all_facts) - active_fact_count
     facts_html_rows: list[str] = []
-    for f in search_res["facts"]:
+    for f in all_facts:
         is_inv = not f.get("is_valid", True)
         badge_cls = f"cat-{html.escape(str(f['category']))}"
         subj = f"<strong>[{html.escape(str(f['subject']))}]</strong> " if f.get("subject") else ""
         row_text = f"{subj}{html.escape(_clean_latex_inline(str(f['fact'])))}"
         state_badge = "<span class='badge valid-badge'>VALID</span>"
+        history_note = ""
+        action_html = ""
         if is_inv:
             label = "SUPERSEDED" if f.get("status") == "superseded" else "INVALIDATED"
             state_badge = f"<span class='badge invalid-badge'>{label}</span>"
             row_text = f"<del>{row_text}</del>"
+            extra_parts: list[str] = []
+            if f.get("superseded_by"):
+                extra_parts.append(f"replaced by #{f['superseded_by']}")
+            if f.get("invalidated_reason"):
+                extra_parts.append(html.escape(str(f["invalidated_reason"])))
+            if f.get("invalidated_by"):
+                extra_parts.append(f"by {html.escape(str(f['invalidated_by']))}")
+            if extra_parts:
+                history_note = f"<div class='fact-reason'>{' · '.join(extra_parts)}</div>"
+        elif actor == "owner":
+            action_html = (
+                f"<form class='fact-retire-form' method='post' action='{safe_base_path.rstrip('/')}/facts'>"
+                f"<input type='hidden' name='csrf_token' value='{html.escape(facts_csrf, quote=True)}'>"
+                f"<input type='hidden' name='action' value='forget'>"
+                f"<input type='hidden' name='fact_id' value='{int(f['id'])}'>"
+                f"<input type='hidden' name='next' value='{html.escape(current_page_url, quote=True)}'>"
+                f"<input type='hidden' name='reason' value='Retired by owner in web UI'>"
+                f"<button type='submit' class='fact-retire-btn' aria-label='Retire fact #{int(f['id'])}'>Retire</button>"
+                f"</form>"
+            )
         facts_html_rows.append(
             f"<div class='fact-card {'superseded' if is_inv else ''}'>"
-            f"{state_badge} "
+            f"<div class='fact-head'><div class='fact-badges'>{state_badge} "
             f"<span class='badge {badge_cls}'>{html.escape(str(f['category']))}</span> "
-            f"<span class='badge scope-badge'>{html.escape(str(f['scope']))}</span> "
+            f"<span class='badge scope-badge'>{html.escape(str(f['scope']))}</span></div>{action_html}</div>"
             f"<div class='fact-text'>{row_text}</div>"
+            f"{history_note}"
             f"<div class='fact-meta'>#{f['id']} · by <code>{html.escape(str(f['author']))}</code> · {html.escape(str(f['valid_from'])[:10])}"
             + (f" → {html.escape(str(f['valid_until'])[:10])}" if f.get("valid_until") else "")
             + "</div></div>"
         )
-    facts_block = "\n".join(facts_html_rows) or "<p class='muted'>No matching AI facts in this folder.</p>"
+    facts_block = "\n".join(facts_html_rows) or "<p class='muted'>No matching AI facts in this folder yet.</p>"
+    add_fact_html = ""
+    if actor == "owner":
+        add_fact_html = (
+            f"<details class='fact-add'>"
+            f"<summary>+ Add verified fact</summary>"
+            f"<form class='fact-add-form' method='post' action='{safe_base_path.rstrip('/')}/facts'>"
+            f"<input type='hidden' name='csrf_token' value='{html.escape(facts_csrf, quote=True)}'>"
+            f"<input type='hidden' name='action' value='add'>"
+            f"<input type='hidden' name='next' value='{html.escape(current_page_url, quote=True)}'>"
+            f"<label class='form-label' for='fact-scope'>Scope</label>"
+            f"<select id='fact-scope' name='scope'>{upload_scope_options}</select>"
+            f"<label class='form-label' for='fact-subject'>Topic slug (updates replace old fact)</label>"
+            f"<input id='fact-subject' type='text' name='subject' placeholder='e.g. preferred-editor'>"
+            f"<label class='form-label' for='fact-category'>Category</label>"
+            f"<select id='fact-category' name='category'>{category_options}</select>"
+            f"<label class='form-label' for='fact-statement'>Verified statement</label>"
+            f"<textarea id='fact-statement' name='fact' rows='2' placeholder='Clear, self-contained fact to share across agents' required></textarea>"
+            f"<button type='submit'>Save Fact</button>"
+            f"</form></details>"
+        )
+
+    search_banner_html = ""
+    if search_query.strip():
+        search_banner_html = (
+            f"<div class='search-banner'>"
+            f"<span>Showing <strong>{len(notes)}</strong> page(s) and <strong>{len(all_facts)}</strong> fact(s) for "
+            f"<code>{html.escape(search_query.strip())}</code></span>"
+            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}'>Clear search</a>"
+            f"</div>"
+        )
+
+    if active_note_meta:
+        reader_body_html = (
+            search_banner_html
+            + breadcrumbs_html
+            + f"<div class='doc-meta-bar'><span class='badge scope-badge'>{html.escape(str(active_note_meta['scope']))}</span>"
+            + f"<span>📄 <code>{html.escape(str(active_note_meta['path']))}</code></span>"
+            + f"<span>· Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>"
+            + f"{active_download_btn}</div>"
+            + note_html
+            + connected_html
+        )
+    elif search_query.strip():
+        reader_body_html = (
+            search_banner_html
+            + "<div class='empty-state'><h2>No pages matched that search</h2>"
+            + "<p class='muted'>Try fewer keywords, switch to Entire Vault on the left, or check matching AI Memory Facts on the right.</p></div>"
+        )
+    elif notes:
+        reader_body_html = (
+            "<div class='empty-state'><h2>Select a page from the folder tree</h2>"
+            "<p class='muted'>Browse folders on the left, search notes and facts above, or upload a <code>.md</code>, <code>.pdf</code>, or <code>.docx</code> document.</p></div>"
+        )
+    else:
+        reader_body_html = (
+            "<div class='empty-state'>"
+            "<h2>Your memory vault is ready</h2>"
+            "<p>Notes, uploaded PDFs/DOCX files, and verified AI facts appear here so you and your coding/chat assistants stay in sync.</p>"
+            "<ul>"
+            "<li>Use <strong>Upload</strong> in the top bar to index your first <code>.md</code>, <code>.pdf</code>, or <code>.docx</code> file.</li>"
+            "<li>Open <a href='/apps'>Connected apps</a> for your MCP URL and 1-command laptop login.</li>"
+            "<li>Add or retire shared facts directly in the <strong>AI Memory Facts</strong> panel on the right.</li>"
+            "</ul></div>"
+        )
+
     reader_checked = "checked" if active_note_meta else ""
     notes_checked = "" if active_note_meta else "checked"
     facts_open_attr = " open" if search_query.strip() else ""
@@ -3399,7 +3701,7 @@ def render_dashboard_page(
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Vyn Unified Obsidian Vault &amp; Memory Hub</title>
+  <title>{html.escape(dashboard_title)} · Vault &amp; Memory Hub</title>
   <style>
     html {{ scroll-behavior: smooth; }}
     :root {{
@@ -3469,8 +3771,8 @@ def render_dashboard_page(
     .search-form {{ display: flex; gap: 6px; flex: 1 1 380px; max-width: 480px; min-width: 0; align-items: center; }}
     .search-form input[type="search"] {{ width: 100%; min-width: 0; background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.85rem; }}
     .search-form input[type="search"]:focus {{ outline: 2px solid var(--accent); border-color: transparent; }}
-    .search-form button, .upload-form button {{ background: var(--accent); color: #ffffff; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
-    #theme-dark:checked ~ .app-shell .search-form button, #theme-dark:checked ~ .app-shell .upload-form button {{ color: #020617; }}
+    .search-form button, .upload-form button, .fact-add-form button {{ background: var(--accent); color: #ffffff; border: none; border-radius: 6px; padding: 6px 12px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
+    #theme-dark:checked ~ .app-shell .search-form button, #theme-dark:checked ~ .app-shell .upload-form button, #theme-dark:checked ~ .app-shell .fact-add-form button {{ color: #020617; }}
     .clear-search {{ font-size: 0.78rem; color: var(--muted); text-decoration: none; padding: 4px 6px; white-space: nowrap; }}
     .header-right {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
     .upload-box {{ position: relative; }}
@@ -3479,15 +3781,20 @@ def render_dashboard_page(
     .upload-box[open] > summary {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
     .upload-box[open] > summary::before {{ content: " "; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 45; display: block; cursor: default; background: transparent; }}
     .upload-box:not([open]) .upload-form {{ display: none; }}
-    .upload-form {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 300px; max-width: calc(100vw - 28px); padding: 12px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: 0 10px 25px rgba(15,23,42,0.18); display: flex; flex-direction: column; gap: 8px; }}
-    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"] {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.82rem; width: 100%; }}
+    .upload-form {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 310px; max-width: calc(100vw - 28px); padding: 14px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: 0 10px 25px rgba(15,23,42,0.18); display: flex; flex-direction: column; gap: 6px; }}
+    .form-label {{ font-size: 0.75rem; font-weight: 600; color: var(--muted); margin-top: 2px; }}
+    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.82rem; width: 100%; font-family: inherit; }}
     .theme-toggle {{ cursor: pointer; font-size: 0.79rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }}
     .theme-toggle:hover {{ border-color: var(--accent); color: var(--accent); }}
     .actor-tag {{ font-size: 0.78rem; background: var(--panel); padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
     .actor-tag strong {{ color: var(--text); }}
+    .actor-link {{ color: inherit; font-weight: 600; text-decoration: none; }}
+    .actor-link:hover {{ color: var(--accent); text-decoration: underline; }}
+    .signout-link {{ color: var(--red); text-decoration: none; font-weight: 600; }}
+    .signout-link:hover {{ text-decoration: underline; }}
     .dl-btn {{ display: inline-block; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }}
     .mobile-tabs {{ display: none; }}
-    .layout {{ display: grid; grid-template-columns: 290px minmax(0, 1fr) 260px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
+    .layout {{ display: grid; grid-template-columns: 290px minmax(0, 1fr) 280px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
     .sidebar {{ padding: 14px 12px 28px 14px; border-right: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); text-align: left; }}
     .sidebar-section-label {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); padding: 2px 8px 6px; text-align: left; }}
     .scope-strip {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 5px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
@@ -3516,6 +3823,10 @@ def render_dashboard_page(
     .tree-sub {{ font-size: 0.72rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
     .reader-wrap {{ padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }}
     .reader {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 32px 42px; max-width: 860px; width: 100%; min-width: 0; overflow-wrap: break-word; word-break: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
+    .search-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.83rem; color: var(--text); }}
+    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; white-space: nowrap; }}
+    .search-banner a:hover {{ text-decoration: underline; }}
+    .empty-state {{ padding: 8px 0; }}
     .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; font-size: 0.81rem; color: var(--muted); margin-bottom: 8px; }}
     .breadcrumbs a {{ color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }}
     .breadcrumbs a:hover {{ color: var(--accent); text-decoration: underline; }}
@@ -3558,10 +3869,20 @@ def render_dashboard_page(
     .facts-drawer summary {{ cursor: pointer; font-size: 0.8rem; font-weight: 700; color: var(--text); padding: 7px 10px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); list-style: none; display: flex; align-items: center; justify-content: space-between; }}
     .facts-drawer summary::-webkit-details-marker {{ display: none; }}
     .facts-drawer-body {{ margin-top: 10px; }}
+    .facts-summary-line {{ margin: 0 0 8px; font-size: 0.78rem; color: var(--muted); }}
+    .fact-add {{ margin: 0 0 10px; }}
+    .fact-add > summary {{ font-size: 0.78rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); padding: 6px 10px; }}
+    .fact-add-form {{ display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); }}
     .muted {{ color: var(--muted); font-size: 0.79rem; }}
     .fact-card {{ padding: 10px 12px; border-radius: 12px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.82rem; overflow-wrap: break-word; }}
-    .fact-card.superseded {{ opacity: 0.6; }}
-    .fact-text {{ margin-top: 4px; color: var(--text-body); }}
+    .fact-card.superseded {{ opacity: 0.78; }}
+    .fact-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }}
+    .fact-badges {{ display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
+    .fact-retire-form {{ margin: 0; flex-shrink: 0; }}
+    .fact-retire-btn {{ background: transparent; color: var(--muted); border: 1px solid var(--border-strong); border-radius: 5px; padding: 2px 7px; font-size: 0.72rem; font-weight: 600; cursor: pointer; }}
+    .fact-retire-btn:hover {{ color: var(--red); border-color: var(--red); background: var(--red-bg); }}
+    .fact-text {{ margin-top: 5px; color: var(--text-body); }}
+    .fact-reason {{ margin-top: 4px; font-size: 0.75rem; color: var(--muted); }}
     .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; }}
     .valid-badge {{ background: var(--green-bg); color: var(--green); }}
     .invalid-badge {{ background: var(--red-bg); color: var(--red); }}
@@ -3614,33 +3935,36 @@ def render_dashboard_page(
   <div class="app-shell">
     <header>
       <div class="brand-wrap">
-        <a class="brand" href="{safe_base_path}?scope=" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">📘 Vyn<span class="brand-long"> Unified Obsidian</span> Vault</a>
+        <a class="brand" href="{safe_base_path}?scope=" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">📘 {html.escape(dashboard_title)}<span class="brand-long"> Vault</span></a>
       </div>
       <form class="search-form" method="get" action="{safe_base_path}">
         <input type="hidden" name="scope" value="{html.escape(scope_filter)}">
-        <input type="search" name="q" value="{html.escape(search_query)}" placeholder="Search notes, topics, code...">
+        <input type="search" name="q" value="{html.escape(search_query)}" aria-label="Search notes and facts" placeholder="Search notes, topics, facts...">
         <button type="submit">Search</button>
-        {f'<a class="clear-search" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}">✕</a>' if search_query else ''}
+        {f'<a class="clear-search" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}" aria-label="Clear search">✕</a>' if search_query else ''}
       </form>
       <div class="header-right">
         <details class="upload-box">
           <summary>📤 Upload</summary>
           <form class="upload-form" method="post" action="{safe_base_path.rstrip('/')}/upload" enctype="multipart/form-data">
             <input type="hidden" name="csrf_token" value="{html.escape(upload_csrf, quote=True)}">
-            <select name="scope" aria-label="Target vault scope">{upload_scope_options}</select>
-            <input type="file" name="file" accept=".pdf,.docx,.md,.txt" required>
-            <input type="text" name="title" placeholder="Optional document title">
+            <label class="form-label" for="upload-scope">Folder</label>
+            <select id="upload-scope" name="scope">{upload_scope_options}</select>
+            <label class="form-label" for="upload-file">File (.md, .pdf, .docx, .txt)</label>
+            <input id="upload-file" type="file" name="file" accept=".pdf,.docx,.md,.txt" required>
+            <label class="form-label" for="upload-title">Title (optional)</label>
+            <input id="upload-title" type="text" name="title" placeholder="Uses filename if blank">
             <button type="submit">Upload &amp; Index</button>
           </form>
         </details>
-        <label for="theme-dark" class="theme-toggle" title="Switch between Confluence Light and Slate Dark mode">🌓 Theme</label>
-        <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a href="/apps" style="color:inherit;font-weight:600">Apps</a> · <a href="/logout" style="color:var(--red);text-decoration:none;font-weight:600">Sign Out</a></div>
+        <label for="theme-dark" class="theme-toggle" title="Switch between Light and Dark mode">🌓 Theme</label>
+        <div class="actor-tag" title="{writable_tooltip}"><span class="actor-name"><strong>{html.escape(actor)}</strong> · </span><a class="actor-link" href="/apps">Apps</a> · <a class="signout-link" href="/logout">Sign Out</a></div>
       </div>
     </header>
     <nav class="mobile-tabs" aria-label="Mobile view switcher">
       <label for="tab-reader" class="mtab mtab-reader">📖 Read</label>
       <label for="tab-notes" class="mtab mtab-notes">📁 Folders ({len(notes)})</label>
-      <label for="tab-facts" class="mtab mtab-facts">📑 Outline</label>
+      <label for="tab-facts" class="mtab mtab-facts">📑 Outline &amp; Facts</label>
     </nav>
     <div class="layout">
       <aside class="sidebar" aria-label="Folder navigation">
@@ -3652,22 +3976,16 @@ def render_dashboard_page(
       </aside>
       <div class="reader-wrap">
         <main class="reader">
-          {
-            breadcrumbs_html
-            + f"<div class='doc-meta-bar'><span class='badge scope-badge'>{html.escape(str(active_note_meta['scope']))}</span><span>📄 <code>{html.escape(str(active_note_meta['path']))}</code></span><span>· Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>{active_download_btn}</div>"
-            + note_html
-            + connected_html
-            if active_note_meta
-            else "<h2>Select a study guide or page from the folder tree</h2><p class='muted'>Use the collapsible folder tree on the left or the search bar above to browse your vault.</p>"
-          }
+          {reader_body_html}
         </main>
       </div>
       <aside class="facts-col" aria-label="Page outline and AI facts">
         {toc_html}
         <details class="facts-drawer"{facts_open_attr}>
-          <summary><span>⚡ AI Memory Facts</span><span class="tree-count">{len(search_res['facts'])}</span></summary>
+          <summary><span>⚡ AI Memory Facts</span><span class="tree-count">{active_fact_count}</span></summary>
           <div class="facts-drawer-body">
-            <p class="muted" style="margin:0 0 8px">Shared temporal facts across Claude, ChatGPT, Hermes &amp; Antigravity.</p>
+            <p class="facts-summary-line"><strong>{active_fact_count}</strong> active · {retired_fact_count} history — shared across all connected agents.</p>
+            {add_fact_html}
             {facts_block}
           </div>
         </details>
@@ -3716,6 +4034,19 @@ def build_openapi_schema(server_url: str) -> dict[str, object]:
                         {"name": "include_history", "in": "query", "required": False, "schema": {"type": "boolean", "default": False}},
                     ],
                     "responses": {"200": {"description": "Matching facts, inline observations, and notes"}},
+                }
+            },
+            "/api/v1/fact-check": {
+                "get": {
+                    "operationId": "memoryCheckFacts",
+                    "summary": "Fact-check a claim or topic against active facts, retired/superseded history, and related vault notes before saving new memory.",
+                    "parameters": [
+                        {"name": "statement", "in": "query", "required": False, "schema": {"type": "string"}},
+                        {"name": "scope", "in": "query", "required": False, "schema": {"type": "string"}},
+                        {"name": "subject", "in": "query", "required": False, "schema": {"type": "string"}},
+                        {"name": "limit", "in": "query", "required": False, "schema": {"type": "integer", "default": 8}},
+                    ],
+                    "responses": {"200": {"description": "Matching active facts, retired history, related notes, and guidance"}},
                 }
             },
             "/api/v1/context": {
@@ -3794,7 +4125,7 @@ def build_openapi_schema(server_url: str) -> dict[str, object]:
             "/api/v1/remember": {
                 "post": {
                     "operationId": "memoryRememberFact",
-                    "summary": "Save or update an atomic AI-to-AI temporal fact (automatically marks older state on the same subject as superseded/invalid).",
+                    "summary": "Save or update an atomic AI-to-AI temporal fact (automatically marks older state on the same subject as superseded/invalid and flags potential_conflicts).",
                     "requestBody": {
                         "required": True,
                         "content": {
@@ -3829,6 +4160,8 @@ MAX_JSON_BODY_BYTES = 512 * 1024
 MAX_FORM_BODY_BYTES = 64 * 1024
 MAX_OAUTH_CODES = 256
 MAX_OAUTH_TOKENS = 512
+MAX_WEB_AUTH_STATES = 256
+MAX_DEVICE_CODES = 256
 PKCE_CHALLENGE_RE = re.compile(r"^[A-Za-z0-9_-]{43,128}$")
 PKCE_VERIFIER_RE = re.compile(r"^[A-Za-z0-9._~-]{32,128}$")
 # Human pages that accept the owner's browser cookie; API/MCP routes never do.
@@ -3837,6 +4170,7 @@ BROWSER_ROUTES = ("/", "/oauth/authorize", "/logout", "/download", "/device", "/
 DEVICE_ROLES = {"claude": "Claude (Claude Code)", "chatgpt": "ChatGPT (Codex)", "antigravity": "Antigravity"}
 USER_CODE_ALPHABET = "BCDFGHJKLMNPQRSTVWXZ"  # no vowels or look-alikes, so codes never spell words
 MAX_PENDING_DEVICE_CODES = 20
+MAX_PENDING_DEVICE_CODES_PER_IP = 5
 DEVICE_TOKEN_TTL = 86400 * 365
 DASHBOARD_CSP = (
     "default-src 'none'; "
@@ -3996,20 +4330,29 @@ def _state_cookie_header(state_value: str, max_age: int = 900) -> str:
     return f"vyn_memory_state={safe_st}; Path=/; HttpOnly; SameSite=Lax; Max-Age={max_age}"
 
 
+def _omni_configured() -> bool:
+    return bool((os.environ.get("OMNI_PUBLIC_URL", "") or OMNI_PUBLIC_URL).strip())
+
+
 CARD_CSS = """body{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;padding:40px 16px;margin:0}
 .card{background:#1e293b;padding:24px 20px;border-radius:12px;border:1px solid #334155;max-width:var(--w);width:100%;box-sizing:border-box}
 h2{margin:0 0 12px;font-size:1.3rem}
-p,td{color:#cbd5e1;font-size:14px;line-height:1.5}
+p,td,li{color:#cbd5e1;font-size:14px;line-height:1.5}
 .muted{color:#94a3b8;font-size:13px}
+.err-box{color:#fecaca;background:#450a0a;padding:10px 12px;border-radius:6px;border:1px solid #991b1b;font-size:14px}
 .code{font:600 1.6rem/1.2 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:.12em;margin:4px 0 16px}
-select,button{width:100%;padding:11px;margin:6px 0;border-radius:6px;font-size:16px;box-sizing:border-box}
-select{border:1px solid #475569;background:#020617;color:#f8fafc}
-button{background:#38bdf8;color:#020617;border:none;font-weight:700;cursor:pointer}
+label{display:block;color:#cbd5e1;font-size:13px;font-weight:600;margin-top:8px}
+input,select,button,.cta-btn{width:100%;padding:11px;margin:6px 0;border-radius:6px;font-size:16px;box-sizing:border-box}
+input,select{border:1px solid #475569;background:#020617;color:#f8fafc}
+button,.cta-btn{background:#38bdf8;color:#020617;border:none;font-weight:700;cursor:pointer;display:block;text-align:center;text-decoration:none}
 button.secondary{background:#334155;color:#f8fafc;border:1px solid #475569;font-weight:600}
 td button{width:auto;margin:0;padding:6px 12px;font-size:13px}
-button:focus-visible,select:focus-visible,a:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
+button:focus-visible,select:focus-visible,input:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid #38bdf8;outline-offset:2px}
 a{color:#38bdf8;text-underline-offset:3px}
-code{color:#e2e8f0}
+code{color:#e2e8f0;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:0.9em}
+pre{background:#020617;color:#f8fafc;border:1px solid #334155;border-radius:8px;padding:10px 12px;overflow-x:auto;font-size:13px;line-height:1.5}
+details{margin:14px 0;border-top:1px solid #334155;padding-top:12px}
+summary{color:#cbd5e1;font-size:13px;font-weight:600;cursor:pointer}
 ::selection{background:#38bdf8;color:#020617}
 table{width:100%;border-collapse:collapse;font-variant-numeric:tabular-nums;margin:8px 0 16px}
 th{text-align:left;color:#94a3b8;font-size:12px;font-weight:600;padding:8px 6px;border-bottom:1px solid #334155}
@@ -4025,7 +4368,7 @@ def render_card_page(title: str, body: str, width: int = 430) -> str:
 
 
 def _device_label(info: dict[str, object]) -> str:
-    """'Codex · veera@laptop · Linux 6.8' from what `memory.py login` reports (untrusted, so cleaned and capped)."""
+    """'Codex · user@laptop · Linux 6.8' from what `memory.py login` reports (untrusted, so cleaned and capped)."""
     def part(key: str) -> str:
         return re.sub(r"[^\w .@()+/-]", "", str(info.get(key) or ""))[:60].strip()
     host, user = part("host") or "unknown device", part("user")
@@ -4039,20 +4382,34 @@ def _device_role_hint(label: str) -> str:
     return "antigravity" if "antigravity" in app or "gemini" in app else "claude"
 
 
-def render_device_page(row: sqlite3.Row) -> str:
+def render_device_lookup_page(error_msg: str = "") -> str:
+    err_html = f'<p class="err-box">{html.escape(error_msg)}</p>' if error_msg else ""
+    body = f"""<p>Enter the 8-letter code shown in your terminal after running <code>memory.py login</code>.</p>
+{err_html}
+<form method="get" action="/device">
+<label for="device-code">Device code</label>
+<input id="device-code" type="text" name="code" placeholder="BCDF-GHJK" autocomplete="off" required>
+<button type="submit">Continue</button>
+</form>
+<p class="muted"><a href="/apps">Connected apps</a> · <a href="/">Back to the vault</a></p>"""
+    return render_card_page("Approve device login", body)
+
+
+def render_device_page(row: sqlite3.Row, *, session_token: str = "") -> str:
     options = "".join(
         f'<option value="{r}"{" selected" if r == row["role_hint"] else ""}>{label}</option>'
         for r, label in DEVICE_ROLES.items()
     )
     code = html.escape(str(row["user_code"]), quote=True)
+    csrf = html.escape(_mint_upload_csrf(purpose="device", session_token=session_token), quote=True)
     body = f"""<p>A device is asking for its own memory token.</p>
 <p><strong>{html.escape(str(row["label"]))}</strong><br><span class="muted">from {html.escape(str(row["ip"]))}</span></p>
 <p class="muted">Approve only if you just ran <code>memory.py login</code> and your terminal shows this code:</p>
 <div class="code">{code}</div>
 <form method="post" action="/device">
 <input type="hidden" name="code" value="{code}">
-<input type="hidden" name="csrf_token" value="{html.escape(_mint_upload_csrf(), quote=True)}">
-<label class="muted" for="role">Act as</label>
+<input type="hidden" name="csrf_token" value="{csrf}">
+<label for="role">Act as</label>
 <select id="role" name="role">{options}</select>
 <button name="decision" value="approve">Approve</button>
 <button class="secondary" name="decision" value="deny">Deny</button>
@@ -4060,11 +4417,11 @@ def render_device_page(row: sqlite3.Row) -> str:
     return render_card_page("Approve device login", body)
 
 
-def render_apps_page(conn: sqlite3.Connection) -> str:
+def render_apps_page(conn: sqlite3.Connection, *, session_token: str = "") -> str:
     def when(ts: float) -> str:
         return datetime.fromtimestamp(ts, LOCAL_TZ).strftime("%d %b %Y, %H:%M") if ts else "–"
 
-    csrf = html.escape(_mint_upload_csrf(), quote=True)
+    csrf = html.escape(_mint_upload_csrf(purpose="apps", session_token=session_token), quote=True)
 
     def row_html(name: str, kind: str, acts_as: str, added: float, used: float, rev_kind: str, rowid: int) -> str:
         return (
@@ -4097,51 +4454,55 @@ def render_apps_page(conn: sqlite3.Connection) -> str:
         if owner_email_ok(str(w["email"]))
     ]
     roles = ", ".join(sorted(r for r in configured_tokens() if r != "owner")) or "none"
+    mcp_url = html.escape(f"{PUBLIC_URL}/mcp")
+    pub_url = html.escape(PUBLIC_URL)
     body = (
         '<p class="muted">Everything that can reach your memory now. Revoke ends access at once; '
         "a device can log in again with <code>memory.py login</code>.</p>"
         "<table><thead><tr><th>App</th><th>Acts as</th><th>Added</th><th>Last used</th><th></th></tr></thead>"
-        f'<tbody>{"".join(rows) or "<tr><td colspan=5>Nothing connected.</td></tr>"}</tbody></table>'
+        f'<tbody>{"".join(rows) or "<tr><td colspan=5>Nothing connected yet.</td></tr>"}</tbody></table>'
+        "<details>"
+        "<summary>Connect a new app, MCP client, or laptop</summary>"
+        f"<p><strong>Claude / ChatGPT (MCP Connector):</strong> add <code>{mcp_url}</code> as a remote MCP server and sign in when prompted.</p>"
+        f"<p><strong>Laptop CLI (Claude Code, Codex, Antigravity):</strong> run this once, then approve the code at <a href='/device'>/device</a>:</p>"
+        f"<pre>python3 memory.py login {pub_url}</pre>"
+        "</details>"
         f'<p class="muted">The server also has role tokens for: {html.escape(roles)}. '
         "To revoke one, change it in the server's env file and restart.</p>"
-        '<p><a href="/">Back to the vault</a></p>'
+        '<p><a href="/">Back to the vault</a> · <a href="/device">Approve a device code</a></p>'
     )
     return render_card_page("Connected apps", body, width=880)
 
 
 def render_login_page(next_path: str = f"/?scope={DEFAULT_SCOPE}", error_msg: str = "") -> str:
     safe_next = _sanitize_next_path(next_path)
-    err_html = (
-        f'<p style="color:#f87171;background:#450a0a;padding:10px;border-radius:6px;border:1px solid #991b1b;font-size:14px">{html.escape(error_msg)}</p>'
-        if error_msg
-        else ""
+    err_html = f'<p class="err-box">{html.escape(error_msg)}</p>' if error_msg else ""
+    token_form = (
+        '<form method="post" action="/login">'
+        f'<input type="hidden" name="next" value="{html.escape(safe_next, quote=True)}">'
+        '<label for="owner-token">Owner token (<code>MEMORY_OWNER_TOKEN</code>)</label>'
+        '<input id="owner-token" type="password" name="token" placeholder="Paste MEMORY_OWNER_TOKEN" autocomplete="current-password" required>'
+        '<button type="submit">Sign In with Token</button>'
+        "</form>"
     )
-    omni_start_href = f"/auth/start?next={urllib.parse.quote(safe_next, safe='')}"
-    return f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sign In · Vyn Memory Hub</title>
-<style>body{{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;padding:48px 16px;margin:0}}
-.card{{background:#1e293b;padding:24px 20px;border-radius:12px;border:1px solid #334155;max-width:430px;width:100%;box-sizing:border-box}}
-h2{{margin-top:0;color:#38bdf8;font-size:1.3rem}}
-p{{color:#cbd5e1;font-size:14px;line-height:1.5}}
-.omni-btn{{display:block;text-align:center;text-decoration:none;width:100%;padding:12px;margin:14px 0;background:#38bdf8;color:#020617;border-radius:6px;font-weight:700;font-size:16px;box-sizing:border-box}}
-details{{margin-top:18px;border-top:1px solid #334155;padding-top:12px}}
-summary{{color:#94a3b8;font-size:13px;cursor:pointer}}
-input{{width:100%;padding:11px;margin:10px 0;border-radius:6px;border:1px solid #475569;background:#020617;color:#fff;box-sizing:border-box;font-size:16px}}
-button{{width:100%;padding:11px;background:#334155;color:#f8fafc;border:1px solid #475569;border-radius:6px;font-weight:600;cursor:pointer;font-size:15px}}</style>
-</head><body><div class="card">
-<h2>🔒 Sign In to Vyn Memory</h2>
-<p>Sign in with your <strong>Omni</strong> owner account (email OTP / active Omni session):</p>
-{err_html}
-<a class="omni-btn" href="{html.escape(omni_start_href, quote=True)}">🔐 Sign in with Omni (Owner Email)</a>
-<details>
-  <summary>Emergency fallback: sign in with MEMORY_OWNER_TOKEN</summary>
-  <form method="post" action="/login">
-    <input type="hidden" name="next" value="{html.escape(safe_next, quote=True)}">
-    <input type="password" name="token" placeholder="Paste MEMORY_OWNER_TOKEN" autocomplete="current-password" required>
-    <button type="submit">Sign In with Token</button>
-  </form>
-</details></div></body></html>"""
+    if _omni_configured():
+        omni_start_href = f"/auth/start?next={urllib.parse.quote(safe_next, safe='')}"
+        body = (
+            "<p>Sign in with your <strong>Omni</strong> owner account (email OTP / active Omni session):</p>"
+            f"{err_html}"
+            f'<a class="cta-btn" href="{html.escape(omni_start_href, quote=True)}">🔐 Sign in with Omni (Owner Email)</a>'
+            "<details>"
+            "<summary>Fallback: sign in with MEMORY_OWNER_TOKEN</summary>"
+            f"{token_form}"
+            "</details>"
+        )
+    else:
+        body = (
+            "<p>Enter your <code>MEMORY_OWNER_TOKEN</code> from your server env file to open the vault.</p>"
+            f"{err_html}"
+            f"{token_form}"
+        )
+    return render_card_page("Sign In to Vyn Memory", body)
 
 
 def validate_oauth_redirect_uri(uri: str) -> str:
@@ -4200,6 +4561,26 @@ def _prune_oauth_tables(conn: sqlite3.Connection) -> None:
             )
             """,
             (tok_count - MAX_OAUTH_TOKENS + 1,),
+        )
+    state_count = int(conn.execute("SELECT COUNT(*) FROM web_auth_states").fetchone()[0])
+    if state_count >= MAX_WEB_AUTH_STATES:
+        conn.execute(
+            """
+            DELETE FROM web_auth_states WHERE state_hash IN (
+                SELECT state_hash FROM web_auth_states ORDER BY expires_at ASC LIMIT ?
+            )
+            """,
+            (state_count - MAX_WEB_AUTH_STATES + 1,),
+        )
+    dev_count = int(conn.execute("SELECT COUNT(*) FROM device_codes").fetchone()[0])
+    if dev_count >= MAX_DEVICE_CODES:
+        conn.execute(
+            """
+            DELETE FROM device_codes WHERE device_hash IN (
+                SELECT device_hash FROM device_codes ORDER BY expires_at ASC LIMIT ?
+            )
+            """,
+            (dev_count - MAX_DEVICE_CODES + 1,),
         )
 
 
@@ -4266,19 +4647,27 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
     def client_ip(self) -> str:
         return _client_ip(self.headers, getattr(self, "client_address", None))
 
-    def send_json(self, status: int, payload: object, extra_headers: dict[str, str] | None = None) -> None:
+    def send_json(
+        self,
+        status: int,
+        payload: object,
+        extra_headers: dict[str, str] | None = None,
+        *,
+        cors: bool = True,
+    ) -> None:
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         self.send_response(status)
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Cache-Control", "no-store")
         self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header(
-            "Access-Control-Allow-Headers",
-            "Authorization, Content-Type, X-API-Key, X-Hermes-Subagent, Mcp-Session-Id, MCP-Protocol-Version",
-        )
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
+        if cors:
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-API-Key, X-Hermes-Subagent, Mcp-Session-Id, MCP-Protocol-Version",
+            )
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS")
         if extra_headers:
             for k, v in extra_headers.items():
                 self.send_header(k, v)
@@ -4379,7 +4768,9 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         if sec_site and sec_site not in ("same-origin", "none"):
             return False
         origin_hdr = (self.headers.get("Origin") or "").strip().rstrip("/").lower()
-        if not origin_hdr or origin_hdr == "null":
+        if origin_hdr == "null":
+            return sec_site == "same-origin"
+        if not origin_hdr:
             return sec_site in ("", "same-origin", "none")
         pub_origin = PUBLIC_URL.rstrip("/").lower()
         if origin_hdr == pub_origin:
@@ -4423,25 +4814,39 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             _record_auth_failure(self.client_ip())
         return raw_path, query, None
 
-    def owner_cookie_email(self) -> str | None:
-        """Email of the owner browser session in this request's cookies, if any."""
+    def _owner_cookie_pair(self) -> tuple[str, str] | None:
+        """Return (cookie_token, email) for the active owner browser session, if any."""
         for tok in self._extract_cookie_tokens():
             email = web_session_email(self.server.db, tok)  # type: ignore[attr-defined]
             if email is None and resolve_actor_from_token(tok) == "owner":
                 email = owner_session_email()
             if email:
-                return email
+                return tok, email
         return None
 
-    def read_owner_form(self) -> tuple[dict[str, list[str]], str] | None:
-        """Form fields and approving email of a same-origin, CSRF-checked owner POST; otherwise sends 403."""
+    def owner_cookie_token(self) -> str:
+        pair = self._owner_cookie_pair()
+        return pair[0] if pair else ""
+
+    def owner_cookie_email(self) -> str | None:
+        """Email of the owner browser session in this request's cookies, if any."""
+        pair = self._owner_cookie_pair()
+        return pair[1] if pair else None
+
+    def read_owner_form(self, *, purpose: str = "upload") -> tuple[dict[str, list[str]], str] | None:
+        """Form fields and approving email of a same-origin, session-bound CSRF-checked owner POST; otherwise sends 403."""
         try:
             form = urllib.parse.parse_qs(self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace"))
         except MemoryError as exc:
-            self.send_json(exc.status, {"error": str(exc)})
+            self.send_json(exc.status, {"error": str(exc)}, cors=False)
             return None
-        email = self.owner_cookie_email()
-        if self._is_same_origin_browser_post() and _verify_upload_csrf((form.get("csrf_token") or [""])[0]) and email:
+        pair = self._owner_cookie_pair()
+        tok, email = pair if pair else ("", None)
+        if (
+            self._is_same_origin_browser_post()
+            and email
+            and _verify_upload_csrf((form.get("csrf_token") or [""])[0], purpose=purpose, session_token=tok)
+        ):
             return form, email
         _record_auth_failure(self.client_ip())
         self.send_html(403, render_card_page("Not allowed", "<p>Sign in again and retry from the page.</p>"))
@@ -4524,6 +4929,10 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             return
 
         if route == "/auth/start":
+            omni_pub = (os.environ.get("OMNI_PUBLIC_URL", "") or OMNI_PUBLIC_URL).rstrip("/")
+            if not omni_pub:
+                self.send_html(404, render_login_page(error_msg="Omni sign-in is not configured; use the owner token."))
+                return
             next_p = (query.get("next") or [f"/?scope={DEFAULT_SCOPE}"])[0].strip()
             safe_next = _sanitize_next_path(next_p)
             state = "memory_" + secrets.token_urlsafe(24)
@@ -4535,10 +4944,6 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     (hashlib.sha256(state.encode()).hexdigest(), safe_next, now_ts + 900),
                 )
                 conn.commit()
-            omni_pub = (os.environ.get("OMNI_PUBLIC_URL", "") or OMNI_PUBLIC_URL).rstrip("/")
-            if not omni_pub:
-                self.send_html(404, render_login_page(error_msg="Omni sign-in is not configured; use the owner token."))
-                return
             target = f"{omni_pub}/hub/signin?{urllib.parse.urlencode({'state': state})}"
             self.send_response(303)
             self.send_header("Location", target)
@@ -4674,7 +5079,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 return
             default_role = _default_oauth_role(redirect_uri, query)
             if actor == "owner":
-                oauth_csrf = _mint_upload_csrf()
+                oauth_csrf = _mint_upload_csrf(purpose="oauth", session_token=self.owner_cookie_token())
                 role_options = "".join(
                     f'<option value="{r}" {"selected" if r == default_role else ""}>{label}</option>'
                     for r, label in (
@@ -4684,67 +5089,78 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                         ("hermes", "Hermes Agent"),
                     )
                 )
+                session_label = "Omni Owner Session" if _omni_configured() else "Owner Session"
                 auth_body_html = (
-                    '<p style="color:#4ade80;font-size:14px">✅ Signed in via <strong>Omni Owner Session</strong>. Select the AI agent scope to grant this connector:</p>'
+                    f'<p>✅ Signed in via <strong>{session_label}</strong>. Select the AI agent scope to grant this connector:</p>'
                     '<input type="hidden" name="omni_session" value="1">'
                     f'<input type="hidden" name="csrf_token" value="{html.escape(oauth_csrf, quote=True)}">'
-                    f'<select name="role" style="width:100%;padding:11px;margin:10px 0;border-radius:6px;border:1px solid #475569;background:#020617;color:#fff;font-size:16px">{role_options}</select>'
+                    '<label for="oauth-role">Agent role</label>'
+                    f'<select id="oauth-role" name="role">{role_options}</select>'
                     '<button type="submit">Approve Access</button>'
                 )
             else:
                 parsed_cur = urllib.parse.urlsplit(self.path)
                 cur_oauth_target = "/oauth/authorize" + (f"?{parsed_cur.query}" if parsed_cur.query else "")
-                omni_href = f"/auth/start?next={urllib.parse.quote(cur_oauth_target, safe='')}"
+                if _omni_configured():
+                    signin_href = f"/auth/start?next={urllib.parse.quote(cur_oauth_target, safe='')}"
+                    signin_label = "🔐 Sign in with Omni to Approve Access"
+                    signin_intro = "Sign in with your <strong>Omni</strong> owner account to approve this MCP connector:"
+                else:
+                    signin_href = f"/login?next={urllib.parse.quote(cur_oauth_target, safe='')}"
+                    signin_label = "Sign in as Owner to Approve Access"
+                    signin_intro = "Sign in as the vault owner to approve this MCP connector, or paste an agent token below:"
                 auth_body_html = (
-                    '<p style="color:#cbd5e1;font-size:14px">Sign in with your <strong>Omni</strong> owner account to approve this MCP connector:</p>'
-                    f'<a href="{html.escape(omni_href, quote=True)}" style="display:block;text-align:center;text-decoration:none;width:100%;padding:12px;margin:12px 0;background:#38bdf8;color:#020617;border-radius:6px;font-weight:700;font-size:16px;box-sizing:border-box">🔐 Sign in with Omni to Approve Access</a>'
-                    '<details style="margin-top:16px;border-top:1px solid #334155;padding-top:10px">'
-                    '<summary style="color:#94a3b8;font-size:13px;cursor:pointer">Or paste an agent token directly</summary>'
-                    '<input type="password" name="token" placeholder="Paste MEMORY_CHATGPT_TOKEN or MEMORY_CLAUDE_TOKEN">'
-                    '<button type="submit" style="background:#334155;color:#f8fafc">Approve with Token</button>'
-                    '</details>'
+                    f"<p>{signin_intro}</p>"
+                    f'<a class="cta-btn" href="{html.escape(signin_href, quote=True)}">{signin_label}</a>'
+                    "<details>"
+                    "<summary>Or paste an agent token directly</summary>"
+                    '<label for="oauth-agent-token">Agent token</label>'
+                    '<input id="oauth-agent-token" type="password" name="token" placeholder="Paste MEMORY_CHATGPT_TOKEN or MEMORY_CLAUDE_TOKEN">'
+                    '<button class="secondary" type="submit">Approve with Token</button>'
+                    "</details>"
                 )
-            form_html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Authorize Vyn Memory MCP</title>
-<style>body{{background:#0f172a;color:#f8fafc;font-family:system-ui,-apple-system,sans-serif;display:flex;justify-content:center;padding:40px 16px;margin:0}}
-.card{{background:#1e293b;padding:24px 20px;border-radius:12px;border:1px solid #334155;max-width:430px;width:100%;box-sizing:border-box}}
-input{{width:100%;padding:11px;margin:10px 0;border-radius:6px;border:1px solid #475569;background:#020617;color:#fff;box-sizing:border-box;font-size:16px}}
-button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;border-radius:6px;font-weight:700;cursor:pointer;font-size:16px}}</style>
-</head><body><div class="card">
-<h2>🔑 Authorize Vyn Memory</h2>
-<p style="font-size:14px">Access will be sent to <strong>{html.escape(urllib.parse.urlsplit(redirect_uri).hostname or "", quote=True)}</strong> (client <code>{html.escape(client_id, quote=True)}</code>). Approve only if you started this connection there.</p>
-<form method="post" action="/oauth/authorize">
-  <input type="hidden" name="client_id" value="{html.escape(client_id, quote=True)}">
-  <input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}">
-  <input type="hidden" name="state" value="{html.escape(state, quote=True)}">
-  <input type="hidden" name="code_challenge" value="{html.escape(code_challenge, quote=True)}">
-  <input type="hidden" name="code_challenge_method" value="S256">
-  <input type="hidden" name="resource" value="{html.escape(resource, quote=True)}">
-  {auth_body_html}
-</form></div></body></html>"""
-            self.send_html(200, form_html, csp=OAUTH_CSP)
+            oauth_body = (
+                f'<p>Access will be sent to <strong>{html.escape(urllib.parse.urlsplit(redirect_uri).hostname or "", quote=True)}</strong> '
+                f'(client <code>{html.escape(client_id, quote=True)}</code>). Approve only if you started this connection there.</p>'
+                '<form method="post" action="/oauth/authorize">'
+                f'<input type="hidden" name="client_id" value="{html.escape(client_id, quote=True)}">'
+                f'<input type="hidden" name="redirect_uri" value="{html.escape(redirect_uri, quote=True)}">'
+                f'<input type="hidden" name="state" value="{html.escape(state, quote=True)}">'
+                f'<input type="hidden" name="code_challenge" value="{html.escape(code_challenge, quote=True)}">'
+                '<input type="hidden" name="code_challenge_method" value="S256">'
+                f'<input type="hidden" name="resource" value="{html.escape(resource, quote=True)}">'
+                f"{auth_body_html}"
+                "</form>"
+            )
+            self.send_html(200, render_card_page("Authorize Vyn Memory", oauth_body), csp=OAUTH_CSP)
             return
 
         if route in ("/device", "/apps"):
             if actor != "owner":
                 self.send_html(401, render_login_page(next_path=self.path))
                 return
+            sess_tok = self.owner_cookie_token()
             if route == "/apps":
-                self.send_html(200, render_apps_page(conn))
+                self.send_html(200, render_apps_page(conn, session_token=sess_tok))
+                return
+            req_code = (query.get("code") or [""])[0].strip().upper()
+            if not req_code:
+                self.send_html(200, render_device_lookup_page())
                 return
             with DB_LOCK:
                 row = conn.execute(
                     "SELECT * FROM device_codes WHERE user_code = ? AND actor = '' AND expires_at > ?",
-                    ((query.get("code") or [""])[0].strip().upper(), time.time()),
+                    (req_code, time.time()),
                 ).fetchone()
             if row:
-                self.send_html(200, render_device_page(row))
+                self.send_html(200, render_device_page(row, session_token=sess_tok))
             else:
-                self.send_html(404, render_card_page(
-                    "Login request not found",
-                    "<p>It expired or was already answered. Run <code>memory.py login</code> again.</p>",
-                ))
+                self.send_html(
+                    404,
+                    render_device_lookup_page(
+                        error_msg="Login code not found, expired, or already answered. Check your terminal or run memory.py login again."
+                    ),
+                )
             return
 
         if route == "/openapi.json":  # public: only the API shape, so ChatGPT Actions can import it
@@ -4763,24 +5179,24 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
 
         if route == "/download":
             if actor != "owner":
-                self.send_json(403, {"error": "Only the owner session can download original binary vault files."})
+                self.send_json(403, {"error": "Only the owner session can download original binary vault files."}, cors=False)
                 return
             rel = (query.get("path") or [""])[0].strip().lstrip("/")
             if not rel or rel.split("/")[0].lower() == "personal":
-                self.send_json(403, {"error": "Invalid or forbidden vault path"})
+                self.send_json(403, {"error": "Invalid or forbidden vault path"}, cors=False)
                 return
             try:
                 full = assert_safe_vault_path(VAULT_DIR / rel)
             except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
+                self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             if not full.is_file() or not full.name.lower().endswith(SUPPORTED_VAULT_EXTENSIONS):
-                self.send_json(404, {"error": "Vault document not found"})
+                self.send_json(404, {"error": "Vault document not found"}, cors=False)
                 return
             try:
                 data_bytes = read_vault_file(rel)[0]
             except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
+                self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             low_name = full.name.lower()
             safe_fname = re.sub(r"[^a-zA-Z0-9._-]", "_", full.name)
@@ -4823,6 +5239,17 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 val = (query.get("validity") or [""])[0]
                 inc = (query.get("include_history") or ["false"])[0].lower() in ("1", "true", "yes")
                 self.send_json(200, op_search(conn, query=q, scope=scope, category=cat, include_history=inc, validity=val))
+            except MemoryError as exc:
+                self.send_json(exc.status, {"error": str(exc)})
+            return
+
+        if route == "/api/v1/fact-check":
+            try:
+                stmt = (query.get("statement") or query.get("q") or [""])[0]
+                scope = (query.get("scope") or [""])[0]
+                subj = (query.get("subject") or [""])[0]
+                lim = _safe_int((query.get("limit") or ["8"])[0], "limit", default=8)
+                self.send_json(200, op_check_facts(conn, statement=stmt, scope=scope, subject=subj, limit=lim))
             except MemoryError as exc:
                 self.send_json(exc.status, {"error": str(exc)})
             return
@@ -4893,7 +5320,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 200,
                 {
                     "name": "vyn-memory",
-                    "version": "1.2.0",
+                    "version": "1.3.0",
                     "actor": actor,
                     "writable_scopes": writable_scopes_for(actor),
                     "transport": "streamable-http",
@@ -4906,8 +5333,9 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 self.send_json(
                     403,
                     {
-                        "error": "Agent tokens are restricted to MCP/API endpoints; sign in with Omni at /login to view the human HTML dashboard.",
+                        "error": "Agent tokens are restricted to MCP/API endpoints; sign in at /login to view the human HTML dashboard.",
                     },
+                    cors=False,
                 )
                 return
             page = render_dashboard_page(
@@ -4916,6 +5344,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 selected_note=(query.get("note") or [""])[0],
                 scope_filter=(query.get("scope") or [""])[0],
                 search_query=(query.get("q") or [""])[0],
+                session_token=self.owner_cookie_token(),
             )
             self.send_html(200, page)
             return
@@ -4939,22 +5368,28 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             same_origin_ok = self._is_same_origin_browser_post()
             upload_actor = actor if actor == "owner" else None
             used_cookie_auth = False
+            upload_cookie_tok = ""
             if not upload_actor and same_origin_ok:
                 for cand_tok in self._extract_cookie_tokens():
                     if resolve_actor_from_token(cand_tok, conn) == "owner":
                         upload_actor = "owner"
                         used_cookie_auth = True
+                        upload_cookie_tok = cand_tok
                         break
             if upload_actor != "owner":
                 _record_auth_failure(ip)
-                self.send_json(401, {"error": "Owner authentication required to upload files via browser."})
+                self.send_json(401, {"error": "Owner authentication required to upload files via browser."}, cors=False)
                 return
             try:
                 raw_mp = self.read_bounded_body(MAX_UPLOAD_BODY_BYTES)
                 fields, fname, fbytes = _parse_multipart_upload(raw_mp, self.headers.get("Content-Type", ""))
-                if used_cookie_auth and not _verify_upload_csrf(fields.get("csrf_token", "")):
+                if used_cookie_auth and not _verify_upload_csrf(
+                    fields.get("csrf_token", ""),
+                    purpose="upload",
+                    session_token=upload_cookie_tok,
+                ):
                     _record_auth_failure(ip)
-                    self.send_json(403, {"error": "Invalid or expired upload CSRF token. Reload the page and try again."})
+                    self.send_json(403, {"error": "Invalid or expired upload CSRF token. Reload the page and try again."}, cors=False)
                     return
                 res = op_upload_document(
                     conn,
@@ -4966,7 +5401,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     summary=fields.get("summary", ""),
                 )
             except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
+                self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             dest = f"/?scope={urllib.parse.quote(str(res['scope']))}&note={urllib.parse.quote(str(res['path']))}"
             self.send_response(303)
@@ -4975,16 +5410,58 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             self.end_headers()
             return
 
+        if route == "/facts":
+            owner = self.read_owner_form(purpose="facts")
+            if not owner:
+                return
+            form = owner[0]
+            action = (form.get("action") or [""])[0].strip().lower()
+            next_p = _sanitize_next_path((form.get("next") or [""])[0], default="/")
+            try:
+                if action == "add":
+                    op_remember_fact(
+                        conn,
+                        "owner",
+                        fact=(form.get("fact") or [""])[0],
+                        scope=(form.get("scope") or [DEFAULT_SCOPE])[0],
+                        subject=(form.get("subject") or [""])[0],
+                        category=(form.get("category") or ["fact"])[0],
+                    )
+                elif action == "forget":
+                    fid = _safe_int((form.get("fact_id") or ["0"])[0], "fact_id", default=0)
+                    op_forget_fact(
+                        conn,
+                        "owner",
+                        fact_id=fid,
+                        reason=(form.get("reason") or ["Retired by owner in web UI"])[0],
+                    )
+                else:
+                    raise MemoryError("Invalid fact action")
+            except MemoryError as exc:
+                self.send_html(
+                    exc.status,
+                    render_card_page(
+                        "Could not update fact",
+                        f'<p class="err-box">{html.escape(str(exc))}</p><p><a href="{html.escape(next_p, quote=True)}">Back to the vault</a></p>',
+                    ),
+                )
+                return
+            self.send_response(303)
+            self.send_header("Location", next_p)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            return
+
         if route == "/login":
             if not self._is_same_origin_browser_post():
                 _record_auth_failure(ip)
-                self.send_json(403, {"error": "Cross-origin sign-in form submissions are forbidden."})
+                self.send_json(403, {"error": "Cross-origin sign-in form submissions are forbidden."}, cors=False)
                 return
             try:
                 raw_form = self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace")
                 form = urllib.parse.parse_qs(raw_form)
             except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
+                self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             submitted_token = (form.get("token") or [""])[0].strip()
             next_p = _sanitize_next_path((form.get("next") or [f"/?scope={DEFAULT_SCOPE}"])[0])
@@ -4994,7 +5471,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                 msg = (
                     "Only MEMORY_OWNER_TOKEN can sign into the human browser dashboard (agent tokens are for MCP/API only)."
                     if resolved
-                    else "Invalid MEMORY_OWNER_TOKEN. Sign in with Omni above or check memory.env."
+                    else "Invalid MEMORY_OWNER_TOKEN. Check your server env file and try again."
                 )
                 self.send_html(401, render_login_page(next_path=next_p, error_msg=msg))
                 return
@@ -5051,15 +5528,20 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             parent = ""
             if submitted_token:
                 # Role tokens only (no db: sessions and OAuth tokens are not accepted here), and never the owner's:
-                # the owner approves through the Omni session below, so owner credentials never become OAuth tokens.
+                # the owner approves through the owner session below, so owner credentials never become OAuth tokens.
                 resolved = resolve_actor_from_token(submitted_token)
                 if resolved == "owner":
                     resolved = None
                 parent = "role:" + hashlib.sha256(submitted_token.encode()).hexdigest()
             elif (form.get("omni_session") or [""])[0].strip() == "1":
                 same_origin_ok = self._is_same_origin_browser_post()
-                csrf_ok = _verify_upload_csrf((form.get("csrf_token") or [""])[0])
-                email = self.owner_cookie_email()
+                pair = self._owner_cookie_pair()
+                sess_tok, email = pair if pair else ("", None)
+                csrf_ok = bool(email) and _verify_upload_csrf(
+                    (form.get("csrf_token") or [""])[0],
+                    purpose="oauth",
+                    session_token=sess_tok,
+                )
                 parent = "email:" + (email or "")
                 selected_role = (form.get("role") or ["claude"])[0].strip().lower()
                 if (
@@ -5071,7 +5553,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
                     resolved = selected_role
             if not resolved:
                 _record_auth_failure(ip)
-                self.send_html(401, "<h3>Unauthorized</h3><p>Sign in with Omni or provide a valid agent token.</p>", csp=OAUTH_CSP)
+                self.send_html(401, render_card_page("Unauthorized", "<p>Sign in as owner or provide a valid agent token.</p>"), csp=OAUTH_CSP)
                 return
             _clear_auth_failures(ip)
             state = (form.get("state") or [""])[0]
@@ -5257,7 +5739,9 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             with DB_LOCK:
                 _prune_oauth_tables(conn)
                 # ponytail: count only unanswered (actor = '') rows so denied/approved codes free their slot immediately
-                if conn.execute("SELECT COUNT(*) FROM device_codes WHERE actor = ''").fetchone()[0] >= MAX_PENDING_DEVICE_CODES:
+                total_pending = conn.execute("SELECT COUNT(*) FROM device_codes WHERE actor = ''").fetchone()[0]
+                ip_pending = conn.execute("SELECT COUNT(*) FROM device_codes WHERE actor = '' AND ip = ?", (ip,)).fetchone()[0]
+                if total_pending >= MAX_PENDING_DEVICE_CODES or ip_pending >= MAX_PENDING_DEVICE_CODES_PER_IP:
                     conn.commit()
                     self.send_json(429, {"error": "slow_down", "error_description": "Too many pending logins; try again later."})
                     return
@@ -5315,7 +5799,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             return
 
         if route == "/device":
-            owner = self.read_owner_form()
+            owner = self.read_owner_form(purpose="device")
             if not owner:
                 return
             form, email = owner
@@ -5339,7 +5823,7 @@ button{{width:100%;padding:11px;background:#38bdf8;color:#020617;border:none;bor
             return
 
         if route == "/apps":
-            owner = self.read_owner_form()
+            owner = self.read_owner_form(purpose="apps")
             if not owner:
                 return
             form = owner[0]

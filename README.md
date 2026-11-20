@@ -8,6 +8,8 @@ It keeps two things in step:
 
 - **Facts**: short statements in SQLite (`memory.db`, full-text search). A fact is
   valid from when it is saved until it is retired or replaced, and the history stays.
+  Agents can fact-check claims against active facts, retired history, and notes via
+  `memory_check_facts` / `memory.py check-fact`, and `remember` flags `potential_conflicts`.
 - **Notes**: an Obsidian vault of Markdown, PDF and DOCX files. Notes are indexed for
   search, `- [category] text #tag` lines become searchable observations, and
   `[[links]]` / `- relation [[Note]]` lines become a graph that `context` follows.
@@ -20,8 +22,8 @@ One Python file, standard library only (`pypdf` is optional, for PDF text).
 | :--- | :--- |
 | Agents that can run commands (Claude Code, Codex, Antigravity, Hermes) | the skill in `skills/vyn-memory/`: `memory.py` calls the REST API |
 | Apps that cannot (claude.ai, ChatGPT, phone apps) | MCP connector at `<your address>/mcp` (OAuth 2.1 + PKCE) or `/sse` |
-| You, in a browser | the dashboard at `<your address>/`, and **Connected apps** at `/apps` |
-| Anything else | REST API under `/api/v1/`, described at `/openapi.json` |
+| You, in a browser | the dashboard at `<your address>/` (browse, search, upload, add/retire AI facts), and **Connected apps** at `/apps` |
+| Anything else | REST API under `/api/v1/` (including `/api/v1/fact-check`), described at `/openapi.json` |
 
 The skill only loads its instructions when a task needs memory, so it costs far fewer
 tokens per request than an always-loaded MCP tool list.
@@ -47,7 +49,7 @@ and keep them in an env file only you can read, never in Git.
 | `MEMORY_SETTINGS` | path to your settings JSON (below) |
 | `MEMORY_BEHIND_CLOUDFLARE=1` | trust `CF-Connecting-IP` for rate limiting (only behind a Cloudflare tunnel) |
 | `MEMORY_OAUTH_REDIRECT_HOSTS` | hosts allowed to receive OAuth codes (default `claude.ai,claude.com,chatgpt.com,chat.openai.com`; loopback is always allowed) |
-| `OMNI_PUBLIC_URL`, `OMNI_INTERNAL_URL`, `OMNI_MEMORY_KEY`, `MEMORY_ADMIN_EMAILS` | optional sign-in through an Omni server; only the listed emails get in |
+| `OMNI_PUBLIC_URL`, `OMNI_INTERNAL_URL`, `OMNI_MEMORY_KEY`, `MEMORY_ADMIN_EMAILS` | optional sign-in through an Omni server; only the listed emails get in (when unset, `/login` opens directly to the owner-token form) |
 
 Put it behind HTTPS (a reverse proxy or a tunnel) before you expose it to the internet.
 
@@ -66,7 +68,7 @@ uses plain defaults: `shared`, `projects/<slug>` and `resources/books` are open 
 | `scope_aliases` | shorthands, e.g. `{"acme": "career/company/acme"}` |
 | `hermes` | `subagents` (profile names), `aliases`, `extra_write` (more scopes Hermes may write) |
 | `briefing_areas` | areas whose facts the briefing lists separately |
-| `dashboard` | sidebar groups and rules, scope pills, pinned notes, landing note, upload scopes |
+| `dashboard` | title, sidebar groups and rules, scope pills, pinned notes, landing note, upload scopes |
 
 Starter notes for your areas belong in your vault (or a template you copy into it), not in settings.
 
@@ -76,7 +78,7 @@ Starter notes for your areas belong in your vault (or a template you copy into i
 - Agents write only to the open scopes and to their own `agents/<name>` folder; Hermes
   profiles also share `agents/{hermes,decisions,gotchas,playbooks,research}`.
 - The owner (owner token, or an Omni sign-in for an email in `MEMORY_ADMIN_EMAILS`) can
-  write everywhere and is the only one who can open the dashboard and download files.
+  write everywhere and is the only one who can open the dashboard, add/retire facts from the web UI, and download files.
 - Connector logins (OAuth) stay valid only while the credential that approved them does: rotating an
   agent token, or removing an email from `MEMORY_ADMIN_EMAILS`, ends them. Owner credentials cannot be
   turned into OAuth tokens, and browser sessions opened with the owner token end when it changes.
@@ -87,8 +89,9 @@ Starter notes for your areas belong in your vault (or a template you copy into i
   and OS that asked for it. **Connected apps** (`/apps`) lists every device login, connector login and
   browser session with when it was added and last used, and revokes any of them at once.
 - The role tokens are for apps on the server itself; rotate one by changing it and restarting.
-- Notes render with a strict Content-Security-Policy (no scripts), uploads and request
-  bodies have size limits, failed sign-ins are rate limited, and paths cannot leave the vault.
+- Notes render with a strict Content-Security-Policy (no scripts), browser forms use session- and
+  purpose-bound CSRF tokens, uploads and request bodies have size limits, failed sign-ins and
+  device codes are rate limited, and paths cannot leave the vault.
 
 ## Use it from another machine
 
@@ -101,13 +104,12 @@ Starter notes for your areas belong in your vault (or a template you copy into i
    ```
 3. Log in once from each app's copy, so the server knows which app it is:
    ```sh
-   export MEMORY_HUB_URL=https://memory.example.com
-   python3 ~/.claude/skills/vyn-memory/memory.py login   # Claude Code
-   python3 ~/.codex/skills/vyn-memory/memory.py login    # Codex
+   python3 ~/.claude/skills/vyn-memory/memory.py login https://memory.example.com   # Claude Code
+   python3 ~/.codex/skills/vyn-memory/memory.py login https://memory.example.com    # Codex
    ```
-   It prints a link and a code. Open the link on any device where you are signed in as the owner,
+   It prints a link and a code. Open the link (or `/device`) on any device where you are signed in as the owner,
    check the code matches, and approve. The token is saved to `~/.config/vyn-memory.env` (mode 600).
-4. Check: `python3 ~/.claude/skills/vyn-memory/memory.py search test`.
+4. Check: `python3 ~/.claude/skills/vyn-memory/memory.py search test` or `check-fact "release process"`.
 
 `git -C ~/vyn-memory pull` updates the skill.
 

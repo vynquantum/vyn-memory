@@ -31,7 +31,26 @@ HOST_MEMORY_ENV_CANDIDATES = tuple(
     for p in (os.environ.get("MEMORY_ENV_FILE", ""), str(Path.home() / ".config" / "vyn-memory.env"))
     if p
 )
-IS_CONTAINER = Path("/opt/data").exists() or bool(os.environ.get("MEMORY_HERMES_TOKEN"))
+IS_CONTAINER = (
+    Path("/.dockerenv").exists()
+    or bool(os.environ.get("HERMES_HOME"))
+    or bool(os.environ.get("MEMORY_HERMES_TOKEN"))
+)
+
+
+def _validate_hub_url(raw_url: str) -> str:
+    cleaned = (raw_url or "").strip().rstrip("/")
+    parsed = urllib.parse.urlsplit(cleaned)
+    scheme = parsed.scheme.lower()
+    host = (parsed.hostname or "").lower()
+    if scheme == "https" and host:
+        return cleaned
+    if scheme == "http" and host in ("127.0.0.1", "localhost", "::1", "vyn-memory"):
+        return cleaned
+    raise ValueError(
+        f"Refusing insecure MEMORY_HUB_URL {cleaned!r}: use https:// for remote servers "
+        "(http:// is allowed only for localhost/127.0.0.1/::1/vyn-memory)."
+    )
 
 
 def detect_hermes_subagent(explicit: str = "") -> str:
@@ -81,10 +100,11 @@ def resolve_token_and_mode() -> tuple[str, bool]:
     env_hermes = os.environ.get("MEMORY_HERMES_TOKEN", "").strip()
     if env_hermes:
         return env_hermes, True
-    for candidate in (HOME / ".env", Path("/opt/data/.env")):
-        found = _read_key_from_env_file(candidate, "MEMORY_HERMES_TOKEN")
-        if found:
-            return found, True
+    if IS_CONTAINER:
+        for candidate in (HOME / ".env", Path("/opt/data/.env")):
+            found = _read_key_from_env_file(candidate, "MEMORY_HERMES_TOKEN")
+            if found:
+                return found, True
     script_str = str(SCRIPT_PATH)
     actor_env = os.environ.get("MEMORY_ACTOR", "").strip().lower()
     preferred_keys = ["MEMORY_ANTIGRAVITY_TOKEN", "MEMORY_CLAUDE_TOKEN", "MEMORY_CHATGPT_TOKEN"]
@@ -96,7 +116,7 @@ def resolve_token_and_mode() -> tuple[str, bool]:
         val = os.environ.get(key, "").strip() or _read_host_memory_key(key)
         if val:
             return val, False
-    raise ValueError("No MEMORY_*_TOKEN found in environment or memory.env")
+    raise ValueError("No MEMORY_*_TOKEN found in environment or ~/.config/vyn-memory.env (run 'memory.py login <url>')")
 
 
 def resolve_token() -> str:
@@ -104,14 +124,21 @@ def resolve_token() -> str:
     return tok
 
 
-def _send(path: str, data: bytes | None = None, subagent: str = "", auth: bool = True) -> dict[str, object]:
+def _send(
+    path: str,
+    data: bytes | None = None,
+    subagent: str = "",
+    auth: bool = True,
+    base_url: str = "",
+) -> dict[str, object]:
+    hub_url = _validate_hub_url(base_url or DEFAULT_URL)
     headers = {"User-Agent": "vyn-memory-cli/1", "Content-Type": "application/json; charset=utf-8"}
     if auth:
         tok, is_hermes = resolve_token_and_mode()
         headers["Authorization"] = f"Bearer {tok}"
         if is_hermes:
             headers["X-Hermes-Subagent"] = detect_hermes_subagent(subagent)
-    req = urllib.request.Request(f"{DEFAULT_URL}{path}", data=data, headers=headers, method="POST" if data else "GET")
+    req = urllib.request.Request(f"{hub_url}{path}", data=data, headers=headers, method="POST" if data else "GET")
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -129,8 +156,20 @@ def api_get(path: str, params: dict[str, object] | None = None, subagent: str = 
     return _send(path + ("?" + urllib.parse.urlencode(clean) if clean else ""), subagent=subagent)
 
 
-def api_post(path: str, payload: dict[str, object], subagent: str = "", auth: bool = True) -> dict[str, object]:
-    return _send(path, json.dumps(payload, ensure_ascii=False).encode("utf-8"), subagent=subagent, auth=auth)
+def api_post(
+    path: str,
+    payload: dict[str, object],
+    subagent: str = "",
+    auth: bool = True,
+    base_url: str = "",
+) -> dict[str, object]:
+    return _send(
+        path,
+        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+        subagent=subagent,
+        auth=auth,
+        base_url=base_url,
+    )
 
 
 def detect_app() -> str:
@@ -145,18 +184,19 @@ def detect_app() -> str:
     return "memory.py"
 
 
-def login() -> dict[str, object]:
+def login(url: str = "") -> dict[str, object]:
     """Device login: the owner approves this device in a browser, and its own token lands in the token file."""
+    hub_url = _validate_hub_url(url or DEFAULT_URL)
     info = {"app": detect_app(), "user": getpass.getuser(), "host": platform.node(),
             "os": f"{platform.system()} {platform.release()} {platform.machine()}".strip()}
-    start = api_post("/device/code", info, auth=False)
+    start = api_post("/device/code", info, auth=False, base_url=hub_url)
     print(f"Open {start['verification_uri_complete']}\nand approve code {start['user_code']} "
           "(it must match the page).", file=sys.stderr, flush=True)
     deadline = time.time() + float(start["expires_in"])
     while time.time() < deadline:
         time.sleep(float(start["interval"]))
         try:
-            got = api_post("/device/token", {"device_code": start["device_code"]}, auth=False)
+            got = api_post("/device/token", {"device_code": start["device_code"]}, auth=False, base_url=hub_url)
         except ValueError as exc:
             if "authorization_pending" in str(exc):
                 continue
@@ -168,9 +208,9 @@ def login() -> dict[str, object]:
         target.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write("\n".join([*kept, f"MEMORY_HUB_URL={DEFAULT_URL}", f"{key}={got['access_token']}"]) + "\n")
+            fh.write("\n".join([*kept, f"MEMORY_HUB_URL={hub_url}", f"{key}={got['access_token']}"]) + "\n")
         os.chmod(target, 0o600)
-        return {"ok": True, "app": info["app"], "acts_as": got["actor"], "saved_to": str(target)}
+        return {"ok": True, "app": info["app"], "acts_as": got["actor"], "hub_url": hub_url, "saved_to": str(target)}
     raise ValueError("Login was not approved within 10 minutes; run login again.")
 
 
@@ -179,18 +219,25 @@ def main() -> int:
     parser.add_argument("--subagent", default="", help="Override Hermes sub-agent name (auto-detected from profile HOME)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("login", help="Get this device's own token: approve it in the browser, saved to the token file")
+    p_login = sub.add_parser("login", help="Get this device's own token: approve it in the browser, saved to the token file")
+    p_login.add_argument("url", nargs="?", default="", help="Optional memory server URL (e.g. https://memory.example.com)")
 
     p_brief = sub.add_parser("briefing", help="Get unified cross-agent memory briefing")
     p_brief.add_argument("--project", default="")
     p_brief.add_argument("--scope", default="")
 
-    p_search = sub.add_parser("search", help="Search AI facts and Obsidian vault study notes")
+    p_search = sub.add_parser("search", help="Search AI facts and Obsidian vault notes")
     p_search.add_argument("query", nargs="?", default="")
     p_search.add_argument("--scope", default="")
     p_search.add_argument("--category", default="")
     p_search.add_argument("--validity", default="valid", choices=["valid", "invalid", "all"])
     p_search.add_argument("--history", action="store_true", help="Include superseded and invalidated facts (same as --validity all)")
+
+    p_check = sub.add_parser("check-fact", help="Fact-check a claim or topic against active facts, history, and vault notes")
+    p_check.add_argument("statement", nargs="?", default="", help="Claim or question to verify against memory")
+    p_check.add_argument("--scope", default="")
+    p_check.add_argument("--subject", default="")
+    p_check.add_argument("--limit", type=int, default=8)
 
     p_rem = sub.add_parser("remember", help="Record an atomic AI-to-AI temporal fact")
     p_rem.add_argument("fact", help="Self-contained fact text")
@@ -240,7 +287,7 @@ def main() -> int:
     args = parser.parse_args()
     subagent = args.subagent
     if args.command == "login":
-        res = login()
+        res = login(args.url)
     elif args.command == "briefing":
         res = api_get("/api/v1/briefing", {"project": args.project, "scope": args.scope}, subagent=subagent)
     elif args.command == "search":
@@ -253,6 +300,17 @@ def main() -> int:
                 "category": args.category,
                 "validity": validity,
                 "include_history": "true" if validity == "all" else "false",
+            },
+            subagent=subagent,
+        )
+    elif args.command == "check-fact":
+        res = api_get(
+            "/api/v1/fact-check",
+            {
+                "statement": args.statement,
+                "scope": args.scope,
+                "subject": args.subject,
+                "limit": args.limit,
             },
             subagent=subagent,
         )

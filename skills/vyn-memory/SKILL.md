@@ -18,7 +18,7 @@ It never edits files itself, so it works the same from Hermes, the server or a l
   `http://vyn-memory:8770` inside Hermes and `http://127.0.0.1:8770` elsewhere.
 - **Who you are:** each app acts as a role (`claude`, `chatgpt`, `antigravity`, `hermes`).
   Hermes and the server's own apps have their tokens already. On another machine, run
-  `M login` once (with `MEMORY_HUB_URL` set): the owner approves it in a browser and this
+  `M login https://<your-server>` once: the owner approves the code in a browser and this
   device's own token is saved to `~/.config/vyn-memory.env`. Never print a token or put it on a command line.
 - **Phone apps** (claude.ai, ChatGPT) cannot run commands; they use the MCP connector at
   `<server address>/mcp`, which reaches the same server.
@@ -39,8 +39,13 @@ A server may add its own areas (for example `career/...`); `briefing` lists the 
 | `personal/*` | nobody | never reachable through this skill |
 
 Fact categories: `fact`, `decision`, `preference`, `progress`, `strength`, `weakness`, `question`.
-Saving a `progress`/`strength`/`weakness` fact with the same `--subject` in the same scope
-automatically retires the older one, so history stays without contradictions.
+
+## Fact-checking & memory hygiene
+
+1. **Check before saving or asserting:** run `M check-fact "<claim>" [--scope <scope>] [--subject <slug>]` (or MCP `memory_check_facts`) whenever a claim might already exist, might have changed, or was retired earlier. It returns `matching_active_facts`, `matching_history_facts`, `related_notes`, and reconciliation guidance.
+2. **Use a stable `--subject` slug for changing state:** passing `--subject <slug>` (for example `--subject release-process`) automatically supersedes older active facts on that subject in the same scope while preserving history.
+3. **Resolve `potential_conflicts`:** `remember` flags other active facts in the same scope that share keywords. If an older fact is now wrong or superseded, retire it immediately with `M forget <id> --reason "<why>"`.
+4. **Never rely on invalidated facts as current truth:** check `is_valid` / `status` before quoting history.
 
 ## Commands
 
@@ -49,6 +54,7 @@ automatically retires the older one, so history stays without contradictions.
 
 ```sh
 M briefing --scope projects/<slug>     # start of a session: facts + the 40 newest notes of that scope
+M check-fact "<claim>" [--scope <scope>] [--subject <slug>]   # verify against active facts, history & notes
 M search "<words>" [--scope <scope>] [--validity valid|invalid|all]
 M read-note <path.md>                  # one note in full
 M context <path-or-subject> --depth 1  # a note plus what links to it, with related facts
@@ -62,7 +68,7 @@ M list-notes [--scope <scope>]         # the whole index; large, prefer search
 In a note, `- [category] text #tag` lines are indexed as searchable observations, and
 `- relation [[Other Note]]` lines become links that `context` follows.
 
-**Keep answers small:** use `search` or `read-note` for specifics; `list-notes` without a scope
+**Keep answers small:** use `check-fact`, `search`, or `read-note` for specifics; `list-notes` without a scope
 returns every note in the vault.
 
 **Installing:** see the server repository's README → "Use it from another machine".

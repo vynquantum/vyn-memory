@@ -5,15 +5,18 @@ from __future__ import annotations
 import base64
 import hashlib
 import importlib.util
+import io
 import json
 import os
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
@@ -775,9 +778,12 @@ class TestVynMemory(unittest.TestCase):
             self.assertEqual(ctx.exception.code, 303)
             ctx.exception.close()
             self.assertEqual(call("/api/v1/briefing", headers=auth)[0], 401)
-            # A denied request gets no token.
+            # A denied request gets no token; /apps CSRF token cannot be reused on /device (purpose-scoped).
             start = json.loads(call("/device/code", {"app": "Claude Code"})[1])
-            call("/device", {"code": start["user_code"], "role": "claude", "decision": "deny", "csrf_token": csrf}, owner)
+            self.assertEqual(call("/device", {"code": start["user_code"], "role": "claude", "decision": "deny", "csrf_token": csrf}, owner)[0], 403)
+            deny_page = call(f"/device?code={start['user_code']}", headers=owner)[1]
+            device_csrf = deny_page.split('name="csrf_token" value="')[1].split('"')[0]
+            call("/device", {"code": start["user_code"], "role": "claude", "decision": "deny", "csrf_token": device_csrf}, owner)
             self.assertEqual(json.loads(call("/device/token", {"device_code": start["device_code"]})[1])["error"], "access_denied")
         finally:
             self.srv._clear_auth_failures("127.0.0.1")
@@ -1107,9 +1113,9 @@ class TestVynMemory(unittest.TestCase):
             self.assertIn("Example engineer working on storage drivers", docx_note["content"])
             self.assertIn("| Example Corp | BSP & IOMMU |", docx_note["content"])
 
-            # 4. Browser multipart/form-data POST /upload and GET /download with owner session cookie + CSRF token
+            # 4. Browser multipart/form-data POST /upload and GET /download with owner session cookie + session-bound CSRF token
             sess_tok = self.srv._mint_web_session(self.conn, "owner@example.com")
-            csrf_tok = self.srv._mint_upload_csrf()
+            csrf_tok = self.srv._mint_upload_csrf(purpose="upload", session_token=sess_tok)
             boundary = "----VynTestBoundary987654"
             mp_body = (
                 f"--{boundary}\r\n"
@@ -1432,9 +1438,10 @@ class TestVynMemory(unittest.TestCase):
             self.assertEqual(ctx_b.exception.code, 400)
             ctx_b.exception.close()
 
-            # Denying a pending device_code immediately frees its pending slot
+            # Per-IP pending device_code cap prevents a single IP from exhausting global slots,
+            # and denying a pending device_code immediately frees its pending slot
             codes = []
-            for i in range(self.srv.MAX_PENDING_DEVICE_CODES):
+            for i in range(self.srv.MAX_PENDING_DEVICE_CODES_PER_IP):
                 r_dc = urllib.request.Request(
                     f"{base}/device/code",
                     data=json.dumps({"app": "Codex", "host": f"h{i}"}).encode(),
@@ -1443,8 +1450,20 @@ class TestVynMemory(unittest.TestCase):
                 )
                 with urllib.request.urlopen(r_dc) as resp:
                     codes.append(json.loads(resp.read().decode()))
+            # Next request from the same IP is throttled with 429
+            r_dc_over = urllib.request.Request(
+                f"{base}/device/code",
+                data=b'{"app":"Codex"}',
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_over:
+                urllib.request.urlopen(r_dc_over)
+            self.assertEqual(ctx_over.exception.code, 429)
+            ctx_over.exception.close()
+
             sess = self.srv._mint_web_session(self.conn, self.srv.owner_session_email())
-            csrf = self.srv._mint_upload_csrf()
+            csrf = self.srv._mint_upload_csrf(purpose="device", session_token=sess)
             deny_req = urllib.request.Request(
                 f"{base}/device",
                 data=urllib.parse.urlencode({"code": codes[0]["user_code"], "csrf_token": csrf, "role": "chatgpt", "decision": "deny"}).encode(),
@@ -1457,18 +1476,318 @@ class TestVynMemory(unittest.TestCase):
             )
             with urllib.request.urlopen(deny_req) as resp:
                 self.assertEqual(resp.status, 200)
-            r_dc21 = urllib.request.Request(
+            r_dc_freed = urllib.request.Request(
                 f"{base}/device/code",
                 data=b'{"app":"Codex"}',
                 headers={"Content-Type": "application/json"},
                 method="POST",
             )
-            with urllib.request.urlopen(r_dc21) as resp21:
-                self.assertEqual(resp21.status, 200)
+            with urllib.request.urlopen(r_dc_freed) as resp_freed:
+                self.assertEqual(resp_freed.status, 200)
         finally:
             self.srv._clear_auth_failures("127.0.0.1")
             httpd.shutdown()
             httpd.server_close()
+
+    def test_fact_checking_and_web_fact_management(self) -> None:
+        # 1. op_remember_fact flags potential_conflicts for other active facts in the same scope
+        f1 = self.srv.op_remember_fact(
+            self.conn,
+            "claude",
+            fact="Production deploys use blue-green cutover on Tuesdays.",
+            scope="shared",
+            subject="deploy-cadence",
+            category="decision",
+        )
+        self.assertEqual(f1["potential_conflicts"], [])
+
+        f2 = self.srv.op_remember_fact(
+            self.conn,
+            "chatgpt",
+            fact="Production deploys happen on Fridays after QA freeze.",
+            scope="shared",
+            subject="release-window",
+            category="decision",
+        )
+        self.assertTrue(any(c["id"] == f1["fact"]["id"] for c in f2["potential_conflicts"]))
+
+        # Superseding deploy-cadence moves f1 into history
+        f3 = self.srv.op_remember_fact(
+            self.conn,
+            "claude",
+            fact="Production deploys use rolling updates on Wednesdays.",
+            scope="shared",
+            subject="deploy-cadence",
+            category="decision",
+        )
+        self.assertIn(f1["fact"]["id"], f3["superseded_ids"])
+
+        # 2. op_check_facts returns active matches, retired history, related notes, and guidance
+        self.srv.op_write_note(
+            self.conn,
+            "claude",
+            path="shared/deploy-runbook.md",
+            content="# Deploy Runbook\n\nProduction deploys run via rolling updates on Wednesdays.\n",
+            scope="shared",
+        )
+        chk = self.srv.op_check_facts(self.conn, statement="Production deploys on Tuesdays", scope="shared", subject="deploy-cadence")
+        self.assertTrue(any(f["id"] == f3["fact"]["id"] for f in chk["matching_active_facts"]))
+        self.assertTrue(any(f["id"] == f1["fact"]["id"] for f in chk["matching_history_facts"]))
+        self.assertTrue(any(n["path"] == "shared/deploy-runbook.md" for n in chk["related_notes"]))
+        self.assertIn("active fact(s)", chk["guidance"])
+
+        # 3. MCP memory_check_facts tool + REST /api/v1/fact-check + OpenAPI + Web UI POST /facts + /device lookup
+        httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+        httpd.db = self.conn  # type: ignore[attr-defined]
+        port = httpd.server_address[1]
+        thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+        thread.start()
+        base = f"http://127.0.0.1:{port}"
+        try:
+            # OpenAPI includes /api/v1/fact-check
+            with urllib.request.urlopen(f"{base}/openapi.json") as resp:
+                oa = json.loads(resp.read().decode())
+            self.assertIn("/api/v1/fact-check", oa["paths"])
+
+            # REST GET /api/v1/fact-check
+            fc_req = urllib.request.Request(
+                f"{base}/api/v1/fact-check?statement=Production+deploys&scope=shared",
+                headers={"Authorization": "Bearer tok-claude-test"},
+            )
+            with urllib.request.urlopen(fc_req) as resp:
+                fc_data = json.loads(resp.read().decode())
+            self.assertGreaterEqual(len(fc_data["matching_active_facts"]), 1)
+
+            # MCP tools/call memory_check_facts
+            mcp_req = urllib.request.Request(
+                f"{base}/mcp",
+                data=json.dumps({
+                    "jsonrpc": "2.0",
+                    "id": 91,
+                    "method": "tools/call",
+                    "params": {
+                        "name": "memory_check_facts",
+                        "arguments": {"statement": "Production deploys", "scope": "shared", "subject": "deploy-cadence"},
+                    },
+                }).encode("utf-8"),
+                headers={"Authorization": "Bearer tok-claude-test", "Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(mcp_req) as resp:
+                mcp_res = json.loads(resp.read().decode())
+            self.assertFalse(mcp_res["result"]["isError"])
+            tool_payload = json.loads(mcp_res["result"]["content"][0]["text"])
+            self.assertTrue(any(f["id"] == f3["fact"]["id"] for f in tool_payload["matching_active_facts"]))
+
+            # Owner Web UI: GET /device without ?code= renders lookup form (200) instead of 404
+            sess_tok = self.srv._mint_web_session(self.conn, self.srv.owner_session_email())
+            owner_hdrs = {"Cookie": f"__Host-vyn_memory_token={sess_tok}", "Sec-Fetch-Site": "same-origin"}
+            with urllib.request.urlopen(urllib.request.Request(f"{base}/device", headers=owner_hdrs)) as resp:
+                self.assertEqual(resp.status, 200)
+                dev_lookup = resp.read().decode()
+            self.assertIn('name="code"', dev_lookup)
+
+            # GET /apps shows connect guide
+            with urllib.request.urlopen(urllib.request.Request(f"{base}/apps", headers=owner_hdrs)) as resp:
+                apps_html = resp.read().decode()
+            self.assertIn("memory.py login", apps_html)
+            self.assertIn("/mcp", apps_html)
+
+            # Owner Web UI POST /facts (add + retire) with session-bound purpose="facts" CSRF
+            class NoRedirect(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):
+                    return None
+
+            no_redir = urllib.request.build_opener(NoRedirect)
+            bad_csrf = self.srv._mint_upload_csrf(purpose="upload", session_token=sess_tok)
+            bad_fact_req = urllib.request.Request(
+                f"{base}/facts",
+                data=urllib.parse.urlencode({
+                    "csrf_token": bad_csrf,
+                    "action": "add",
+                    "scope": "shared",
+                    "subject": "ui-fact",
+                    "fact": "Should be rejected due to wrong CSRF purpose.",
+                }).encode("utf-8"),
+                headers={**owner_hdrs, "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_bad:
+                no_redir.open(bad_fact_req)
+            self.assertEqual(ctx_bad.exception.code, 403)
+            ctx_bad.exception.close()
+
+            facts_csrf = self.srv._mint_upload_csrf(purpose="facts", session_token=sess_tok)
+            add_fact_req = urllib.request.Request(
+                f"{base}/facts",
+                data=urllib.parse.urlencode({
+                    "csrf_token": facts_csrf,
+                    "action": "add",
+                    "scope": "shared",
+                    "subject": "ui-fact",
+                    "category": "decision",
+                    "fact": "Added directly from owner web UI.",
+                    "next": "/?scope=shared",
+                }).encode("utf-8"),
+                headers={**owner_hdrs, "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_add:
+                no_redir.open(add_fact_req)
+            self.assertEqual(ctx_add.exception.code, 303)
+            ctx_add.exception.close()
+
+            found_ui = self.srv.op_check_facts(self.conn, subject="ui-fact", scope="shared")
+            self.assertEqual(len(found_ui["matching_active_facts"]), 1)
+            ui_fact_id = found_ui["matching_active_facts"][0]["id"]
+
+            retire_req = urllib.request.Request(
+                f"{base}/facts",
+                data=urllib.parse.urlencode({
+                    "csrf_token": facts_csrf,
+                    "action": "forget",
+                    "fact_id": str(ui_fact_id),
+                    "reason": "Superseded during review",
+                    "next": "/?scope=shared",
+                }).encode("utf-8"),
+                headers={**owner_hdrs, "Content-Type": "application/x-www-form-urlencoded"},
+                method="POST",
+            )
+            with self.assertRaises(urllib.error.HTTPError) as ctx_ret:
+                no_redir.open(retire_req)
+            self.assertEqual(ctx_ret.exception.code, 303)
+            ctx_ret.exception.close()
+
+            after_retire = self.srv.op_check_facts(self.conn, subject="ui-fact", scope="shared")
+            self.assertEqual(after_retire["matching_active_facts"], [])
+            self.assertEqual(len(after_retire["matching_history_facts"]), 1)
+            self.assertEqual(after_retire["matching_history_facts"][0]["invalidated_reason"], "Superseded during review")
+        finally:
+            self.srv._clear_auth_failures("127.0.0.1")
+            httpd.shutdown()
+            httpd.server_close()
+
+    def test_security_hardening_followup(self) -> None:
+        # 1. CSRF tokens reject cross-purpose, cross-session, and future timestamps
+        tok_a = self.srv._mint_upload_csrf(purpose="upload", session_token="sess-A")
+        self.assertTrue(self.srv._verify_upload_csrf(tok_a, purpose="upload", session_token="sess-A"))
+        self.assertFalse(self.srv._verify_upload_csrf(tok_a, purpose="device", session_token="sess-A"))
+        self.assertFalse(self.srv._verify_upload_csrf(tok_a, purpose="upload", session_token="sess-B"))
+        future_tok = self.srv._mint_upload_csrf(now_ts=time.time() + 3600, purpose="upload", session_token="sess-A")
+        self.assertFalse(self.srv._verify_upload_csrf(future_tok, purpose="upload", session_token="sess-A"))
+
+        # 2. normalize_scope is idempotent and owner can write daily/inbox
+        for raw in ("shared", "projects/alpha", "career", "career/embedded/linux", "agents/claude", "daily", "inbox"):
+            once = self.srv.normalize_scope(raw)
+            self.assertEqual(self.srv.normalize_scope(once), once)
+        self.assertIn("daily", self.srv.writable_scopes_for("owner"))
+        self.assertIn("inbox", self.srv.writable_scopes_for("owner"))
+
+        # 3. Cross-agent writes are denied, and explicit_scope cannot place a note in a nested child scope denied to the actor
+        with self.assertRaises(self.srv.MemoryPermissionError):
+            self.srv.op_write_note(
+                self.conn,
+                "claude",
+                path="agents/chatgpt/sneaky.md",
+                content="# Sneaky\n",
+            )
+        orig_extra = self.srv.HERMES_EXTRA_WRITE
+        try:
+            self.srv.HERMES_EXTRA_WRITE = (*orig_extra, "business")
+            with self.assertRaises(self.srv.MemoryPermissionError):
+                self.srv.op_write_note(
+                    self.conn,
+                    "hermes",
+                    path="secret/file.md",
+                    content="# Secret\n",
+                    scope="business",
+                )
+        finally:
+            self.srv.HERMES_EXTRA_WRITE = orig_extra
+
+        # 4. DOCX ZIP entry count cap rejects oversized central directories
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("word/document.xml", "<w:document xmlns:w='http://schemas.openxmlformats.org/wordprocessingml/2006/main'><w:body><w:p><w:r><w:t>ok</w:t></w:r></w:p></w:body></w:document>")
+            for i in range(6):
+                zf.writestr(f"extra/{i}.txt", "x")
+        orig_cap = self.srv.MAX_DOCX_ZIP_ENTRIES
+        try:
+            self.srv.MAX_DOCX_ZIP_ENTRIES = 5
+            with self.assertRaises(self.srv.MemoryError):
+                self.srv.op_upload_document(self.conn, "claude", filename="many.docx", raw_bytes=buf.getvalue(), scope="shared")
+        finally:
+            self.srv.MAX_DOCX_ZIP_ENTRIES = orig_cap
+
+        # 5. render_login_page adapts when OMNI_PUBLIC_URL is unset, and /auth/start does not pollute web_auth_states
+        old_omni_env = os.environ.pop("OMNI_PUBLIC_URL", None)
+        old_omni_mod = self.srv.OMNI_PUBLIC_URL
+        try:
+            self.srv.OMNI_PUBLIC_URL = ""
+            login_no_omni = self.srv.render_login_page()
+            self.assertNotIn("Sign in with Omni", login_no_omni)
+            self.assertIn('id="owner-token"', login_no_omni)
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+            httpd.db = self.conn  # type: ignore[attr-defined]
+            port = httpd.server_address[1]
+            thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+            thread.start()
+            base = f"http://127.0.0.1:{port}"
+            try:
+                before_states = self.conn.execute("SELECT COUNT(*) FROM web_auth_states").fetchone()[0]
+                with self.assertRaises(urllib.error.HTTPError) as ctx_s:
+                    urllib.request.urlopen(f"{base}/auth/start")
+                self.assertEqual(ctx_s.exception.code, 404)
+                ctx_s.exception.close()
+                after_states = self.conn.execute("SELECT COUNT(*) FROM web_auth_states").fetchone()[0]
+                self.assertEqual(before_states, after_states)
+
+                # Origin: null without Sec-Fetch-Site is rejected on cookie-authenticated POST /upload
+                sess = self.srv._mint_web_session(self.conn, self.srv.owner_session_email())
+                csrf = self.srv._mint_upload_csrf(purpose="upload", session_token=sess)
+                bnd = "----NullOriginTest"
+                body = (
+                    f"--{bnd}\r\nContent-Disposition: form-data; name=\"csrf_token\"\r\n\r\n{csrf}\r\n"
+                    f"--{bnd}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.md\"\r\n\r\n# Hi\r\n--{bnd}--\r\n"
+                ).encode()
+                req_null = urllib.request.Request(
+                    f"{base}/upload",
+                    data=body,
+                    headers={
+                        "Cookie": f"__Host-vyn_memory_token={sess}",
+                        "Origin": "null",
+                        "Content-Type": f"multipart/form-data; boundary={bnd}",
+                    },
+                    method="POST",
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_null:
+                    urllib.request.urlopen(req_null)
+                self.assertEqual(ctx_null.exception.code, 401)
+                self.assertIsNone(ctx_null.exception.headers.get("Access-Control-Allow-Origin"))
+                ctx_null.exception.close()
+            finally:
+                self.srv._clear_auth_failures("127.0.0.1")
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            self.srv.OMNI_PUBLIC_URL = old_omni_mod
+            if old_omni_env is not None:
+                os.environ["OMNI_PUBLIC_URL"] = old_omni_env
+
+        # 6. CLI memory.py rejects remote http:// URLs while allowing https:// and loopback http://
+        cli_spec = importlib.util.spec_from_file_location(
+            "vyn_memory_cli_test",
+            Path(__file__).resolve().parent / "skills" / "vyn-memory" / "memory.py",
+        )
+        assert cli_spec and cli_spec.loader
+        cli_mod = importlib.util.module_from_spec(cli_spec)
+        cli_spec.loader.exec_module(cli_mod)
+        self.assertEqual(cli_mod._validate_hub_url("https://memory.example.com/"), "https://memory.example.com")
+        self.assertEqual(cli_mod._validate_hub_url("http://127.0.0.1:8770"), "http://127.0.0.1:8770")
+        self.assertEqual(cli_mod._validate_hub_url("http://vyn-memory:8770"), "http://vyn-memory:8770")
+        with self.assertRaises(ValueError):
+            cli_mod._validate_hub_url("http://memory.example.com")
 
 
 if __name__ == "__main__":
