@@ -22,6 +22,12 @@ It never edits files itself, so it works the same from Hermes, the server or a l
   device's own token is saved to `~/.config/vyn-memory.env`. Never print a token or put it on a command line.
 - **Phone apps** (claude.ai, ChatGPT) cannot run commands; they use the MCP connector at
   `<server address>/mcp`, which reaches the same server.
+  For ChatGPT's custom MCP form set **Connection** to the exact HTTPS address
+  (`https://<your-server>/mcp` — plain `http://` is rejected and is not redirected) and
+  **Authentication** to **OAuth**, not "No authentication" (the server answers `/mcp` with a
+  `401` OAuth challenge). Leave advanced OAuth fields on auto-discovery; on first use approve
+  the browser sign-in with `MEMORY_OWNER_TOKEN` and choose the `chatgpt` role. DCR callbacks on
+  `chatgpt.com` and `chat.openai.com` are already allowlisted.
 
 ## What goes where (scopes)
 
