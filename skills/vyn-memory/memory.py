@@ -124,13 +124,7 @@ def resolve_token() -> str:
     return tok
 
 
-def _send(
-    path: str,
-    data: bytes | None = None,
-    subagent: str = "",
-    auth: bool = True,
-    base_url: str = "",
-) -> dict[str, object]:
+def _send(path: str, data: bytes | None = None, subagent: str = "", auth: bool = True, base_url: str = "") -> dict[str, object]:
     hub_url = _validate_hub_url(base_url or DEFAULT_URL)
     headers = {"User-Agent": "vyn-memory-cli/1", "Content-Type": "application/json; charset=utf-8"}
     if auth:
@@ -156,20 +150,9 @@ def api_get(path: str, params: dict[str, object] | None = None, subagent: str = 
     return _send(path + ("?" + urllib.parse.urlencode(clean) if clean else ""), subagent=subagent)
 
 
-def api_post(
-    path: str,
-    payload: dict[str, object],
-    subagent: str = "",
-    auth: bool = True,
-    base_url: str = "",
-) -> dict[str, object]:
-    return _send(
-        path,
-        json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        subagent=subagent,
-        auth=auth,
-        base_url=base_url,
-    )
+def api_post(path: str, payload: dict[str, object], subagent: str = "", auth: bool = True, base_url: str = "") -> dict[str, object]:
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return _send(path, body, subagent=subagent, auth=auth, base_url=base_url)
 
 
 def detect_app() -> str:

@@ -18,6 +18,8 @@ come from the JSON file named by MEMORY_SETTINGS; see settings.example.json.
 from __future__ import annotations
 
 import base64
+import contextvars
+import functools
 import hashlib
 import hmac
 import html
@@ -1223,10 +1225,41 @@ def should_index_vault_file(rel_path: str) -> bool:
     return True
 
 
+#: True inside a read-only operation that has already scanned the vault (see one_vault_scan).
+_VAULT_SCANNED: contextvars.ContextVar[bool] = contextvars.ContextVar("vault_scanned", default=False)
+
+
+def one_vault_scan(fn):
+    """For a read-only operation that calls other operations (a dashboard page,
+    briefing, context, fact check): scan the vault once at the start, and let the
+    nested calls reuse that scan instead of walking the whole vault again. The
+    dashboard used to walk it four times per page (~95% of its time)."""
+
+    @functools.wraps(fn)
+    def wrapper(conn: sqlite3.Connection, *args, **kwargs):
+        if _VAULT_SCANNED.get():
+            return fn(conn, *args, **kwargs)
+        with DB_LOCK:
+            sync_vault_notes(conn)
+            token = _VAULT_SCANNED.set(True)
+            try:
+                return fn(conn, *args, **kwargs)
+            finally:
+                _VAULT_SCANNED.reset(token)
+
+    return wrapper
+
+
 def sync_vault_notes(conn: sqlite3.Connection) -> None:
     """Index Markdown, DOCX, and PDF files across the unified Obsidian vault (excluding symlinks, personal/, templates/, .obsidian/, .sync/)."""
+    if _VAULT_SCANNED.get():  # scanned already by this operation (one_vault_scan)
+        return
     VAULT_DIR.mkdir(parents=True, exist_ok=True)
     vault_real = VAULT_DIR.resolve()
+    # Containment is checked on real-path strings: pathlib's is_relative_to/relative_to
+    # were over half the scan's time. Same rule: inside the vault after resolving.
+    base = str(vault_real)
+    inside = lambda real: real == base or real.startswith(base + os.sep)  # noqa: E731
     seen: set[str] = set()
     for root_str, dirs, files in os.walk(VAULT_DIR, followlinks=False):
         root_path = Path(root_str)
@@ -1246,7 +1279,7 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
             if d_path.is_symlink():
                 continue
             try:
-                if not d_path.resolve().is_relative_to(vault_real):
+                if not inside(os.path.realpath(d_path)):
                     continue
             except OSError:
                 continue
@@ -1261,10 +1294,10 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
             if file.is_symlink():
                 continue
             try:
-                resolved_file = file.resolve()
-                if not resolved_file.is_relative_to(vault_real):
+                resolved_file = os.path.realpath(file)
+                if not inside(resolved_file) or resolved_file == base:
                     continue
-                rel = resolved_file.relative_to(vault_real).as_posix()
+                rel = Path(os.path.relpath(resolved_file, base)).as_posix()
             except OSError:
                 continue
             if not should_index_vault_file(rel):
@@ -1639,6 +1672,17 @@ def op_remember_fact(
         }
 
 
+def _scope_sql(col: str, norm_scope: str, *, hide_books: bool = True) -> tuple[str, list[object]]:
+    """A scope and everything under it; with no scope, everything but the books
+    library (too big to drown other results in) unless hide_books is False."""
+    if norm_scope:
+        return f" AND ({col} = ? OR {col} LIKE ? ESCAPE '\\')", [norm_scope, f"{_escape_like(norm_scope)}/%"]
+    if hide_books:
+        return f" AND {col} != 'resources/books' AND {col} NOT LIKE 'resources/books/%'", []
+    return "", []
+
+
+@one_vault_scan
 def op_check_facts(
     conn: sqlite3.Connection,
     *,
@@ -1648,11 +1692,9 @@ def op_check_facts(
     limit: int = 8,
 ) -> dict[str, object]:
     """Fact-check a claim or topic against active facts, retired/superseded history, and vault notes before saving."""
-    with DB_LOCK:
-        sync_vault_notes(conn)
+    with DB_LOCK:  # the vault is synced by op_search below; facts don't need it
         cap = max(1, min(int(limit or 8), 25))
         norm_scope = normalize_scope(scope) if (scope or "").strip() else ""
-        esc_scope = _escape_like(norm_scope)
         subj = slugify_segment(subject).lower() if (subject or "").strip() else ""
         stmt = (statement or "").strip()
         if not stmt and not subj:
@@ -1664,9 +1706,9 @@ def op_check_facts(
         if subj:
             sql_subj = "SELECT * FROM facts WHERE subject = ?"
             params_s: list[object] = [subj]
-            if norm_scope:
-                sql_subj += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
-                params_s.extend([norm_scope, f"{esc_scope}/%"])
+            where, args = _scope_sql("scope", norm_scope, hide_books=False)
+            sql_subj += where
+            params_s.extend(args)
             sql_subj += " ORDER BY id DESC LIMIT ?"
             params_s.append(cap * 2)
             for r in conn.execute(sql_subj, params_s).fetchall():
@@ -1685,11 +1727,9 @@ def op_check_facts(
                 WHERE facts_fts MATCH ?
             """
             params_f: list[object] = [fts_q]
-            if norm_scope:
-                sql_fts += " AND (f.scope = ? OR f.scope LIKE ? ESCAPE '\\')"
-                params_f.extend([norm_scope, f"{esc_scope}/%"])
-            else:
-                sql_fts += " AND f.scope != 'resources/books' AND f.scope NOT LIKE 'resources/books/%'"
+            where, args = _scope_sql("f.scope", norm_scope)
+            sql_fts += where
+            params_f.extend(args)
             sql_fts += " ORDER BY bm25(facts_fts), f.id DESC LIMIT ?"
             params_f.append(cap * 2)
             for r in conn.execute(sql_fts, params_f).fetchall():
@@ -1702,11 +1742,7 @@ def op_check_facts(
 
         matching_active = list(active_by_id.values())[:cap]
         matching_history = list(history_by_id.values())[:cap]
-        related_notes = (
-            op_search(conn, query=stmt or subj, scope=norm_scope, limit=min(cap, 5))["notes"]
-            if (stmt or subj)
-            else []
-        )
+        related_notes = op_search(conn, query=stmt or subj, scope=norm_scope, limit=min(cap, 5))["notes"]
         if matching_active:
             guidance = (
                 f"Found {len(matching_active)} active fact(s) on this topic. "
@@ -2113,6 +2149,7 @@ def op_read_note(conn: sqlite3.Connection, path: str) -> dict[str, object]:
         }
 
 
+@one_vault_scan
 def op_build_context(
     conn: sqlite3.Connection,
     target: str,
@@ -2291,7 +2328,6 @@ def op_search(
         sync_vault_notes(conn)
         cap = max(1, min(int(limit or 15), 50))
         norm_scope = normalize_scope(scope) if (scope or "").strip() else ""
-        esc_scope = _escape_like(norm_scope)
         fts_q = fts_query_tokens(query)
         val_mode = (validity or ("all" if include_history else "valid")).strip().lower()
         if val_mode not in ("valid", "invalid", "all"):
@@ -2305,11 +2341,9 @@ def op_search(
                 WHERE facts_fts MATCH ?
             """
             params_f: list[object] = [fts_q]
-            if norm_scope:
-                sql_facts += " AND (f.scope = ? OR f.scope LIKE ? ESCAPE '\\')"
-                params_f.extend([norm_scope, f"{esc_scope}/%"])
-            else:
-                sql_facts += " AND f.scope != 'resources/books' AND f.scope NOT LIKE 'resources/books/%'"
+            where, args = _scope_sql("f.scope", norm_scope)
+            sql_facts += where
+            params_f.extend(args)
             if category.strip():
                 sql_facts += " AND f.category = ?"
                 params_f.append(category.strip().lower())
@@ -2327,11 +2361,9 @@ def op_search(
                 WHERE notes_fts MATCH ?
             """
             params_n: list[object] = [fts_q]
-            if norm_scope:
-                sql_notes_where += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
-                params_n.extend([norm_scope, f"{esc_scope}/%"])
-            else:
-                sql_notes_where += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
+            where, args = _scope_sql("n.scope", norm_scope)
+            sql_notes_where += where
+            params_n.extend(args)
             notes_total = int(conn.execute("SELECT COUNT(*) " + sql_notes_where, params_n).fetchone()[0])
             sql_notes = (
                 "SELECT n.path, n.scope, n.title, n.summary, n.tags, n.updated_by, n.updated_at, "
@@ -2343,11 +2375,9 @@ def op_search(
         else:
             sql_facts = "SELECT * FROM facts WHERE 1=1"
             params_f = []
-            if norm_scope:
-                sql_facts += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
-                params_f.extend([norm_scope, f"{esc_scope}/%"])
-            else:
-                sql_facts += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
+            where, args = _scope_sql("scope", norm_scope)
+            sql_facts += where
+            params_f.extend(args)
             if category.strip():
                 sql_facts += " AND category = ?"
                 params_f.append(category.strip().lower())
@@ -2361,11 +2391,9 @@ def op_search(
 
             sql_notes_where = "FROM notes WHERE 1=1"
             params_n = []
-            if norm_scope:
-                sql_notes_where += " AND (scope = ? OR scope LIKE ? ESCAPE '\\')"
-                params_n.extend([norm_scope, f"{esc_scope}/%"])
-            else:
-                sql_notes_where += " AND scope != 'resources/books' AND scope NOT LIKE 'resources/books/%'"
+            where, args = _scope_sql("scope", norm_scope)
+            sql_notes_where += where
+            params_n.extend(args)
             notes_total = int(conn.execute("SELECT COUNT(*) " + sql_notes_where, params_n).fetchone()[0])
             sql_notes = (
                 "SELECT path, scope, title, summary, tags, updated_by, updated_at, substr(body, 1, 240) AS snippet "
@@ -2381,11 +2409,9 @@ def op_search(
             WHERE 1=1
         """
         params_o: list[object] = []
-        if norm_scope:
-            sql_obs += " AND (n.scope = ? OR n.scope LIKE ? ESCAPE '\\')"
-            params_o.extend([norm_scope, f"{esc_scope}/%"])
-        else:
-            sql_obs += " AND n.scope != 'resources/books' AND n.scope NOT LIKE 'resources/books/%'"
+        where, args = _scope_sql("n.scope", norm_scope)
+        sql_obs += where
+        params_o.extend(args)
         if category.strip():
             sql_obs += " AND o.category = ?"
             params_o.append(category.strip().lower())
@@ -2429,6 +2455,7 @@ def op_search(
         }
 
 
+@one_vault_scan
 def op_briefing(
     conn: sqlite3.Connection,
     actor: str,
@@ -3335,6 +3362,7 @@ DASHBOARD: dict = {
 } | SETTINGS.get("dashboard", {})
 
 
+@functools.lru_cache(maxsize=4096)  # DASHBOARD is read once at start, so a path's bucket never changes
 def _classify_confluence_bucket(path_str: str) -> str:
     low = path_str.strip("/").lower()
     return next((key for pattern, key in DASHBOARD["rules"] if re.match(pattern, low)), "other")
@@ -3379,12 +3407,57 @@ def _normalize_theme(raw: str | None) -> str:
     return val if val in ("light", "dark", "auto") else "auto"
 
 
+def _theme_switch(theme: str) -> tuple[str, str, str]:
+    """The theme switch's target, label and icon: dark offers light, else dark."""
+    if theme == "dark":
+        return "light", "Light", _svg_icon("sun")
+    return "dark", "Dark", _svg_icon("moon")
+
+
 def _theme_cookie_header(theme_val: str) -> str:
     val = _normalize_theme(theme_val)
     if PUBLIC_URL.lower().startswith("https://"):
         return f"vyn_theme={val}; Path=/; Secure; HttpOnly; SameSite=Lax; Max-Age=31536000"
     return f"vyn_theme={val}; Path=/; HttpOnly; SameSite=Lax; Max-Age=31536000"
 
+
+# The dark palette: chosen in the theme switch, or "auto" on a phone set to dark.
+_DARK_VARS = """      --bg: #111317;
+      --canvas: #171a21;
+      --panel: #20242e;
+      --panel-hover: #2b313e;
+      --header-bg: #0e1014;
+      --border: #262b36;
+      --border-strong: #394050;
+      --text: #f3f4f6;
+      --text-body: #dde1e9;
+      --muted: #a8b0c0;
+      --accent: #60a5fa;
+      --accent-fg: #0b1120;
+      --accent-soft: #1b2840;
+      --accent-border: #2e5086;
+      --mark-bg: #fde047;
+      --mark-fg: #111317;
+      --green: #86efac;
+      --green-bg: #132a1e;
+      --amber: #fcd34d;
+      --amber-bg: #2c210f;
+      --red: #fca5a5;
+      --red-bg: #33171a;
+      --purple: #d8b4fe;
+      --purple-bg: #271a38;
+      --fact-fg: #bfdbfe;
+      --fact-bg: #1d2838;
+      --retired-bg: #14171d;
+      --retired-border: #2c3240;
+      --code-inline-bg: #20242e;
+      --code-inline-fg: #93c5fd;
+      --pre-bg: #0b0d11;
+      --pre-fg: #f3f4f6;
+      --quote-bg: #162033;
+      --shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
+      color-scheme: dark;
+"""
 
 BASE_THEME_CSS = """
     :root {
@@ -3425,86 +3498,17 @@ BASE_THEME_CSS = """
       color-scheme: light;
     }
     html[data-theme="dark"] {
-      --bg: #111317;
-      --canvas: #171a21;
-      --panel: #20242e;
-      --panel-hover: #2b313e;
-      --header-bg: #0e1014;
-      --border: #262b36;
-      --border-strong: #394050;
-      --text: #f3f4f6;
-      --text-body: #dde1e9;
-      --muted: #a8b0c0;
-      --accent: #60a5fa;
-      --accent-fg: #0b1120;
-      --accent-soft: #1b2840;
-      --accent-border: #2e5086;
-      --mark-bg: #fde047;
-      --mark-fg: #111317;
-      --green: #86efac;
-      --green-bg: #132a1e;
-      --amber: #fcd34d;
-      --amber-bg: #2c210f;
-      --red: #fca5a5;
-      --red-bg: #33171a;
-      --purple: #d8b4fe;
-      --purple-bg: #271a38;
-      --fact-fg: #bfdbfe;
-      --fact-bg: #1d2838;
-      --retired-bg: #14171d;
-      --retired-border: #2c3240;
-      --code-inline-bg: #20242e;
-      --code-inline-fg: #93c5fd;
-      --pre-bg: #0b0d11;
-      --pre-fg: #f3f4f6;
-      --quote-bg: #162033;
-      --shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
-      color-scheme: dark;
-    }
+@@DARK@@    }
     @media (prefers-color-scheme: dark) {
       html[data-theme="auto"] {
-        --bg: #111317;
-        --canvas: #171a21;
-        --panel: #20242e;
-        --panel-hover: #2b313e;
-        --header-bg: #0e1014;
-        --border: #262b36;
-        --border-strong: #394050;
-        --text: #f3f4f6;
-        --text-body: #dde1e9;
-        --muted: #a8b0c0;
-        --accent: #60a5fa;
-        --accent-fg: #0b1120;
-        --accent-soft: #1b2840;
-        --accent-border: #2e5086;
-        --mark-bg: #fde047;
-        --mark-fg: #111317;
-        --green: #86efac;
-        --green-bg: #132a1e;
-        --amber: #fcd34d;
-        --amber-bg: #2c210f;
-        --red: #fca5a5;
-        --red-bg: #33171a;
-        --purple: #d8b4fe;
-        --purple-bg: #271a38;
-        --fact-fg: #bfdbfe;
-        --fact-bg: #1d2838;
-        --retired-bg: #14171d;
-        --retired-border: #2c3240;
-        --code-inline-bg: #20242e;
-        --code-inline-fg: #93c5fd;
-        --pre-bg: #0b0d11;
-        --pre-fg: #f3f4f6;
-        --quote-bg: #162033;
-        --shadow: 0 4px 14px rgba(0, 0, 0, 0.4);
-        color-scheme: dark;
-      }
+@@DARK@@      }
     }
     ::placeholder { color: var(--muted); opacity: 1; }
     .ico { flex-shrink: 0; vertical-align: -2px; }
-"""
+""".replace("@@DARK@@", _DARK_VARS)
 
 
+@functools.lru_cache(maxsize=4096)  # pure; a page calls it 2-4 times per note
 def _humanize_note_title(title: str, path_str: str) -> str:
     raw = _clean_latex_inline((title or "").strip())
     # Strip raw inline Markdown formatting (`code`, **bold**, *italic*) that leaks into note titles
@@ -3561,6 +3565,7 @@ def _note_matches_root_folder(note_scope: str, root_sc: str) -> bool:
     return note_scope == root_sc or note_scope.startswith(root_sc + "/")
 
 
+@one_vault_scan
 def render_dashboard_page(
     conn: sqlite3.Connection,
     actor: str,
@@ -3575,9 +3580,7 @@ def render_dashboard_page(
 ) -> str:
     safe_base_path = html.escape(base_path or "/", quote=True)
     theme_mode = _normalize_theme(theme)
-    next_theme = "light" if theme_mode == "dark" else "dark"
-    theme_btn_label = "Light" if theme_mode == "dark" else "Dark"
-    theme_btn_icon = _svg_icon("sun" if theme_mode == "dark" else "moon")
+    next_theme, theme_btn_label, theme_btn_icon = _theme_switch(theme_mode)
     upload_csrf = _mint_upload_csrf(purpose="upload", session_token=session_token)
     facts_csrf = _mint_upload_csrf(purpose="facts", session_token=session_token)
     with DB_LOCK:
@@ -4944,9 +4947,7 @@ def render_card_page(
     show_theme: bool = True,
 ) -> str:
     norm_theme = _normalize_theme(theme)
-    next_theme = "light" if norm_theme == "dark" else "dark"
-    theme_ico = _svg_icon("sun" if norm_theme == "dark" else "moon")
-    theme_lbl = "Light" if norm_theme == "dark" else "Dark"
+    next_theme, theme_lbl, theme_ico = _theme_switch(norm_theme)
     theme_ctrl = (
         f'<form method="post" action="/theme" class="theme-form">'
         f'<input type="hidden" name="theme" value="{next_theme}">'
@@ -5156,52 +5157,23 @@ def _default_oauth_role(redirect_uri: str, query: dict[str, list[str]]) -> str:
 
 
 def _prune_oauth_tables(conn: sqlite3.Connection) -> None:
+    """Drop expired sign-in rows, then keep each table under its cap (oldest go first)."""
     now_ts = time.time()
-    conn.execute("DELETE FROM oauth_codes WHERE expires_at < ?", (now_ts,))
-    conn.execute("DELETE FROM oauth_tokens WHERE expires_at < ?", (now_ts,))
-    conn.execute("DELETE FROM web_auth_states WHERE expires_at < ?", (now_ts,))
-    conn.execute("DELETE FROM web_sessions WHERE expires_at < ?", (now_ts,))
-    conn.execute("DELETE FROM device_codes WHERE expires_at < ?", (now_ts,))
-    code_count = int(conn.execute("SELECT COUNT(*) FROM oauth_codes").fetchone()[0])
-    if code_count >= MAX_OAUTH_CODES:
-        conn.execute(
-            """
-            DELETE FROM oauth_codes WHERE code_hash IN (
-                SELECT code_hash FROM oauth_codes ORDER BY expires_at ASC LIMIT ?
+    for table in ("oauth_codes", "oauth_tokens", "web_auth_states", "web_sessions", "device_codes"):
+        conn.execute(f"DELETE FROM {table} WHERE expires_at < ?", (now_ts,))
+    # Table and column names are these constants, never input.
+    for table, key, oldest_first, cap in (
+        ("oauth_codes", "code_hash", "expires_at", MAX_OAUTH_CODES),
+        ("oauth_tokens", "token_hash", "created_at", MAX_OAUTH_TOKENS),
+        ("web_auth_states", "state_hash", "expires_at", MAX_WEB_AUTH_STATES),
+        ("device_codes", "device_hash", "expires_at", MAX_DEVICE_CODES),
+    ):
+        count = int(conn.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        if count >= cap:
+            conn.execute(
+                f"DELETE FROM {table} WHERE {key} IN (SELECT {key} FROM {table} ORDER BY {oldest_first} ASC LIMIT ?)",
+                (count - cap + 1,),
             )
-            """,
-            (code_count - MAX_OAUTH_CODES + 1,),
-        )
-    tok_count = int(conn.execute("SELECT COUNT(*) FROM oauth_tokens").fetchone()[0])
-    if tok_count >= MAX_OAUTH_TOKENS:
-        conn.execute(
-            """
-            DELETE FROM oauth_tokens WHERE token_hash IN (
-                SELECT token_hash FROM oauth_tokens ORDER BY created_at ASC LIMIT ?
-            )
-            """,
-            (tok_count - MAX_OAUTH_TOKENS + 1,),
-        )
-    state_count = int(conn.execute("SELECT COUNT(*) FROM web_auth_states").fetchone()[0])
-    if state_count >= MAX_WEB_AUTH_STATES:
-        conn.execute(
-            """
-            DELETE FROM web_auth_states WHERE state_hash IN (
-                SELECT state_hash FROM web_auth_states ORDER BY expires_at ASC LIMIT ?
-            )
-            """,
-            (state_count - MAX_WEB_AUTH_STATES + 1,),
-        )
-    dev_count = int(conn.execute("SELECT COUNT(*) FROM device_codes").fetchone()[0])
-    if dev_count >= MAX_DEVICE_CODES:
-        conn.execute(
-            """
-            DELETE FROM device_codes WHERE device_hash IN (
-                SELECT device_hash FROM device_codes ORDER BY expires_at ASC LIMIT ?
-            )
-            """,
-            (dev_count - MAX_DEVICE_CODES + 1,),
-        )
 
 
 def _parse_multipart_upload(raw_body: bytes, content_type: str) -> tuple[dict[str, str], str, bytes]:
@@ -5357,52 +5329,45 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 pass
         return host_tokens + [t for t in plain_tokens if t not in host_tokens]
 
-    def _extract_state_cookie(self) -> str:
+    def _cookie_value(self, *names: str) -> str:
+        """The first non-empty value of these cookies, in the order named."""
         raw_headers = self.headers.get_all("Cookie") if hasattr(self.headers, "get_all") else None
         if not raw_headers:
             single = self.headers.get("Cookie", "")
             raw_headers = [single] if single else []
         for raw_cookie in raw_headers:
-            for target_key in ("__Host-vyn_memory_state", "vyn_memory_state"):
+            for name in names:
                 for part in raw_cookie.split(";"):
-                    if "=" not in part:
-                        continue
-                    k, v = part.split("=", 1)
-                    if k.strip() == target_key:
-                        val = urllib.parse.unquote(v.strip().strip('"'))
-                        if val:
-                            return val
+                    k, sep, v = part.partition("=")
+                    if sep and k.strip() == name and (val := urllib.parse.unquote(v.strip().strip('"'))):
+                        return val
             try:
                 c = SimpleCookie()
                 c.load(raw_cookie)
-                if "__Host-vyn_memory_state" in c:
-                    return urllib.parse.unquote(c["__Host-vyn_memory_state"].value)
-                if "vyn_memory_state" in c:
-                    return urllib.parse.unquote(c["vyn_memory_state"].value)
+                for name in names:
+                    if name in c and (val := urllib.parse.unquote(c[name].value)):
+                        return val
             except Exception:
                 pass
         return ""
 
+    def _extract_state_cookie(self) -> str:
+        return self._cookie_value("__Host-vyn_memory_state", "vyn_memory_state")
+
     def _extract_theme_cookie(self) -> str:
-        raw_headers = self.headers.get_all("Cookie") if hasattr(self.headers, "get_all") else None
-        if not raw_headers:
-            single = self.headers.get("Cookie", "")
-            raw_headers = [single] if single else []
-        for raw_cookie in raw_headers:
-            for part in raw_cookie.split(";"):
-                if "=" not in part:
-                    continue
-                k, v = part.split("=", 1)
-                if k.strip() == "vyn_theme":
-                    return _normalize_theme(urllib.parse.unquote(v.strip().strip('"')))
-            try:
-                c = SimpleCookie()
-                c.load(raw_cookie)
-                if "vyn_theme" in c:
-                    return _normalize_theme(urllib.parse.unquote(c["vyn_theme"].value))
-            except Exception:
-                pass
-        return "auto"
+        return _normalize_theme(self._cookie_value("vyn_theme"))
+
+    def redirect(self, location: str, *cookies: str, status: int = 303) -> None:
+        """Send the browser on (after a form post: 303), never cached."""
+        self.send_response(status)
+        self.send_header("Location", location)
+        for cookie in cookies:
+            self.send_header("Set-Cookie", cookie)
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+
+    def read_form(self) -> dict[str, list[str]]:
+        return urllib.parse.parse_qs(self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace"))
 
     def _is_same_origin_browser_post(self) -> bool:
         sec_site = (self.headers.get("Sec-Fetch-Site") or "").strip().lower()
@@ -5469,15 +5434,10 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         pair = self._owner_cookie_pair()
         return pair[0] if pair else ""
 
-    def owner_cookie_email(self) -> str | None:
-        """Email of the owner browser session in this request's cookies, if any."""
-        pair = self._owner_cookie_pair()
-        return pair[1] if pair else None
-
     def read_owner_form(self, *, purpose: str = "upload") -> tuple[dict[str, list[str]], str] | None:
         """Form fields and approving email of a same-origin, session-bound CSRF-checked owner POST; otherwise sends 403."""
         try:
-            form = urllib.parse.parse_qs(self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace"))
+            form = self.read_form()
         except MemoryError as exc:
             self.send_json(exc.status, {"error": str(exc)}, cors=False)
             return None
@@ -5595,11 +5555,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 )
                 conn.commit()
             target = f"{omni_pub}/hub/signin?{urllib.parse.urlencode({'state': state})}"
-            self.send_response(303)
-            self.send_header("Location", target)
-            self.send_header("Set-Cookie", _state_cookie_header(state, max_age=900))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(target, _state_cookie_header(state, max_age=900))
             return
 
         if route == "/auth/callback":
@@ -5652,12 +5608,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 return
             _clear_auth_failures(ip)
             sess_tok = _mint_web_session(conn, email)
-            self.send_response(303)
-            self.send_header("Location", next_path)
-            self.send_header("Set-Cookie", _session_cookie_header(sess_tok, max_age=2592000))
-            self.send_header("Set-Cookie", _state_cookie_header("", max_age=0))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(next_path, _session_cookie_header(sess_tok, max_age=2592000), _state_cookie_header("", max_age=0))
             return
 
         if route == "/logout":
@@ -5877,59 +5828,31 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 self.wfile.write(data_bytes)
             return
 
-        if route == "/api/v1/briefing":
-            try:
-                project = (query.get("project") or [""])[0]
-                scope = (query.get("scope") or [""])[0]
-                self.send_json(200, op_briefing(conn, actor, scope=scope, project=project))
-            except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
-            return
+        def arg(*names: str, default: str = "") -> str:
+            """The first of these query parameters that was given."""
+            return next((query[n][0] for n in names if query.get(n)), default)
 
-        if route == "/api/v1/search":
+        # The read API: each route is one operation; a MemoryError is the caller's 4xx.
+        read_api = {
+            "/api/v1/briefing": lambda: op_briefing(conn, actor, scope=arg("scope"), project=arg("project")),
+            "/api/v1/search": lambda: op_search(
+                conn, query=arg("query", "q"), scope=arg("scope"), category=arg("category"),
+                include_history=arg("include_history", default="false").lower() in ("1", "true", "yes"),
+                validity=arg("validity"),
+            ),
+            "/api/v1/fact-check": lambda: op_check_facts(
+                conn, statement=arg("statement", "q"), scope=arg("scope"), subject=arg("subject"),
+                limit=_safe_int(arg("limit", default="8"), "limit", default=8),
+            ),
+            "/api/v1/context": lambda: op_build_context(
+                conn, target=arg("target", "path"), depth=_safe_int(arg("depth", default="1"), "depth", default=1)
+            ),
+            "/api/v1/notes": lambda: op_list_notes(conn, scope=arg("scope")),
+            "/api/v1/note": lambda: op_read_note(conn, arg("path")),
+        }  # fmt: skip
+        if route in read_api:
             try:
-                q = (query.get("query") or query.get("q") or [""])[0]
-                scope = (query.get("scope") or [""])[0]
-                cat = (query.get("category") or [""])[0]
-                val = (query.get("validity") or [""])[0]
-                inc = (query.get("include_history") or ["false"])[0].lower() in ("1", "true", "yes")
-                self.send_json(200, op_search(conn, query=q, scope=scope, category=cat, include_history=inc, validity=val))
-            except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
-            return
-
-        if route == "/api/v1/fact-check":
-            try:
-                stmt = (query.get("statement") or query.get("q") or [""])[0]
-                scope = (query.get("scope") or [""])[0]
-                subj = (query.get("subject") or [""])[0]
-                lim = _safe_int((query.get("limit") or ["8"])[0], "limit", default=8)
-                self.send_json(200, op_check_facts(conn, statement=stmt, scope=scope, subject=subj, limit=lim))
-            except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
-            return
-
-        if route == "/api/v1/context":
-            try:
-                target = (query.get("target") or query.get("path") or [""])[0]
-                depth = _safe_int((query.get("depth") or ["1"])[0], "depth", default=1)
-                self.send_json(200, op_build_context(conn, target=target, depth=depth))
-            except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
-            return
-
-        if route == "/api/v1/notes":
-            try:
-                scope = (query.get("scope") or [""])[0]
-                self.send_json(200, op_list_notes(conn, scope=scope))
-            except MemoryError as exc:
-                self.send_json(exc.status, {"error": str(exc)})
-            return
-
-        if route == "/api/v1/note":
-            try:
-                note_path = (query.get("path") or [""])[0]
-                self.send_json(200, op_read_note(conn, note_path))
+                self.send_json(200, read_api[route]())
             except MemoryError as exc:
                 self.send_json(exc.status, {"error": str(exc)})
             return
@@ -6028,18 +5951,13 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "Cross-origin theme changes are forbidden."}, cors=False)
                 return
             try:
-                raw_form = self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace")
-                form = urllib.parse.parse_qs(raw_form)
+                form = self.read_form()
             except MemoryError as exc:
                 self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             chosen = _normalize_theme((form.get("theme") or ["auto"])[0])
             next_p = _sanitize_next_path((form.get("next") or [""])[0], default="/?scope=&view=topics")
-            self.send_response(303)
-            self.send_header("Location", next_p)
-            self.send_header("Set-Cookie", _theme_cookie_header(chosen))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(next_p, _theme_cookie_header(chosen))
             return
 
         if route == "/upload":
@@ -6082,10 +6000,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
             dest = f"/?scope={urllib.parse.quote(str(res['scope']))}&note={urllib.parse.quote(str(res['path']))}"
-            self.send_response(303)
-            self.send_header("Location", dest)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(dest)
             return
 
         if route == "/facts":
@@ -6125,10 +6040,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     ),
                 )
                 return
-            self.send_response(303)
-            self.send_header("Location", next_p)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(next_p)
             return
 
         if route == "/login":
@@ -6137,8 +6049,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 self.send_json(403, {"error": "Cross-origin sign-in form submissions are forbidden."}, cors=False)
                 return
             try:
-                raw_form = self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace")
-                form = urllib.parse.parse_qs(raw_form)
+                form = self.read_form()
             except MemoryError as exc:
                 self.send_json(exc.status, {"error": str(exc)}, cors=False)
                 return
@@ -6156,11 +6067,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 return
             _clear_auth_failures(ip)
             sess_tok = _mint_web_session(conn, owner_session_email())
-            self.send_response(303)
-            self.send_header("Location", next_p)
-            self.send_header("Set-Cookie", _session_cookie_header(sess_tok, max_age=2592000))
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(next_p, _session_cookie_header(sess_tok, max_age=2592000))
             return
 
         if route == "/oauth/register":
@@ -6191,8 +6098,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
 
         if route == "/oauth/authorize":
             try:
-                raw_form = self.read_bounded_body(MAX_FORM_BODY_BYTES).decode("utf-8", errors="replace")
-                form = urllib.parse.parse_qs(raw_form)
+                form = self.read_form()
                 redirect_uri = validate_oauth_redirect_uri((form.get("redirect_uri") or [""])[0])
                 code_challenge = (form.get("code_challenge") or [""])[0].strip()
                 code_challenge_method = (form.get("code_challenge_method") or ["S256"])[0].strip()
@@ -6272,10 +6178,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             if state:
                 loc += f"&state={urllib.parse.quote(state, safe='')}"
             loc += f"&iss={urllib.parse.quote(PUBLIC_URL, safe='')}"
-            self.send_response(302)
-            self.send_header("Location", loc)
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect(loc, status=302)
             return
 
         if route == "/oauth/token":
@@ -6525,10 +6428,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 with DB_LOCK:
                     conn.execute(f"DELETE FROM {table} WHERE rowid = ?", (int(rowid),))
                     conn.commit()
-            self.send_response(303)
-            self.send_header("Location", "/apps")
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+            self.redirect("/apps")
             return
 
         if not self.require_auth(actor):
