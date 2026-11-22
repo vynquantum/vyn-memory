@@ -357,7 +357,19 @@ class TestVynMemory(unittest.TestCase):
                 res_ok = json.loads(resp.read().decode())
                 self.assertFalse(res_ok["result"]["isError"])
 
-            # 4. OAuth 2.1 + PKCE flow
+            # 4. OAuth 2.1 + PKCE flow (including RFC 9207 iss + discovery metadata)
+            with urllib.request.urlopen(f"{base}/.well-known/oauth-protected-resource") as resp:
+                pr_meta = json.loads(resp.read().decode())
+            self.assertEqual(pr_meta["scopes_supported"], ["memory"])
+            self.assertEqual(pr_meta["authorization_servers"], [self.srv.PUBLIC_URL])
+
+            for well_known in ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"):
+                with urllib.request.urlopen(f"{base}{well_known}") as resp:
+                    as_meta = json.loads(resp.read().decode())
+                self.assertEqual(as_meta["issuer"], self.srv.PUBLIC_URL)
+                self.assertTrue(as_meta["authorization_response_iss_parameter_supported"])
+                self.assertEqual(as_meta["scopes_supported"], ["memory"])
+
             verifier = "test-pkce-verifier-string-1234567890"
             challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).decode().rstrip("=")
             auth_form = urllib.parse.urlencode({
@@ -385,6 +397,8 @@ class TestVynMemory(unittest.TestCase):
             parsed_loc = urllib.parse.urlparse(loc)
             qs = urllib.parse.parse_qs(parsed_loc.query)
             code = qs["code"][0]
+            self.assertEqual(qs["state"], ["xyz123"])
+            self.assertEqual(qs["iss"], [self.srv.PUBLIC_URL])
 
             token_form = urllib.parse.urlencode({
                 "grant_type": "authorization_code",
@@ -395,6 +409,7 @@ class TestVynMemory(unittest.TestCase):
             with urllib.request.urlopen(tok_req) as resp:
                 tok_data = json.loads(resp.read().decode())
                 access_token = tok_data["access_token"]
+                self.assertEqual(tok_data["scope"], "memory")
 
             rest_req = urllib.request.Request(
                 f"{base}/api/v1/briefing?scope=agents/claude",
@@ -962,7 +977,10 @@ class TestVynMemory(unittest.TestCase):
                 self.assertEqual(e.code, 302)
                 oauth_loc = e.headers.get("Location", "")
                 e.close()
-            oauth_code = urllib.parse.parse_qs(urllib.parse.urlsplit(oauth_loc).query)["code"][0]
+            oauth_qs = urllib.parse.parse_qs(urllib.parse.urlsplit(oauth_loc).query)
+            oauth_code = oauth_qs["code"][0]
+            self.assertEqual(oauth_qs["state"], ["st99"])
+            self.assertEqual(oauth_qs["iss"], [self.srv.PUBLIC_URL])
 
             # 6. Exchange authorization_code -> access_token + refresh_token, then rotate via grant_type=refresh_token
             tok_req = urllib.request.Request(
@@ -979,6 +997,7 @@ class TestVynMemory(unittest.TestCase):
                 tok_res = json.loads(resp.read().decode())
             access_1 = tok_res["access_token"]
             refresh_1 = tok_res["refresh_token"]
+            self.assertEqual(tok_res["scope"], "memory")
             self.assertEqual(self.srv.resolve_actor_from_token(access_1, self.conn), "chatgpt")
 
             refresh_req = urllib.request.Request(
@@ -993,6 +1012,7 @@ class TestVynMemory(unittest.TestCase):
             with urllib.request.urlopen(refresh_req) as resp:
                 ref_res = json.loads(resp.read().decode())
             access_2 = ref_res["access_token"]
+            self.assertEqual(ref_res["scope"], "memory")
             self.assertNotEqual(access_1, access_2)
             self.assertIsNone(self.srv.resolve_actor_from_token(access_1, self.conn))
             self.assertEqual(self.srv.resolve_actor_from_token(access_2, self.conn), "chatgpt")

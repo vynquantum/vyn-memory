@@ -5693,6 +5693,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     "resource": f"{PUBLIC_URL}/mcp",
                     "authorization_servers": [PUBLIC_URL],
                     "bearer_methods_supported": ["header"],
+                    "scopes_supported": ["memory"],
                 },
             )
             return
@@ -5710,6 +5711,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     "grant_types_supported": ["authorization_code", "refresh_token"],
                     "token_endpoint_auth_methods_supported": ["none", "client_secret_post", "client_secret_basic"],
                     "code_challenge_methods_supported": ["S256"],
+                    "scopes_supported": ["memory"],
+                    "authorization_response_iss_parameter_supported": True,
                 },
             )
             return
@@ -6268,6 +6271,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             loc = f"{redirect_uri}{sep}code={urllib.parse.quote(code, safe='')}"
             if state:
                 loc += f"&state={urllib.parse.quote(state, safe='')}"
+            loc += f"&iss={urllib.parse.quote(PUBLIC_URL, safe='')}"
             self.send_response(302)
             self.send_header("Location", loc)
             self.send_header("Cache-Control", "no-store")
@@ -6346,6 +6350,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                         "refresh_token": new_refresh,
                         "token_type": "Bearer",
                         "expires_in": 86400 * 365,
+                        "scope": "memory",
                     },
                 )
                 return
@@ -6407,6 +6412,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     "refresh_token": refresh_token,
                     "token_type": "Bearer",
                     "expires_in": 86400 * 365,
+                    "scope": "memory",
                 },
             )
             return
