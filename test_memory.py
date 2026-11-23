@@ -2002,6 +2002,84 @@ class TestVynMemory(unittest.TestCase):
             httpd.shutdown()
             httpd.server_close()
 
+    def test_confluence_tag_navigation_and_study_order(self) -> None:
+        # Write three notes with explicit study order and overlapping DSA/sub-topic tags
+        self.srv.op_write_note(
+            self.conn,
+            "owner",
+            path="shared/dsa-queues.md",
+            title="Queues and Rings",
+            summary="FIFO queues and ring buffers.",
+            tags=["dsa", "queues"],
+            order=30,
+            content="# Queues and Rings\n\n## Core\nFIFO ring.\n",
+        )
+        self.srv.op_write_note(
+            self.conn,
+            "owner",
+            path="shared/dsa-bitwise.md",
+            title="Bitwise Operations",
+            summary="Masks, shifts and W1C.",
+            tags=["dsa", "bitwise"],
+            order=10,
+            content="# Bitwise Operations\n\n## Core\nBit masks.\n",
+        )
+        self.srv.op_write_note(
+            self.conn,
+            "owner",
+            path="shared/dsa-linked-list.md",
+            title="Linked Lists",
+            summary="Reversal and cycle detection.",
+            tags=["dsa", "linked-list"],
+            order=20,
+            content="# Linked Lists\n\n## Core\nPointer reversal.\n",
+        )
+
+        # API: list notes filtered by tag returns exact study order (10 -> 20 -> 30)
+        listed = self.srv.op_list_notes(self.conn, scope="shared", tag="DSA")
+        self.assertEqual(listed["count"], 3)
+        self.assertEqual(
+            [n["path"] for n in listed["notes"]],
+            ["shared/dsa-bitwise.md", "shared/dsa-linked-list.md", "shared/dsa-queues.md"],
+        )
+
+        # API: list tags returns counts
+        tag_res = self.srv.op_list_tags(self.conn, scope="shared")
+        tag_map = {t["tag"]: t["count"] for t in tag_res["tags"]}
+        self.assertEqual(tag_map.get("dsa"), 3)
+        self.assertEqual(tag_map.get("bitwise"), 1)
+        self.assertEqual(tag_map.get("linked-list"), 1)
+        self.assertEqual(tag_map.get("queues"), 1)
+
+        # UI: Labels directory (?view=tags)
+        tags_page = self.srv.render_dashboard_page(self.conn, "owner", scope_filter="shared", view="tags")
+        self.assertIn("Labels in", tags_page)
+        self.assertIn("#dsa", tags_page)
+        self.assertIn("view=tags", tags_page)
+
+        # UI: Tag collection (?tag=dsa) shows sub-topics and ordered sequence 1 -> 2 -> 3
+        tag_page = self.srv.render_dashboard_page(self.conn, "owner", scope_filter="shared", tag_filter="dsa")
+        self.assertIn("<h1>#dsa</h1>", tag_page)
+        self.assertIn("#bitwise", tag_page)
+        self.assertIn("#linked-list", tag_page)
+        self.assertIn("#queues", tag_page)
+        self.assertLess(tag_page.index("Bitwise Operations"), tag_page.index("Linked Lists"))
+        self.assertLess(tag_page.index("Linked Lists"), tag_page.index("Queues and Rings"))
+
+        # UI: Reader opened from ?tag=dsa shows back-to-#dsa banner, clickable page labels, and tag-scoped Prev/Next pager
+        reader_page = self.srv.render_dashboard_page(
+            self.conn,
+            "owner",
+            scope_filter="shared",
+            selected_note="shared/dsa-linked-list.md",
+            tag_filter="dsa",
+        )
+        self.assertIn("Back to #dsa (3 pages)", reader_page)
+        self.assertIn("All #dsa (2/3)", reader_page)
+        self.assertIn("Bitwise Operations", reader_page)
+        self.assertIn("Queues and Rings", reader_page)
+        self.assertIn('class="doc-tags-bar"', reader_page)
+
 
 if __name__ == "__main__":
     unittest.main()

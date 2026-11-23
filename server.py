@@ -553,6 +553,7 @@ CREATE TABLE IF NOT EXISTS notes (
     title TEXT NOT NULL,
     summary TEXT NOT NULL DEFAULT '',
     tags TEXT NOT NULL DEFAULT '[]',
+    sort_order INTEGER NOT NULL DEFAULT 1000,
     body TEXT NOT NULL,
     updated_by TEXT NOT NULL DEFAULT 'owner',
     updated_at TEXT NOT NULL,
@@ -645,6 +646,10 @@ def ensure_schema_migrations(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE facts ADD COLUMN invalidated_by TEXT NOT NULL DEFAULT ''")
     if "invalidated_reason" not in fact_cols:
         conn.execute("ALTER TABLE facts ADD COLUMN invalidated_reason TEXT NOT NULL DEFAULT ''")
+    note_cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)").fetchall()}
+    if "sort_order" not in note_cols:
+        conn.execute("ALTER TABLE notes ADD COLUMN sort_order INTEGER NOT NULL DEFAULT 1000")
+        conn.execute("UPDATE notes SET sha256 = ''")
     link_cols = {r["name"] for r in conn.execute("PRAGMA table_info(note_links)").fetchall()}
     if "relation_type" not in link_cols:
         conn.execute("ALTER TABLE note_links ADD COLUMN relation_type TEXT NOT NULL DEFAULT 'links_to'")
@@ -1141,6 +1146,43 @@ def extract_inline_observations(text: str) -> list[dict[str, object]]:
     return out
 
 
+def _normalize_tag(raw: str | None) -> str:
+    cleaned = re.sub(r"[^a-z0-9_./-]+", "-", (raw or "").strip().lstrip("#").lower()).strip("-")
+    return cleaned
+
+
+def _note_tags_norm(note: dict[str, object]) -> list[str]:
+    raw_tags = note.get("tags")
+    if not isinstance(raw_tags, list):
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for t in raw_tags:
+        nt = _normalize_tag(str(t))
+        if nt and nt not in seen:
+            seen.add(nt)
+            out.append(nt)
+    return out
+
+
+def _parse_sort_order(meta: dict[str, object], rel_path: str) -> int:
+    raw = meta.get("order")
+    if raw is not None and str(raw).strip() != "":
+        try:
+            val = int(str(raw).strip())
+            if 0 <= val <= 999999:
+                return val
+        except ValueError:
+            pass
+    fname = rel_path.rsplit("/", 1)[-1].lower()
+    if fname.startswith(("00-", "master-")) or fname == "readme.md":
+        return 0
+    m = re.match(r"^(\d{1,3})-", fname)
+    if m:
+        return int(m.group(1))
+    return 1000
+
+
 def index_note_row(
     conn: sqlite3.Connection,
     rel_path: str,
@@ -1152,23 +1194,25 @@ def index_note_row(
     updated_by: str,
     updated_at: str,
     sha256: str,
+    sort_order: int = 1000,
 ) -> None:
     tags_json = json.dumps(tags)
     conn.execute(
         """
-        INSERT INTO notes(path, scope, title, summary, tags, body, updated_by, updated_at, sha256)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO notes(path, scope, title, summary, tags, sort_order, body, updated_by, updated_at, sha256)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ON CONFLICT(path) DO UPDATE SET
             scope=excluded.scope,
             title=excluded.title,
             summary=excluded.summary,
             tags=excluded.tags,
+            sort_order=excluded.sort_order,
             body=excluded.body,
             updated_by=excluded.updated_by,
             updated_at=excluded.updated_at,
             sha256=excluded.sha256
         """,
-        (rel_path, scope, title, summary, tags_json, body, updated_by, updated_at, sha256),
+        (rel_path, scope, title, summary, tags_json, int(sort_order), body, updated_by, updated_at, sha256),
     )
     conn.execute("DELETE FROM notes_fts WHERE path = ?", (rel_path,))
     conn.execute(
@@ -1341,6 +1385,7 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                     or meta.get("created")
                     or datetime.fromtimestamp(st.st_mtime, LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
                 )
+                sort_order = _parse_sort_order(meta, rel)
             else:
                 ext_tag = "docx" if fname_low.endswith(".docx") else "pdf"
                 if ext_tag == "docx":
@@ -1352,8 +1397,9 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                 tags = [ext_tag, "binary-doc"]
                 updated_by = "owner"
                 updated_at = datetime.fromtimestamp(st.st_mtime, LOCAL_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+                sort_order = _parse_sort_order({}, rel)
 
-            index_note_row(conn, rel, scope, title, summary, tags, body, updated_by, updated_at, sha)
+            index_note_row(conn, rel, scope, title, summary, tags, body, updated_by, updated_at, sha, sort_order=sort_order)
 
     db_paths = [r["path"] for r in conn.execute("SELECT path FROM notes").fetchall()]
     for old_path in db_paths:
@@ -1832,6 +1878,7 @@ def op_write_note(
     tags: list[str] | None = None,
     mode: str = "replace",
     section: str = "",
+    order: int | None = None,
 ) -> dict[str, object]:
     with DB_LOCK:
         resolved_scope, rel_path = normalize_note_path(path, explicit_scope=scope)
@@ -1884,6 +1931,9 @@ def op_write_note(
                 "updated_at": ts,
             }
         )
+        if order is not None and 0 <= int(order) <= 999999:
+            meta_to_write["order"] = int(order)
+        sort_order = _parse_sort_order(meta_to_write, rel_path)
         full_text = format_frontmatter(meta_to_write, final_body)
         atomic_write_text(target, full_text)
         _VAULT_STAT_CACHE.pop(rel_path, None)
@@ -1899,6 +1949,7 @@ def op_write_note(
             actor,
             ts,
             sha,
+            sort_order=sort_order,
         )
         conn.commit()
         refresh_human_dashboards(conn)
@@ -1910,6 +1961,7 @@ def op_write_note(
             "title": final_title,
             "summary": final_summary,
             "tags": final_tags,
+            "order": sort_order,
             "mode": mode,
             "updated_at": ts,
         }
@@ -2276,35 +2328,49 @@ def op_build_context(
         }
 
 
-def op_list_notes(conn: sqlite3.Connection, scope: str = "") -> dict[str, object]:
+def op_list_notes(conn: sqlite3.Connection, scope: str = "", tag: str = "") -> dict[str, object]:
     with DB_LOCK:
         sync_vault_notes(conn)
         if (scope or "").strip():
             norm = normalize_scope(scope)
             esc_norm = _escape_like(norm)
             rows = conn.execute(
-                "SELECT path, scope, title, summary, tags, updated_by, updated_at FROM notes WHERE scope = ? OR scope LIKE ? ESCAPE '\\' ORDER BY path ASC",
+                "SELECT path, scope, title, summary, tags, sort_order, updated_by, updated_at FROM notes WHERE scope = ? OR scope LIKE ? ESCAPE '\\' ORDER BY sort_order ASC, path ASC",
                 (norm, f"{esc_norm}/%"),
             ).fetchall()
         else:
             rows = conn.execute(
-                "SELECT path, scope, title, summary, tags, updated_by, updated_at FROM notes ORDER BY scope ASC, path ASC"
+                "SELECT path, scope, title, summary, tags, sort_order, updated_by, updated_at FROM notes ORDER BY scope ASC, sort_order ASC, path ASC"
             ).fetchall()
-        return {
-            "count": len(rows),
-            "notes": [
+        norm_tag = _normalize_tag(tag)
+        notes_out: list[dict[str, object]] = []
+        for r in rows:
+            tag_list = json.loads(r["tags"] or "[]")
+            if norm_tag and norm_tag not in {_normalize_tag(str(t)) for t in tag_list}:
+                continue
+            notes_out.append(
                 {
                     "path": r["path"],
                     "scope": r["scope"],
                     "title": r["title"],
                     "summary": r["summary"],
-                    "tags": json.loads(r["tags"] or "[]"),
+                    "tags": tag_list,
+                    "order": int(r["sort_order"]) if r["sort_order"] is not None else 1000,
                     "updated_by": r["updated_by"],
                     "updated_at": r["updated_at"],
                 }
-                for r in rows
-            ],
-        }
+            )
+        return {"count": len(notes_out), "tag": norm_tag, "notes": notes_out}
+
+
+def op_list_tags(conn: sqlite3.Connection, scope: str = "") -> dict[str, object]:
+    listed = op_list_notes(conn, scope=scope)
+    counts: dict[str, int] = {}
+    for n in listed["notes"]:  # type: ignore[union-attr]
+        for tg in _note_tags_norm(n):
+            counts[tg] = counts.get(tg, 0) + 1
+    items = [{"tag": t, "count": c} for t, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+    return {"scope": scope, "count": len(items), "tags": items}
 
 
 def fts_query_tokens(query: str) -> str:
@@ -3390,6 +3456,7 @@ _SVG_ICONS: dict[str, str] = {
     "menu": '<line x1="4" x2="20" y1="6" y2="6"/><line x1="4" x2="20" y1="12" y2="12"/><line x1="4" x2="20" y1="18" y2="18"/>',
     "lock": '<rect width="18" height="11" x="3" y="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
     "spark": '<path d="M12 3v3"/><path d="M12 18v3"/><path d="m4.93 4.93 2.12 2.12"/><path d="m16.95 16.95 2.12 2.12"/><path d="M3 12h3"/><path d="M18 12h3"/><path d="m6.34 17.66 2.12-2.12"/><path d="m15.54 8.46 2.12-2.12"/>',
+    "tag": '<path d="M12.586 2.586A2 2 0 0 0 11.172 2H4a2 2 0 0 0-2 2v7.172a2 2 0 0 0 .586 1.414l8.704 8.704a2.426 2.426 0 0 0 3.42 0l6.58-6.58a2.426 2.426 0 0 0 0-3.42z"/><circle cx="7.5" cy="7.5" r=".6" fill="currentColor"/>',
 }
 
 
@@ -3565,6 +3632,26 @@ def _note_matches_root_folder(note_scope: str, root_sc: str) -> bool:
     return note_scope == root_sc or note_scope.startswith(root_sc + "/")
 
 
+_META_NOISE_TAGS = frozenset(
+    {
+        "interview-memory-system",
+        "claude-export",
+        "project-import",
+        "pdf-extract",
+        "full-history",
+        "concept",
+        "career",
+        "interview-prep",
+        "binary-doc",
+        "map",
+        "moc",
+        "qa-notes",
+        "question-bank",
+        "resume-original",
+    }
+)
+
+
 @one_vault_scan
 def render_dashboard_page(
     conn: sqlite3.Connection,
@@ -3573,6 +3660,7 @@ def render_dashboard_page(
     selected_note: str = "",
     scope_filter: str = "",
     search_query: str = "",
+    tag_filter: str = "",
     view: str = "",
     base_path: str = "/",
     session_token: str = "",
@@ -3601,12 +3689,24 @@ def render_dashboard_page(
         all_scope_notes = list(all_vault_notes)
 
     q_clean = (search_query or "").strip()
+    active_tag = _normalize_tag(tag_filter)
     view_mode = (view or "").strip().lower()
     search_res = op_search(conn, query=q_clean, scope=scope_filter, include_history=True, limit=40)
+
+    scope_tag_counts: dict[str, int] = {}
+    for n in all_scope_notes:
+        for tg in _note_tags_norm(n):
+            scope_tag_counts[tg] = scope_tag_counts.get(tg, 0) + 1
+    vault_tag_counts: dict[str, int] = {}
+    for n in all_vault_notes:
+        for tg in _note_tags_norm(n):
+            vault_tag_counts[tg] = vault_tag_counts.get(tg, 0) + 1
 
     if q_clean:
         matched_paths = {str(n["path"]) for n in search_res["notes"]}
         notes = [n for n in all_scope_notes if str(n["path"]) in matched_paths] or list(search_res["notes"])
+    elif active_tag:
+        notes = [n for n in all_scope_notes if active_tag in _note_tags_norm(n)]
     else:
         notes = all_scope_notes
 
@@ -3617,6 +3717,12 @@ def render_dashboard_page(
     if q_clean and not selected_note:
         target_note = ""
         active_view = "search"
+    elif active_tag and not selected_note:
+        target_note = ""
+        active_view = "tag"
+    elif view_mode == "tags" and not selected_note:
+        target_note = ""
+        active_view = "tags"
     elif view_mode == "topics" and not selected_note:
         target_note = ""
         active_view = "topics"
@@ -3637,7 +3743,7 @@ def render_dashboard_page(
             read_minutes = _estimate_read_minutes(raw_md)
         except MemoryError:
             active_note_meta = None
-            active_view = "topics" if notes else "empty"
+            active_view = "tag" if active_tag else ("topics" if notes else "empty")
 
     root_folders = DASHBOARD["folders"]
     all_known_scopes = DASHBOARD["scopes"]
@@ -3702,7 +3808,33 @@ def render_dashboard_page(
         else ""
     )
 
-    # Group notes into collapsible topic tree and track sorted order per bucket for Prev/Next traversal
+    # Sidebar Confluence Labels (curated top study tags in active space)
+    top_sidebar_tags = sorted(
+        [(t, c) for t, c in scope_tag_counts.items() if t not in _META_NOISE_TAGS],
+        key=lambda kv: (-kv[1], kv[0]),
+    )[:16]
+    if active_tag and all(t != active_tag for t, _ in top_sidebar_tags):
+        top_sidebar_tags.insert(0, (active_tag, scope_tag_counts.get(active_tag, 0)))
+    sidebar_tag_chips = "".join(
+        f'<a class="tag-chip {"active" if t == active_tag else ""}" '
+        f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+        f'<span>#{html.escape(t)}</span><span class="tag-chip-cnt">{c}</span></a>'
+        for t, c in top_sidebar_tags
+    )
+    sidebar_tags_open = " open" if (active_tag or active_view == "tags") else ""
+    sidebar_tags_html = (
+        f'<details class="sidebar-tags"{sidebar_tags_open}>'
+        f'<summary class="sidebar-tags-summary"><span>Labels</span>'
+        f'<span class="tree-count">{len(scope_tag_counts)}</span></summary>'
+        f'<div class="sidebar-tag-cloud">{sidebar_tag_chips}</div>'
+        f'<a class="sidebar-tags-all" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">'
+        f'Browse all {len(scope_tag_counts)} labels →</a>'
+        f"</details>"
+        if scope_tag_counts
+        else ""
+    )
+
+    # Group notes into collapsible topic tree and track study-ordered sequence per bucket for Prev/Next traversal
     buckets: dict[str, list[dict[str, object]]] = {k: [] for k, _, _ in DASHBOARD["groups"]}
     for n in notes:
         b_key = _classify_confluence_bucket(str(n["path"]))
@@ -3710,9 +3842,16 @@ def render_dashboard_page(
 
     def _note_sort_key(n: dict[str, object]) -> tuple[int, str]:
         p = str(n["path"])
-        fname = p.rsplit("/", 1)[-1].lower()
-        is_overview = 0 if (fname.startswith("00-") or fname == "readme.md" or fname.startswith("master-")) else 1
-        return (is_overview, _humanize_note_title(str(n["title"]), p).lower())
+        raw_ord = n.get("order")
+        if raw_ord is not None:
+            try:
+                ord_val = int(raw_ord)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                ord_val = 1000
+        else:
+            fname = p.rsplit("/", 1)[-1].lower()
+            ord_val = 0 if (fname.startswith(("00-", "master-")) or fname == "readme.md") else 1000
+        return (ord_val, _humanize_note_title(str(n["title"]), p).lower())
 
     sorted_buckets: dict[str, list[dict[str, object]]] = {}
     for b_key, _, _ in DASHBOARD["groups"]:
@@ -3724,9 +3863,12 @@ def render_dashboard_page(
         else:
             sorted_buckets[b_key] = sorted(b_notes, key=_note_sort_key)
 
+    tag_sorted_notes = sorted(notes, key=_note_sort_key) if active_tag else []
     non_empty_bucket_keys = [k for k, _, _ in DASHBOARD["groups"] if sorted_buckets.get(k)]
     tree_groups_html: list[str] = []
     q_param_suffix = f"&q={urllib.parse.quote(q_clean)}" if q_clean else ""
+    tag_param_suffix = f"&tag={urllib.parse.quote(active_tag)}" if active_tag else ""
+    active_filter_suffix = q_param_suffix + tag_param_suffix
     for b_key, b_label_raw, default_open in DASHBOARD["groups"]:
         b_notes_sorted = sorted_buckets.get(b_key, [])
         if not b_notes_sorted:
@@ -3734,20 +3876,27 @@ def render_dashboard_page(
         b_label = _strip_leading_emoji(b_label_raw)
         has_active = any(str(n["path"]) == active_path_str for n in b_notes_sorted)
         # When reading a specific note, open ONLY the active topic so the current note stays visible near top of sidebar
-        if active_view == "reader" and active_path_str:
+        if active_view == "reader" and active_path_str and not active_tag:
             should_open = has_active
         else:
             should_open = (
                 has_active
                 or bool(q_clean)
+                or bool(active_tag)
                 or len(non_empty_bucket_keys) <= 2
-                or (default_open and active_view != "topics")
-            ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not q_clean and len(non_empty_bucket_keys) > 1)
+                or (default_open and active_view not in ("topics", "tags"))
+            ) and not (b_key in ("qbanks", "archive", "biz_vynq") and not has_active and not q_clean and not active_tag and len(non_empty_bucket_keys) > 1)
         items_html: list[str] = []
+        ordered_step = 0
         for n in b_notes_sorted:
             n_path = str(n["path"])
             is_act = "active-note" if active_path_str == n_path else ""
             clean_title = _humanize_note_title(str(n["title"]), n_path)
+            n_ord = int(n.get("order") if n.get("order") is not None else 1000)  # type: ignore[arg-type]
+            step_prefix = ""
+            if 0 < n_ord < 1000:
+                ordered_step += 1
+                step_prefix = f"<span class='tree-step'>{ordered_step}.</span> "
             sub_hint = ""
             if b_key == "company":
                 parts = n_path.split("/")
@@ -3759,9 +3908,9 @@ def render_dashboard_page(
                     sub_hint = f"<span class='tree-sub'>{html.escape(parts[1].upper())}</span> "
             items_html.append(
                 f'<li><a class="tree-item {is_act}" '
-                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}{q_param_suffix}" '
+                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}{active_filter_suffix}" '
                 f'title="{html.escape(n_path)}">'
-                f'<span class="tree-title">{sub_hint}{html.escape(clean_title)}{_note_badge(n_path, b_key)}</span>'
+                f'<span class="tree-title">{step_prefix}{sub_hint}{html.escape(clean_title)}{_note_badge(n_path, b_key)}</span>'
                 f"</a></li>"
             )
         open_attr = " open" if should_open else ""
@@ -3774,12 +3923,22 @@ def render_dashboard_page(
             f'<ul class="note-list">{"".join(items_html)}</ul>'
             f"</details>"
         )
+    active_tag_sidebar_bar = (
+        f'<div class="sidebar-active-tag">'
+        f'<span>Label <strong>#{html.escape(active_tag)}</strong></span>'
+        f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">Clear</a>'
+        f"</div>"
+        if active_tag
+        else ""
+    )
     notes_tree_html = "".join(tree_groups_html) or '<p class="muted">No matching pages in this folder.</p>'
 
     # Breadcrumbs (parent folders only; H1 displays the document title cleanly) + Prev/Next traversal
     breadcrumbs_html = ""
     pager_html = ""
     active_topic_badge = ""
+    active_page_tags_html = ""
+    right_rail_tags_html = ""
     if active_note_meta:
         parts = str(active_note_meta["path"]).split("/")
         crumbs: list[str] = [f'<a href="{safe_base_path}?scope=&view=topics">Vault</a>']
@@ -3795,29 +3954,46 @@ def render_dashboard_page(
             )
         breadcrumbs_html = '<nav class="breadcrumbs" aria-label="Breadcrumb">' + ' <span class="crumb-sep" aria-hidden="true">/</span> '.join(crumbs) + "</nav>"
 
+        page_tags = _note_tags_norm(active_note_meta)
+        if page_tags:
+            tag_pills_str = "".join(
+                f'<a class="doc-tag-pill {"active" if t == active_tag else ""}" '
+                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+                f'#{html.escape(t)}</a>'
+                for t in page_tags
+            )
+            active_page_tags_html = f'<div class="doc-tags-bar" aria-label="Page labels">{_svg_icon("tag")}{tag_pills_str}</div>'
+            right_rail_tags_html = (
+                '<div class="rail-tags"><div class="toc-header">Page Labels</div>'
+                f'<div class="sidebar-tag-cloud">{tag_pills_str}</div></div>'
+            )
+
         active_bucket = _classify_confluence_bucket(active_path_str)
         active_topic_label = group_labels.get(active_bucket, "")
         if active_topic_label:
             active_topic_badge = f"<span class='badge topic-badge'>{html.escape(active_topic_label)}</span>"
-        topic_list = sorted_buckets.get(active_bucket, [])
-        if topic_list:
-            idx = next((i for i, item in enumerate(topic_list) if str(item["path"]) == active_path_str), -1)
-            prev_item = topic_list[idx - 1] if idx > 0 else None
-            next_item = topic_list[idx + 1] if 0 <= idx < len(topic_list) - 1 else None
+        pager_list = tag_sorted_notes if (active_tag and tag_sorted_notes) else sorted_buckets.get(active_bucket, [])
+        if pager_list:
+            idx = next((i for i, item in enumerate(pager_list) if str(item["path"]) == active_path_str), -1)
+            prev_item = pager_list[idx - 1] if idx > 0 else None
+            next_item = pager_list[idx + 1] if 0 <= idx < len(pager_list) - 1 else None
             if prev_item or next_item:
                 prev_html = (
-                    f'<a class="pager-link pager-prev" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(prev_item["path"]))}">'
+                    f'<a class="pager-link pager-prev" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(prev_item["path"]))}{tag_param_suffix}">'
                     f'<span class="pager-dir">← Previous</span>'
                     f'<span class="pager-title">{html.escape(_humanize_note_title(str(prev_item["title"]), str(prev_item["path"])))}</span></a>'
                     if prev_item
                     else '<span class="pager-spacer"></span>'
                 )
-                mid_html = (
-                    f'<a class="pager-mid" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">'
-                    f'All topics ({idx + 1}/{len(topic_list)})</a>'
+                mid_href = (
+                    f"{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(active_tag)}"
+                    if active_tag
+                    else f"{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics"
                 )
+                mid_lbl = f"All #{active_tag} ({idx + 1}/{len(pager_list)})" if active_tag else f"All topics ({idx + 1}/{len(pager_list)})"
+                mid_html = f'<a class="pager-mid" href="{mid_href}">{html.escape(mid_lbl)}</a>'
                 next_html = (
-                    f'<a class="pager-link pager-next" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(next_item["path"]))}">'
+                    f'<a class="pager-link pager-next" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(next_item["path"]))}{tag_param_suffix}">'
                     f'<span class="pager-dir">Next →</span>'
                     f'<span class="pager-title">{html.escape(_humanize_note_title(str(next_item["title"]), str(next_item["path"])))}</span></a>'
                     if next_item
@@ -3853,8 +4029,8 @@ def render_dashboard_page(
             "</section>"
         )
 
-    # Sticky Right-Hand Context Column: TOC on Reader, ALL Topics Jump on Topics, hidden on Search (Facts takes top slot)
-    if active_view == "search":
+    # Sticky Right-Hand Context Column: TOC on Reader, ALL Topics Jump on Topics, hidden on Search/Tag views
+    if active_view in ("search", "tags", "tag"):
         toc_html = ""
     elif toc_items:
         toc_links = "".join(
@@ -3894,6 +4070,10 @@ def render_dashboard_page(
         cur_qs.append(("note", active_path_str))
     elif active_view == "topics":
         cur_qs.append(("view", "topics"))
+    elif active_view == "tags":
+        cur_qs.append(("view", "tags"))
+    if active_tag:
+        cur_qs.append(("tag", active_tag))
     if q_clean:
         cur_qs.append(("q", q_clean))
     current_page_url = f"{base_path or '/'}?{urllib.parse.urlencode(cur_qs)}"
@@ -4119,15 +4299,145 @@ def render_dashboard_page(
             "<h2 class='section-kicker'>Browse by Topic</h2>"
             f"<div class='topic-grid'>{''.join(topic_cards)}</div></section>"
         )
-    elif active_note_meta:
-        back_to_search_html = (
-            f"<div class='search-banner'>"
-            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {int(search_res.get('notes_total') or len(search_res['notes']))} results for \"{html.escape(q_clean)}\"</a>"
-            f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear filter</a>"
-            f"</div>"
-            if q_clean
+    elif active_view == "tags":
+        heading_scope = _folder_label(scope_filter)
+        study_tags = sorted(
+            [(t, c) for t, c in scope_tag_counts.items() if t not in _META_NOISE_TAGS and c >= 2],
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        all_tags_az = sorted(scope_tag_counts.items(), key=lambda kv: kv[0])
+        featured_pills = "".join(
+            f'<a class="label-dir-pill" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+            f'<span class="label-dir-name">#{html.escape(t)}</span>'
+            f'<span class="label-dir-cnt">{c}</span></a>'
+            for t, c in study_tags
+        )
+        all_pills = "".join(
+            f'<a class="label-dir-pill label-dir-pill-sm" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+            f'<span class="label-dir-name">#{html.escape(t)}</span>'
+            f'<span class="label-dir-cnt">{c}</span></a>'
+            for t, c in all_tags_az
+        )
+        scope_toggle = (
+            f" · <a href='{safe_base_path}?scope=&view=tags'>View labels across entire vault ({len(vault_tag_counts)}) →</a>"
+            if scope_filter
             else ""
         )
+        reader_body_html = (
+            "<div class='topics-header'>"
+            f"<h1>Labels in {html.escape(heading_scope)}</h1>"
+            f"<p class='muted'><strong>{len(scope_tag_counts)}</strong> labels across <strong>{len(all_scope_notes)}</strong> pages. "
+            f"Pick any label to see every linked page in study order{scope_toggle}</p>"
+            "</div>"
+            + (
+                "<section class='label-section'>"
+                "<h2 class='section-kicker'>Popular Study &amp; Topic Labels</h2>"
+                f"<div class='label-cloud'>{featured_pills}</div></section>"
+                if featured_pills
+                else ""
+            )
+            + "<section class='label-section'>"
+            f"<h2 class='section-kicker'>All Labels A–Z ({len(all_tags_az)})</h2>"
+            + (f"<div class='label-cloud'>{all_pills}</div>" if all_pills else "<p class='muted'>No labels indexed in this folder yet.</p>")
+            + "</section>"
+        )
+    elif active_view == "tag":
+        heading_scope = _folder_label(scope_filter)
+        related_counts: dict[str, int] = {}
+        for tn in tag_sorted_notes:
+            for rt in _note_tags_norm(tn):
+                if rt != active_tag and rt not in _META_NOISE_TAGS:
+                    related_counts[rt] = related_counts.get(rt, 0) + 1
+        related_chips = "".join(
+            f'<a class="filter-chip" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(rt)}">'
+            f'#{html.escape(rt)} ({rc})</a>'
+            for rt, rc in sorted(related_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:16]
+        )
+        tag_cards: list[str] = []
+        for idx, tn in enumerate(tag_sorted_notes, 1):
+            tp = str(tn["path"])
+            t_bkey = _classify_confluence_bucket(tp)
+            t_title = _humanize_note_title(str(tn["title"]), tp)
+            t_bucket = group_labels.get(t_bkey, str(tn["scope"]))
+            t_sum = _clean_latex_inline(str(tn.get("summary") or "").strip())
+            if len(t_sum) > 220:
+                t_sum = t_sum[:217].rstrip() + "…"
+            other_tags = [t for t in _note_tags_norm(tn) if t != active_tag and t not in _META_NOISE_TAGS][:6]
+            inline_tags = "".join(
+                f'<span class="result-tag">#{html.escape(ot)}</span>' for ot in other_tags
+            )
+            tag_cards.append(
+                f'<a class="result-card tag-seq-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(tp)}&tag={urllib.parse.quote(active_tag)}">'
+                f'<span class="seq-num">{idx}</span>'
+                f'<div class="tag-seq-body">'
+                f'<div class="result-top"><span class="result-title">{html.escape(t_title)}{_note_badge(tp, t_bkey)}</span>'
+                f'<span class="result-date">{html.escape(str(tn.get("updated_at") or "")[:10])}</span></div>'
+                f'<div class="result-meta"><span class="badge topic-badge">{html.escape(t_bucket)}</span> {inline_tags}</div>'
+                + (f'<p class="result-snippet">{html.escape(t_sum)}</p>' if t_sum else "")
+                + "</div></a>"
+            )
+        vault_fallback = ""
+        if scope_filter and vault_tag_counts.get(active_tag, 0) > len(tag_sorted_notes):
+            vault_fallback = (
+                f" · <a href='{safe_base_path}?scope=&tag={urllib.parse.quote(active_tag)}'>"
+                f"Show all {vault_tag_counts[active_tag]} across entire vault →</a>"
+            )
+        tag_crumbs = (
+            '<nav class="breadcrumbs" aria-label="Breadcrumb">'
+            f'<a href="{safe_base_path}?scope=&view=topics">Vault</a>'
+            ' <span class="crumb-sep" aria-hidden="true">/</span> '
+            + (
+                f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">{html.escape(heading_scope)}</a>'
+                ' <span class="crumb-sep" aria-hidden="true">/</span> '
+                if scope_filter
+                else ""
+            )
+            + f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">Labels</a>'
+            "</nav>"
+        )
+        reader_body_html = (
+            "<div class='search-header'>"
+            + tag_crumbs
+            + f"<h1>#{html.escape(active_tag)}</h1>"
+            + f"<p class='muted'><strong>{len(tag_sorted_notes)}</strong> page(s) in <strong>{html.escape(heading_scope)}</strong> in study order"
+            + vault_fallback
+            + f" · <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags'>All labels</a></p>"
+            + (
+                f"<div class='filter-chip-row' aria-label='Related sub-labels'><span class='sub-label-hint'>Sub-topics:</span>{related_chips}</div>"
+                if related_chips
+                else ""
+            )
+            + "</div>"
+            + (
+                f'<div class="result-list">{"".join(tag_cards)}</div>'
+                if tag_cards
+                else (
+                    f"<p class='muted'>No pages tagged <code>#{html.escape(active_tag)}</code> in <strong>{html.escape(heading_scope)}</strong>."
+                    + (
+                        f" <a href='{safe_base_path}?scope=&tag={urllib.parse.quote(active_tag)}'>Browse {vault_tag_counts[active_tag]} page(s) across the entire vault →</a>"
+                        if scope_filter and vault_tag_counts.get(active_tag, 0) > 0
+                        else f" <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags'>Browse all labels →</a>"
+                    )
+                    + "</p>"
+                )
+            )
+        )
+    elif active_note_meta:
+        back_to_search_html = ""
+        if q_clean:
+            back_to_search_html = (
+                f"<div class='search-banner'>"
+                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {int(search_res.get('notes_total') or len(search_res['notes']))} results for \"{html.escape(q_clean)}\"</a>"
+                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear filter</a>"
+                f"</div>"
+            )
+        elif active_tag:
+            back_to_search_html = (
+                f"<div class='search-banner'>"
+                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(active_tag)}'>← Back to #{html.escape(active_tag)} ({len(tag_sorted_notes)} pages)</a>"
+                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear label</a>"
+                f"</div>"
+            )
         reader_body_html = (
             back_to_search_html
             + breadcrumbs_html
@@ -4135,6 +4445,7 @@ def render_dashboard_page(
             + f"<span>~{read_minutes} min read</span>"
             + f"<span>Updated {html.escape(str(active_note_meta['updated_at'])[:10])} by <strong>{html.escape(str(active_note_meta['updated_by']))}</strong></span>"
             + f"{active_download_btn}</div>"
+            + active_page_tags_html
             + note_html
             + f"<div class='doc-source-foot'>Source file: <span class='meta-mono'>{html.escape(str(active_note_meta['path']))}</span></div>"
             + pager_html
@@ -4163,7 +4474,12 @@ def render_dashboard_page(
     facts_open_attr = " open" if active_view == "search" else ""
     writable_tooltip = html.escape("Writable folders: " + ", ".join(writable_scopes_for(actor)), quote=True)
     topics_nav_active = "active" if active_view == "topics" else ""
-    mobile_notes_tab_label = f"Matches ({len(notes)})" if q_clean else f"Notes ({len(notes)})"
+    tags_nav_active = "active" if active_view in ("tags", "tag") else ""
+    mobile_notes_tab_label = (
+        f"Matches ({len(notes)})"
+        if q_clean
+        else (f"#{active_tag} ({len(notes)})" if active_tag else f"Notes ({len(notes)})")
+    )
     theme_toggle_form = (
         f'<form class="theme-form" method="post" action="{safe_base_path.rstrip("/")}/theme">'
         f'<input type="hidden" name="theme" value="{next_theme}">'
@@ -4216,7 +4532,7 @@ def render_dashboard_page(
     .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 9px; font-size: 0.84rem; width: 100%; font-family: inherit; }}
     .theme-toggle {{ cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; font-size: 0.81rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }}
     .theme-toggle:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .actor-tag {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.8rem; background: var(--panel); padding: 2px 6px 2px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
+    .actor-tag {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.8rem; background: var(--panel); padding: 4px 8px 4px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
     .actor-tag strong {{ color: var(--text); }}
     .actor-link, .signout-link {{ display: inline-flex; align-items: center; min-height: 28px; padding: 2px 7px; border-radius: 5px; text-decoration: none; font-weight: 600; }}
     .actor-link {{ color: var(--text); }}
@@ -4249,9 +4565,9 @@ def render_dashboard_page(
     .tree-group[open] > .tree-summary::before {{ content: "▾"; color: var(--accent); }}
     .tree-count {{ font-size: 0.73rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }}
     .note-list {{ list-style: none; padding: 2px 0 6px 8px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .tree-item {{ display: block; padding: 5px 8px; min-height: 28px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border-left: 2px solid transparent; }}
+    .tree-item {{ display: block; padding: 5px 8px; min-height: 28px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border: 1px solid transparent; }}
     .tree-item:hover {{ background: var(--panel); color: var(--accent); }}
-    .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border-left-color: var(--accent); }}
+    .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border-color: var(--accent-border); }}
     .tree-title {{ overflow-wrap: anywhere; text-align: left; }}
     .tree-sub {{ font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
     .reader-wrap {{ padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }}
@@ -4327,8 +4643,8 @@ def render_dashboard_page(
     pre code {{ word-break: normal; padding: 0; background: transparent; color: inherit; font-size: inherit; }}
     blockquote {{ margin: 16px 0; padding: 12px 16px; max-width: 72ch; border-left: 3px solid var(--accent); background: var(--quote-bg); border-radius: 0 8px 8px 0; }}
     blockquote p:last-child {{ margin-bottom: 0; }}
-    .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 18px 0 22px; border-top: 1.5px solid var(--border-strong); border-bottom: 1.5px solid var(--border-strong); }}
-    .table-wrap table {{ width: 100%; min-width: 540px; border-collapse: collapse; font-size: 0.88rem; background: transparent; font-variant-numeric: tabular-nums; }}
+    .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 18px 0 22px; }}
+    .table-wrap table {{ width: 100%; min-width: 540px; border-collapse: collapse; font-size: 0.88rem; background: transparent; font-variant-numeric: tabular-nums; border-top: 1.5px solid var(--border-strong); border-bottom: 1.5px solid var(--border-strong); }}
     th, td {{ border-bottom: 1px solid var(--border); padding: 10px 14px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }}
     tbody tr:last-child td {{ border-bottom: none; }}
     th {{ background: var(--panel); color: var(--text); font-weight: 600; border-bottom: 1.5px solid var(--border-strong); }}
@@ -4350,7 +4666,7 @@ def render_dashboard_page(
     .facts-col {{ padding: 16px 14px 28px 12px; border-left: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); }}
     .toc-nav {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }}
     .toc-header {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }}
-    .toc-link {{ display: flex; align-items: baseline; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 5px 8px; min-height: 28px; border-left: 2px solid var(--border-strong); border-radius: 0 4px 4px 0; }}
+    .toc-link {{ display: flex; align-items: baseline; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 5px 8px; min-height: 28px; border-left: 2px solid var(--border-strong); }}
     .toc-link:hover {{ color: var(--accent); border-left-color: var(--accent); background: var(--panel); }}
     .toc-cnt {{ font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
     .toc-h3 {{ padding-left: 16px; font-size: 0.77rem; }}
@@ -4410,6 +4726,40 @@ def render_dashboard_page(
         outline: 2px solid var(--accent); outline-offset: -2px;
       }}
     }}
+    .sidebar-tags {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
+    .sidebar-tags-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 6px; min-height: 30px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); user-select: none; }}
+    .sidebar-tags-summary::-webkit-details-marker {{ display: none; }}
+    .sidebar-tags-summary:hover {{ background: var(--panel); color: var(--text); }}
+    .sidebar-tag-cloud {{ display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }}
+    .tag-chip {{ display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--canvas); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
+    .tag-chip:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
+    .tag-chip.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
+    .tag-chip-cnt {{ font-size: 0.71rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
+    .tag-chip.active .tag-chip-cnt {{ color: var(--accent); }}
+    .sidebar-tags-all {{ display: inline-flex; align-items: center; min-height: 28px; margin-top: 8px; padding: 2px 6px; font-size: 0.78rem; font-weight: 600; color: var(--accent); text-decoration: none; border-radius: 5px; }}
+    .sidebar-tags-all:hover {{ background: var(--accent-soft); text-decoration: underline; }}
+    .sidebar-active-tag {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.78rem; color: var(--text); }}
+    .sidebar-active-tag a {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
+    .sidebar-active-tag a:hover {{ text-decoration: underline; }}
+    .tree-step {{ font-size: 0.74rem; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 2px; }}
+    .doc-tags-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -12px 0 22px; color: var(--muted); }}
+    .doc-tag-pill {{ display: inline-flex; align-items: center; min-height: 26px; padding: 2px 9px; border-radius: 999px; font-size: 0.76rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--panel); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
+    .doc-tag-pill:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
+    .doc-tag-pill.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
+    .rail-tags {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }}
+    .label-section {{ margin-bottom: 24px; }}
+    .label-cloud {{ display: flex; flex-wrap: wrap; gap: 8px; }}
+    .label-dir-pill {{ display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 5px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; text-decoration: none; color: var(--text); background: var(--canvas); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
+    .label-dir-pill:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
+    .label-dir-pill-sm {{ min-height: 30px; padding: 4px 10px; font-size: 0.8rem; font-weight: 500; color: var(--text-body); }}
+    .label-dir-cnt {{ font-size: 0.74rem; font-weight: 700; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; font-variant-numeric: tabular-nums; }}
+    .label-dir-pill:hover .label-dir-cnt {{ color: var(--accent); background: var(--canvas); }}
+    .sub-label-hint {{ font-size: 0.78rem; font-weight: 600; color: var(--muted); align-self: center; margin-right: 2px; }}
+    .tag-seq-card {{ display: flex; align-items: flex-start; gap: 14px; }}
+    .seq-num {{ flex-shrink: 0; min-width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 0.78rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 1px; }}
+    .tag-seq-card:hover .seq-num {{ background: var(--canvas); border-color: var(--accent-border); color: var(--accent); }}
+    .tag-seq-body {{ flex: 1 1 auto; min-width: 0; }}
+    .result-tag {{ font-size: 0.74rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); }}
     @media (max-width: 768px) {{
       header {{ padding: 8px 12px; gap: 8px; }}
       .brand {{ font-size: 0.94rem; min-height: 40px; }}
@@ -4424,7 +4774,7 @@ def render_dashboard_page(
       .mobile-upload-form {{ display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }}
       .mobile-upload-form select, .mobile-upload-form input {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px; font-size: 15px; width: 100%; }}
       .mobile-upload-form button {{ background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 10px; min-height: 42px; font-weight: 700; cursor: pointer; }}
-      .nav-pill {{ min-height: 40px; padding: 6px 12px; font-size: 0.82rem; }}
+      .nav-pill {{ min-height: 40px; padding: 6px 10px; font-size: 0.8rem; }}
       .search-form {{ order: 3; flex: 1 1 100%; max-width: 100%; }}
       .search-scope {{ max-width: 112px; min-height: 40px; font-size: 0.8rem; }}
       .search-form input[type="search"] {{ font-size: 16px; min-height: 40px; padding: 6px 10px; }}
@@ -4454,6 +4804,7 @@ def render_dashboard_page(
       <div class="brand-wrap">
         <a class="brand" href="{safe_base_path}?scope=&view=topics" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">{_svg_icon("vault")}<span>{html.escape(dashboard_title)}<span class="brand-long"> Vault</span></span></a>
         <a class="nav-pill {topics_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">{_svg_icon("grid")}<span>Topics</span></a>
+        <a class="nav-pill {tags_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">{_svg_icon("tag")}<span>Labels</span></a>
       </div>
       <form class="search-form" method="get" action="{safe_base_path}">
         <select class="search-scope" name="scope" aria-label="Search scope">{search_scope_options}</select>
@@ -4508,10 +4859,12 @@ def render_dashboard_page(
     </nav>
     <div class="layout">
       <aside class="sidebar" aria-label="Folder navigation">
-        <div class="sidebar-section-label">Folders</div>
+        <div class="sidebar-section-label">Spaces</div>
         <div class="scope-strip">{scope_pills}</div>
         {quick_links_html}
+        {sidebar_tags_html}
         <div class="sidebar-section-label">Topics &amp; Pages ({len(notes)})</div>
+        {active_tag_sidebar_bar}
         {notes_tree_html}
       </aside>
       <div class="reader-wrap">
@@ -4521,6 +4874,7 @@ def render_dashboard_page(
       </div>
       <aside class="facts-col" aria-label="Page outline and AI facts">
         {toc_html}
+        {right_rail_tags_html}
         <details class="facts-drawer"{facts_open_attr}>
           <summary><span class="facts-drawer-title">{_svg_icon("spark")}<span>{facts_heading}</span></span><span class="tree-count">{active_fact_count}</span></summary>
           <div class="facts-drawer-body">
@@ -5847,7 +6201,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             "/api/v1/context": lambda: op_build_context(
                 conn, target=arg("target", "path"), depth=_safe_int(arg("depth", default="1"), "depth", default=1)
             ),
-            "/api/v1/notes": lambda: op_list_notes(conn, scope=arg("scope")),
+            "/api/v1/notes": lambda: op_list_notes(conn, scope=arg("scope"), tag=arg("tag")),
+            "/api/v1/tags": lambda: op_list_tags(conn, scope=arg("scope")),
             "/api/v1/note": lambda: op_read_note(conn, arg("path")),
         }  # fmt: skip
         if route in read_api:
@@ -5922,6 +6277,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 selected_note=(query.get("note") or [""])[0],
                 scope_filter=(query.get("scope") or [""])[0],
                 search_query=(query.get("q") or [""])[0],
+                tag_filter=(query.get("tag") or [""])[0],
                 view=(query.get("view") or [""])[0],
                 session_token=self.owner_cookie_token(),
                 theme=theme,
@@ -6527,6 +6883,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             if route == "/api/v1/note":
                 raw_tags = data.get("tags")
                 tags = [str(x) for x in raw_tags] if isinstance(raw_tags, list) else []
+                raw_order = data.get("order")
+                order_val = _safe_int(raw_order, "order", default=0) if raw_order is not None and str(raw_order).strip() != "" else None
                 res = op_write_note(
                     conn,
                     effective_actor,
@@ -6538,6 +6896,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     tags=tags,
                     mode=str(data.get("mode") or "replace"),
                     section=str(data.get("section") or ""),
+                    order=order_val,
                 )
                 self.send_json(200, res)
                 return
