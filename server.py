@@ -3625,6 +3625,24 @@ BASE_THEME_CSS = """
     }
     ::placeholder { color: var(--muted); opacity: 1; }
     .ico { flex-shrink: 0; vertical-align: -2px; }
+    @supports (appearance: base-select) {
+      select, select::picker(select) { appearance: base-select; }
+      select { cursor: pointer; align-items: center; gap: 6px; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+      select:open, select:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); outline: none; }
+      select::picker-icon { color: var(--muted); transition: transform 0.15s ease, color 0.15s ease; }
+      select:open::picker-icon { transform: rotate(180deg); color: var(--accent); }
+      select::picker(select) {
+        margin-top: 4px; padding: 6px 0; border-radius: 12px;
+        border: 1px solid var(--border-strong); background: var(--canvas); color: var(--text);
+        box-shadow: 0 10px 30px rgba(15, 23, 42, 0.18);
+      }
+      select option {
+        padding: 9px 14px; min-height: 40px; display: flex; align-items: center; gap: 8px;
+        color: var(--text); background: transparent; cursor: pointer;
+      }
+      select option:hover { background: var(--panel); }
+      select option:checked { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    }
 """.replace("@@DARK@@", _DARK_VARS)
 
 
