@@ -18,12 +18,14 @@ come from the JSON file named by MEMORY_SETTINGS; see settings.example.json.
 from __future__ import annotations
 
 import base64
+from collections import Counter
 import contextvars
 import functools
 import hashlib
 import hmac
 import html
 import io
+import ipaddress
 import json
 import os
 import queue
@@ -1146,34 +1148,37 @@ def extract_inline_observations(text: str) -> list[dict[str, object]]:
     return out
 
 
+_TAG_CLEAN_RE = re.compile(r"[^a-z0-9_./-]+")
+
+
+@functools.lru_cache(maxsize=4096)
 def _normalize_tag(raw: str | None) -> str:
-    cleaned = re.sub(r"[^a-z0-9_./-]+", "-", (raw or "").strip().lstrip("#").lower()).strip("-")
-    return cleaned
+    cleaned = _TAG_CLEAN_RE.sub("-", (raw or "")[:128].strip().lstrip("#").lower()).strip("-")
+    return cleaned[:64]
 
 
 def _note_tags_norm(note: dict[str, object]) -> list[str]:
     raw_tags = note.get("tags")
     if not isinstance(raw_tags, list):
         return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for t in raw_tags:
-        nt = _normalize_tag(str(t))
-        if nt and nt not in seen:
-            seen.add(nt)
-            out.append(nt)
-    return out
+    return list(dict.fromkeys(nt for t in raw_tags if (nt := _normalize_tag(str(t)))))
+
+
+def _count_tags(notes: list[dict[str, object]]) -> Counter[str]:
+    return Counter(tg for n in notes for tg in _note_tags_norm(n))
 
 
 def _parse_sort_order(meta: dict[str, object], rel_path: str) -> int:
     raw = meta.get("order")
-    if raw is not None and str(raw).strip() != "":
-        try:
-            val = int(str(raw).strip())
-            if 0 <= val <= 999999:
-                return val
-        except ValueError:
-            pass
+    if raw is not None and not isinstance(raw, bool):
+        raw_s = str(raw).split("#", 1)[0].strip()
+        if raw_s:
+            try:
+                val = int(raw_s)
+                if 0 <= val <= 999999:
+                    return val
+            except ValueError:
+                pass
     fname = rel_path.rsplit("/", 1)[-1].lower()
     if fname.startswith(("00-", "master-")) or fname == "readme.md":
         return 0
@@ -1304,7 +1309,9 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
     # were over half the scan's time. Same rule: inside the vault after resolving.
     base = str(vault_real)
     inside = lambda real: real == base or real.startswith(base + os.sep)  # noqa: E731
+    db_hashes = {str(r["path"]): str(r["sha256"]) for r in conn.execute("SELECT path, sha256 FROM notes").fetchall()}
     seen: set[str] = set()
+    dirty = False
     for root_str, dirs, files in os.walk(VAULT_DIR, followlinks=False):
         root_path = Path(root_str)
         try:
@@ -1335,7 +1342,11 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
             if not fname_low.endswith(SUPPORTED_VAULT_EXTENSIONS) or fname.startswith("."):
                 continue
             file = root_path / fname
-            if file.is_symlink():
+            try:
+                st = file.lstat()
+            except OSError:
+                continue
+            if stat.S_ISLNK(st.st_mode):
                 continue
             try:
                 resolved_file = os.path.realpath(file)
@@ -1346,17 +1357,12 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                 continue
             if not should_index_vault_file(rel):
                 continue
-            try:
-                st = file.stat(follow_symlinks=False)
-            except OSError:
-                continue
             if not fname_low.endswith(".md") and st.st_size > MAX_BINARY_DOC_BYTES:
                 continue
             seen.add(rel)
             cached = _VAULT_STAT_CACHE.get(rel)
             if cached and cached[0] == (st.st_ino, st.st_mtime_ns, st.st_size):
-                existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
-                if existing and existing["sha256"] == cached[1]:
+                if db_hashes.get(rel) == cached[1]:
                     continue
             try:
                 data, st = read_vault_file(rel)
@@ -1365,8 +1371,7 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                 continue
             sha = hashlib.sha256(data).hexdigest()
             _VAULT_STAT_CACHE[rel] = ((st.st_ino, st.st_mtime_ns, st.st_size), sha)
-            existing = conn.execute("SELECT sha256 FROM notes WHERE path = ?", (rel,)).fetchone()
-            if existing and existing["sha256"] == sha:
+            if db_hashes.get(rel) == sha:
                 continue
 
             if fname_low.endswith(".md"):
@@ -1400,16 +1405,18 @@ def sync_vault_notes(conn: sqlite3.Connection) -> None:
                 sort_order = _parse_sort_order({}, rel)
 
             index_note_row(conn, rel, scope, title, summary, tags, body, updated_by, updated_at, sha, sort_order=sort_order)
+            dirty = True
 
-    db_paths = [r["path"] for r in conn.execute("SELECT path FROM notes").fetchall()]
-    for old_path in db_paths:
+    for old_path in db_hashes:
         if old_path not in seen:
             _VAULT_STAT_CACHE.pop(old_path, None)
             conn.execute("DELETE FROM notes WHERE path = ?", (old_path,))
             conn.execute("DELETE FROM notes_fts WHERE path = ?", (old_path,))
             conn.execute("DELETE FROM note_links WHERE source_path = ?", (old_path,))
             conn.execute("DELETE FROM note_observations WHERE source_path = ?", (old_path,))
-    conn.commit()
+            dirty = True
+    if dirty:
+        conn.commit()
 
 
 def refresh_human_dashboards(conn: sqlite3.Connection) -> None:
@@ -1931,8 +1938,10 @@ def op_write_note(
                 "updated_at": ts,
             }
         )
-        if order is not None and 0 <= int(order) <= 999999:
-            meta_to_write["order"] = int(order)
+        if order is not None:
+            if isinstance(order, bool) or not isinstance(order, int) or not (0 <= order <= 999999):
+                raise MemoryError("order must be an integer between 0 and 999999")
+            meta_to_write["order"] = order
         sort_order = _parse_sort_order(meta_to_write, rel_path)
         full_text = format_frontmatter(meta_to_write, final_body)
         atomic_write_text(target, full_text)
@@ -2068,6 +2077,7 @@ def op_upload_document(
             actor,
             ts,
             sha,
+            sort_order=_parse_sort_order({}, rel_path),
         )
         conn.commit()
         refresh_human_dashboards(conn)
@@ -2329,6 +2339,10 @@ def op_build_context(
 
 
 def op_list_notes(conn: sqlite3.Connection, scope: str = "", tag: str = "") -> dict[str, object]:
+    raw_tag = (tag or "").strip()
+    norm_tag = _normalize_tag(raw_tag)
+    if raw_tag and not norm_tag:
+        return {"count": 0, "tag": "", "notes": []}
     with DB_LOCK:
         sync_vault_notes(conn)
         if (scope or "").strip():
@@ -2339,14 +2353,14 @@ def op_list_notes(conn: sqlite3.Connection, scope: str = "", tag: str = "") -> d
                 (norm, f"{esc_norm}/%"),
             ).fetchall()
         else:
+            order_sql = "sort_order ASC, path ASC" if norm_tag else "scope ASC, sort_order ASC, path ASC"
             rows = conn.execute(
-                "SELECT path, scope, title, summary, tags, sort_order, updated_by, updated_at FROM notes ORDER BY scope ASC, sort_order ASC, path ASC"
+                f"SELECT path, scope, title, summary, tags, sort_order, updated_by, updated_at FROM notes ORDER BY {order_sql}"
             ).fetchall()
-        norm_tag = _normalize_tag(tag)
         notes_out: list[dict[str, object]] = []
         for r in rows:
             tag_list = json.loads(r["tags"] or "[]")
-            if norm_tag and norm_tag not in {_normalize_tag(str(t)) for t in tag_list}:
+            if norm_tag and not (isinstance(tag_list, list) and any(_normalize_tag(str(t)) == norm_tag for t in tag_list)):
                 continue
             notes_out.append(
                 {
@@ -2364,13 +2378,52 @@ def op_list_notes(conn: sqlite3.Connection, scope: str = "", tag: str = "") -> d
 
 
 def op_list_tags(conn: sqlite3.Connection, scope: str = "") -> dict[str, object]:
-    listed = op_list_notes(conn, scope=scope)
-    counts: dict[str, int] = {}
-    for n in listed["notes"]:  # type: ignore[union-attr]
-        for tg in _note_tags_norm(n):
-            counts[tg] = counts.get(tg, 0) + 1
+    with DB_LOCK:
+        sync_vault_notes(conn)
+        if (scope or "").strip():
+            norm = normalize_scope(scope)
+            esc_norm = _escape_like(norm)
+            rows = conn.execute(
+                "SELECT tags FROM notes WHERE scope = ? OR scope LIKE ? ESCAPE '\\'",
+                (norm, f"{esc_norm}/%"),
+            ).fetchall()
+        else:
+            rows = conn.execute("SELECT tags FROM notes").fetchall()
+    counts: Counter[str] = Counter()
+    for r in rows:
+        raw_tags = json.loads(r[0] or "[]")
+        if isinstance(raw_tags, list):
+            counts.update({nt for t in raw_tags if (nt := _normalize_tag(str(t)))})
     items = [{"tag": t, "count": c} for t, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
     return {"scope": scope, "count": len(items), "tags": items}
+
+
+def _query_recent_facts(
+    conn: sqlite3.Connection,
+    *,
+    norm_scope: str = "",
+    category: str = "",
+    val_mode: str = "all",
+    limit: int = 40,
+) -> list[dict[str, object]]:
+    """Fetch recent facts for a scope without scanning notes/observations (used by non-search dashboard renders)."""
+    sql_facts = "SELECT * FROM facts WHERE 1=1"
+    params_f: list[object] = []
+    where, args = _scope_sql("scope", norm_scope)
+    sql_facts += where
+    params_f.extend(args)
+    if category.strip():
+        sql_facts += " AND category = ?"
+        params_f.append(category.strip().lower())
+    if val_mode == "valid":
+        sql_facts += " AND status = 'active'"
+    elif val_mode == "invalid":
+        sql_facts += " AND status != 'active'"
+    sql_facts += " ORDER BY id DESC LIMIT ?"
+    params_f.append(limit)
+    with DB_LOCK:
+        rows = conn.execute(sql_facts, params_f).fetchall()
+    return [serialize_fact(r) for r in rows]
 
 
 def fts_query_tokens(query: str) -> str:
@@ -3652,6 +3705,310 @@ _META_NOISE_TAGS = frozenset(
 )
 
 
+DASHBOARD_CSS = (
+    "    html { scroll-behavior: smooth; background: var(--bg); }\n"
+    + BASE_THEME_CSS
+    + "\n"
+    + """    :root { --header-h: 58px; }
+    * { box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }
+    ::selection { background: var(--accent-soft); color: var(--accent); }
+    :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+    body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--text); line-height: 1.65; overflow-x: hidden; caret-color: var(--accent); }
+    .skip-link { position: absolute; left: -9999px; top: 8px; z-index: 100; background: var(--accent); color: var(--accent-fg); padding: 8px 14px; border-radius: 6px; font-weight: 700; text-decoration: none; }
+    .skip-link:focus-visible { left: 12px; }
+    .app-shell { min-height: 100vh; background: var(--bg); color: var(--text); width: 100%; max-width: 100vw; overflow-x: clip; }
+    .mview-radio { position: fixed; top: 0; left: 0; width: 0; height: 0; opacity: 0; pointer-events: none; margin: 0; }
+    header { min-height: var(--header-h); padding: 8px 20px; background: var(--header-bg); border-bottom: 1px solid var(--border); display: flex; flex-wrap: nowrap; gap: 12px; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 30; }
+    .brand-wrap { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+    .brand { display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 0.98rem; color: var(--text); letter-spacing: -0.015em; text-decoration: none; white-space: nowrap; min-height: 32px; padding: 2px 4px; border-radius: 6px; }
+    .brand:hover { color: var(--accent); }
+    .nav-pill { display: inline-flex; align-items: center; gap: 5px; font-size: 0.82rem; font-weight: 600; color: var(--text-body); text-decoration: none; min-height: 32px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }
+    .nav-pill:hover { border-color: var(--accent); color: var(--accent); }
+    .nav-pill.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+    .search-form { display: flex; gap: 6px; flex: 1 1 420px; max-width: 560px; min-width: 0; align-items: center; }
+    .search-scope { background: var(--panel); color: var(--text-body); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.81rem; max-width: 150px; min-height: 34px; flex-shrink: 0; }
+    .search-form input[type="search"] { width: 100%; min-width: 0; min-height: 34px; background: var(--canvas); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.86rem; }
+    .search-form input[type="search"]:focus { outline: 2px solid var(--accent); border-color: transparent; }
+    .search-form button, .upload-form button, .fact-add-form button { background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 6px 13px; min-height: 34px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }
+    .header-right { display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+    .theme-form { margin: 0; display: inline-flex; }
+    .upload-box, .mobile-menu { position: relative; }
+    .mobile-menu { display: none; }
+    .upload-box > summary, .mobile-menu > summary { list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--text-body); font-size: 0.81rem; font-weight: 600; white-space: nowrap; user-select: none; }
+    .upload-box > summary::-webkit-details-marker, .mobile-menu > summary::-webkit-details-marker { display: none; }
+    .upload-box[open] > summary, .mobile-menu[open] > summary { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+    .upload-box[open] > summary::before, .mobile-menu[open] > summary::before { content: " "; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 45; display: block; cursor: default; background: transparent; }
+    .upload-box:not([open]) .upload-form, .mobile-menu:not([open]) .mobile-menu-panel { display: none; }
+    .upload-form { position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 310px; max-width: calc(100vw - 24px); padding: 14px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }
+    .form-label { font-size: 0.76rem; font-weight: 600; color: var(--muted); margin-top: 2px; }
+    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea { background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 9px; font-size: 0.84rem; width: 100%; font-family: inherit; }
+    .theme-toggle { cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; font-size: 0.81rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }
+    .theme-toggle:hover { border-color: var(--accent); color: var(--accent); }
+    .actor-tag { display: inline-flex; align-items: center; gap: 4px; font-size: 0.8rem; background: var(--panel); padding: 4px 8px 4px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }
+    .actor-tag strong { color: var(--text); }
+    .actor-link, .signout-link { display: inline-flex; align-items: center; min-height: 28px; padding: 2px 7px; border-radius: 5px; text-decoration: none; font-weight: 600; }
+    .actor-link { color: var(--text); }
+    .actor-link:hover { background: var(--panel-hover); color: var(--accent); }
+    .signout-link { color: var(--red); }
+    .signout-link:hover { background: var(--red-bg); }
+    .dl-btn { display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }
+    .mobile-tabs { display: none; }
+    .layout { display: grid; grid-template-columns: 288px minmax(0, 1fr) 280px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }
+    .sidebar { padding: 14px 12px 28px 14px; border-right: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); text-align: left; }
+    .sidebar-section-label { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 2px 6px 6px; text-align: left; }
+    .scope-strip { display: flex; flex-direction: column; gap: 2px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .folder-row { display: flex; align-items: center; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--text-body); padding: 6px 8px; min-height: 32px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; border: 1px solid transparent; transition: background-color 0.15s ease, color 0.15s ease; min-width: 0; }
+    .folder-row-left { display: inline-flex; align-items: center; gap: 7px; min-width: 0; }
+    .pill-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pill-count { font-size: 0.74rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .folder-row:hover { background: var(--panel); color: var(--accent); }
+    .folder-row.active { color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); font-weight: 600; }
+    .folder-row.active .pill-count { color: var(--accent); }
+    .quick-links { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; text-align: left; }
+    .quick-link { display: block; padding: 6px 8px; min-height: 30px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: var(--text-body); text-decoration: none; text-align: left; }
+    .quick-link:hover { background: var(--panel); color: var(--accent); }
+    .quick-link.active-note { background: var(--accent-soft); color: var(--accent); font-weight: 600; }
+    .tree-group { margin-bottom: 4px; border-radius: 6px; text-align: left; }
+    .tree-summary, .sidebar-tags-summary { list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: flex-start; gap: 6px; border-radius: 6px; user-select: none; text-align: left; }
+    .tree-summary { padding: 6px 8px; min-height: 32px; font-size: 0.82rem; font-weight: 600; color: var(--text); }
+    .tree-summary::-webkit-details-marker, .sidebar-tags-summary::-webkit-details-marker { display: none; }
+    .tree-summary:hover { background: var(--panel); }
+    .tree-folder-name { flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-align: left; }
+    .tree-group > .tree-summary::before, .sidebar-tags-summary::before { content: "▸"; font-size: 0.76rem; color: var(--muted); flex-shrink: 0; }
+    .tree-group[open] > .tree-summary::before, .sidebar-tags[open] > .sidebar-tags-summary::before { content: "▾"; color: var(--accent); }
+    .tree-count { font-size: 0.73rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }
+    .note-list { list-style: none; padding: 2px 0 6px 8px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }
+    .tree-item { display: block; padding: 5px 8px; min-height: 28px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border: 1px solid transparent; }
+    .tree-item:hover { background: var(--panel); color: var(--accent); }
+    .tree-item.active-note { background: var(--accent-soft); color: var(--accent); font-weight: 600; border-color: var(--accent-border); }
+    .tree-title { overflow-wrap: anywhere; text-align: left; }
+    .tree-sub { font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }
+    .reader-wrap { padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }
+    .reader { max-width: 880px; width: 100%; min-width: 0; overflow-wrap: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }
+    .reader-sheet { background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 34px 44px; box-shadow: var(--shadow); }
+    .reader-flat { background: transparent; border: none; padding: 4px 0; }
+    html[data-theme="dark"] .reader { line-height: 1.76; letter-spacing: 0.005em; }
+    .search-banner { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.84rem; color: var(--text); }
+    .search-banner a { color: var(--accent); font-weight: 600; text-decoration: none; padding: 2px 4px; }
+    .search-banner a:hover { text-decoration: underline; }
+    .search-header, .topics-header { margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .filter-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }
+    .filter-chip { min-height: 30px; padding: 4px 11px; font-size: 0.79rem; color: var(--text-body); background: var(--canvas); }
+    .mobile-search-facts { display: none; margin-bottom: 18px; background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }
+    .mobile-search-facts summary { list-style: none; cursor: pointer; font-weight: 700; font-size: 0.86rem; color: var(--text); min-height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .mobile-search-facts summary::-webkit-details-marker { display: none; }
+    .mobile-search-facts summary::after { content: "▸"; color: var(--muted); font-size: 0.85rem; }
+    .mobile-search-facts[open] summary::after { content: "▾"; color: var(--accent); }
+    .mobile-fact-list { margin: 8px 0 0; padding-left: 1.1em; display: flex; flex-direction: column; gap: 6px; font-size: 0.86rem; }
+    .section-kicker { font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; border: none; padding: 0; }
+    .search-section { margin-bottom: 24px; }
+    .result-list { display: flex; flex-direction: column; gap: 10px; }
+    .result-card { display: block; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); transition: border-color 0.15s ease; }
+    .result-card:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .result-top { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }
+    .result-title { font-weight: 700; font-size: 1rem; color: var(--accent); }
+    .result-date { font-size: 0.78rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+    .result-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; font-size: 0.8rem; color: var(--muted); }
+    .result-snippet { margin: 8px 0 0; font-size: 0.89rem; line-height: 1.55; color: var(--text-body); max-width: none; }
+    mark { background: var(--mark-bg); color: var(--mark-fg); padding: 0 3px; border-radius: 3px; font-weight: 600; }
+    .topics-recent { margin-bottom: 24px; }
+    .recent-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .recent-card { display: flex; flex-direction: column; justify-content: space-between; gap: 4px; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); }
+    .recent-card:hover { border-color: var(--accent); background: var(--accent-soft); }
+    .recent-title { font-weight: 600; font-size: 0.88rem; color: var(--text); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .recent-meta { font-size: 0.77rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .topic-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }
+    .topic-card { padding: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 72px; }
+    .topic-card-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+    .topic-card-head h3 { margin: 0; font-size: 0.96rem; line-height: 1.3; color: var(--text); }
+    .topic-card-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-width: none; }
+    .topic-card-list li { margin: 0; }
+    .topic-card-list a { display: block; padding: 4px 0; min-height: 28px; text-decoration: none; color: var(--text-body); font-size: 0.86rem; line-height: 1.4; }
+    .topic-card-list a:hover { color: var(--accent); text-decoration: underline; }
+    .topic-more-link { display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); text-decoration: none; margin-top: 2px; }
+    .topic-more-link:hover { text-decoration: underline; }
+    .topic-more summary { cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); margin-top: 2px; }
+    .topic-more .topic-card-list { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }
+    .empty-state { padding: 8px 0; }
+    .breadcrumbs { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }
+    .breadcrumbs a { display: inline-flex; align-items: center; min-height: 28px; padding: 2px 4px; border-radius: 4px; color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }
+    .breadcrumbs a:hover { color: var(--accent); background: var(--panel); }
+    .crumb-sep { color: var(--muted); opacity: 0.6; }
+    .doc-meta-bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; font-size: 0.81rem; color: var(--muted); padding-bottom: 12px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .doc-source-foot { margin-top: 28px; padding-top: 12px; border-top: 1px dashed var(--border); font-size: 0.81rem; color: var(--muted); }
+    .meta-mono { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.96em; color: var(--muted); }
+    .reader h1, .reader h2, .reader h3, .reader h4 { color: var(--text); font-weight: 700; line-height: 1.28; letter-spacing: -0.02em; scroll-margin-top: 72px; text-wrap: balance; }
+    .reader h1 { font-size: 2rem; margin: 0 0 0.65em; }
+    .reader h2 { font-size: 1.45rem; margin-top: 1.85em; margin-bottom: 0.55em; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+    .reader h2.section-kicker { font-size: 0.78rem; margin: 0 0 12px; border: none; padding: 0; letter-spacing: 0.06em; color: var(--muted); }
+    .reader h3 { font-size: 1.14rem; margin-top: 1.45em; margin-bottom: 0.45em; }
+    .reader h4 { font-size: 0.96rem; margin-top: 1.2em; margin-bottom: 0.4em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }
+    .reader p { margin: 0 0 1.05em; max-width: 68ch; text-wrap: pretty; }
+    .reader ul, .reader ol { margin: 0 0 1.15em; padding-left: 1.5em; max-width: 68ch; }
+    .reader li { margin-bottom: 0.4em; text-wrap: pretty; }
+    .reader hr { border: none; border-top: 1px solid var(--border); margin: 1.8em 0; }
+    code { font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-inline-bg); color: var(--code-inline-fg); padding: 2px 5px; border-radius: 4px; font-size: 0.86em; word-break: break-word; }
+    .code-block { margin: 14px 0 18px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-strong); background: var(--pre-bg); }
+    .code-lang { background: rgba(255,255,255,0.06); color: #cbd5e1; font-size: 0.76rem; font-family: ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }
+    pre { background: var(--pre-bg); color: var(--pre-fg); margin: 0; padding: 14px 16px; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; line-height: 1.55; font-size: 0.86rem; }
+    pre code { word-break: normal; padding: 0; background: transparent; color: inherit; font-size: inherit; }
+    blockquote { margin: 16px 0; padding: 12px 16px; max-width: 72ch; border: 1px solid var(--accent-border); background: var(--quote-bg); border-radius: 8px; }
+    blockquote p:last-child { margin-bottom: 0; }
+    .table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 18px 0 22px; }
+    .table-wrap table { width: 100%; min-width: 540px; border-collapse: collapse; font-size: 0.88rem; background: transparent; font-variant-numeric: tabular-nums; border-top: 1.5px solid var(--border-strong); border-bottom: 1.5px solid var(--border-strong); }
+    th, td { border-bottom: 1px solid var(--border); padding: 10px 14px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }
+    tbody tr:last-child td { border-bottom: none; }
+    th { background: var(--panel); color: var(--text); font-weight: 600; border-bottom: 1.5px solid var(--border-strong); }
+    a.wikilink, a.ext-link { color: var(--accent); text-decoration: none; font-weight: 500; border-bottom: 1px solid var(--accent-border); text-underline-offset: 3px; }
+    a.wikilink:hover, a.ext-link:hover { background: var(--accent-soft); }
+    .pager-nav { margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center; }
+    .pager-link { display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); min-width: 0; }
+    .pager-link:hover { background: var(--accent-soft); }
+    .pager-next { text-align: right; }
+    .pager-dir { font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }
+    .pager-title { font-size: 0.86rem; font-weight: 600; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .pager-mid { display: inline-flex; align-items: center; min-height: 32px; font-size: 0.78rem; font-weight: 600; color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; background: var(--panel); white-space: nowrap; }
+    .pager-mid:hover { color: var(--accent); background: var(--accent-soft); }
+    .connected-section { margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }
+    .connected-section .connected-title { font-size: 1.14rem; margin: 0 0 10px; border: none; padding: 0; }
+    .connected-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 8px; }
+    .conn-item { display: flex; flex-direction: column; gap: 2px; padding: 9px 11px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; }
+    .conn-item:hover { background: var(--accent-soft); color: var(--accent); }
+    .facts-col { padding: 16px 14px 28px 12px; border-left: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); }
+    .toc-nav { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+    .toc-header { font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }
+    .toc-link { display: flex; align-items: baseline; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 5px 8px; min-height: 28px; border-left: 2px solid var(--border-strong); }
+    .toc-link:hover { color: var(--accent); border-left-color: var(--accent); background: var(--panel); }
+    .toc-cnt { font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }
+    .toc-h3 { padding-left: 16px; font-size: 0.77rem; }
+    .facts-drawer > summary { cursor: pointer; font-size: 0.81rem; font-weight: 700; color: var(--text); padding: 8px 10px; min-height: 36px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+    .facts-drawer > summary::-webkit-details-marker { display: none; }
+    .facts-drawer-title { display: inline-flex; align-items: center; gap: 6px; }
+    .facts-drawer-body { margin-top: 10px; }
+    .facts-summary-line { margin: 0 0 10px; font-size: 0.78rem; color: var(--muted); text-wrap: pretty; }
+    .fact-add { margin: 0 0 10px; }
+    .fact-add > summary { cursor: pointer; display: flex; align-items: center; min-height: 32px; font-size: 0.79rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; padding: 5px 10px; list-style: none; }
+    .fact-add > summary::-webkit-details-marker { display: none; }
+    .fact-add-form { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); }
+    .muted { color: var(--muted); font-size: 0.8rem; }
+    .fact-card { padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.83rem; overflow-wrap: break-word; }
+    .fact-card.superseded { background: var(--retired-bg); border-color: var(--retired-border); border-style: dashed; }
+    .fact-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }
+    .fact-badges { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+    .confirm-box { position: relative; flex-shrink: 0; }
+    .confirm-trigger { list-style: none; cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; padding: 3px 9px; border-radius: 5px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--muted); font-size: 0.74rem; font-weight: 600; }
+    .confirm-trigger::-webkit-details-marker { display: none; }
+    .confirm-trigger:hover { color: var(--red); border-color: var(--red); background: var(--red-bg); }
+    .confirm-pop { position: absolute; right: 0; top: calc(100% + 4px); z-index: 40; width: 175px; padding: 8px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }
+    .danger-btn { background: var(--red); color: #ffffff; border: none; border-radius: 5px; padding: 6px 10px; min-height: 30px; font-size: 0.76rem; font-weight: 700; cursor: pointer; }
+    .fact-subject { font-weight: 700; color: var(--text); text-transform: capitalize; }
+    .fact-text { margin-top: 6px; color: var(--text-body); line-height: 1.48; }
+    .fact-reason { margin-top: 4px; font-size: 0.76rem; color: var(--muted); }
+    .badge { display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.71rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }
+    .guide-badge { background: var(--panel); color: var(--muted); border: 1px solid var(--border-strong); }
+    .topic-badge { background: var(--panel); color: var(--text); border: 1px solid var(--border); text-transform: none; font-weight: 600; }
+    .valid-badge { background: var(--green-bg); color: var(--green); }
+    .invalid-badge { background: var(--red-bg); color: var(--red); }
+    .cat-fact { background: var(--fact-bg); color: var(--fact-fg); }
+    .cat-question { background: var(--purple-bg); color: var(--purple); }
+    .cat-weakness { background: var(--red-bg); color: var(--red); }
+    .cat-strength, .cat-progress { background: var(--green-bg); color: var(--green); }
+    .cat-decision, .cat-preference { background: var(--amber-bg); color: var(--amber); }
+    .scope-badge { background: var(--accent-soft); color: var(--accent); }
+    .fact-meta { margin-top: 5px; font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    @media (max-width: 1120px) {
+      header { flex-wrap: wrap; padding: 8px 14px; gap: 8px; position: static; }
+      .mobile-search-facts { display: block; }
+      .mobile-tabs { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--canvas); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 25; }
+      .mtab { display: flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 6px; font-size: 0.84rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .layout { display: block; min-height: auto; }
+      .sidebar, .reader-wrap, .facts-col { display: none; border: none; height: auto; max-height: none; position: static; width: 100%; }
+      #tab-reader:checked ~ .app-shell .layout .reader-wrap { display: block; }
+      #tab-notes:checked ~ .app-shell .layout .sidebar { display: block; }
+      #tab-facts:checked ~ .app-shell .layout .facts-col { display: block; }
+      #tab-reader:checked ~ .app-shell .mobile-tabs .mtab-reader,
+      #tab-notes:checked ~ .app-shell .mobile-tabs .mtab-notes,
+      #tab-facts:checked ~ .app-shell .mobile-tabs .mtab-facts {
+        color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft);
+      }
+      #tab-reader:focus-visible ~ .app-shell .mobile-tabs .mtab-reader,
+      #tab-notes:focus-visible ~ .app-shell .mobile-tabs .mtab-notes,
+      #tab-facts:focus-visible ~ .app-shell .mobile-tabs .mtab-facts {
+        outline: 2px solid var(--accent); outline-offset: -2px;
+      }
+    }
+    .sidebar-tags { margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }
+    .sidebar-tags-summary { padding: 4px 6px; min-height: 30px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+    .sidebar-tags-summary:hover { background: var(--panel); color: var(--text); }
+    .sidebar-tag-cloud { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
+    .filter-chip, .tag-chip, .doc-tag-pill, .label-dir-pill { display: inline-flex; align-items: center; border-radius: 999px; font-weight: 600; text-decoration: none; border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }
+    .filter-chip:hover, .tag-chip:hover, .doc-tag-pill:hover, .label-dir-pill:hover { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }
+    .filter-chip.active, .tag-chip.active, .doc-tag-pill.active { background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }
+    .tag-chip { gap: 4px; min-height: 26px; padding: 2px 8px; font-size: 0.75rem; color: var(--text-body); background: var(--canvas); }
+    .tag-chip-cnt { font-size: 0.71rem; color: var(--muted); font-variant-numeric: tabular-nums; }
+    .tag-chip.active .tag-chip-cnt { color: var(--accent); }
+    .sidebar-tags-all { display: inline-flex; align-items: center; min-height: 28px; margin-top: 8px; padding: 2px 6px; font-size: 0.78rem; font-weight: 600; color: var(--accent); text-decoration: none; border-radius: 5px; }
+    .sidebar-tags-all:hover { background: var(--accent-soft); text-decoration: underline; }
+    .sidebar-active-tag { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.78rem; color: var(--text); }
+    .sidebar-active-tag a { color: var(--accent); font-weight: 600; text-decoration: none; }
+    .sidebar-active-tag a:hover { text-decoration: underline; }
+    .tree-step { font-size: 0.74rem; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 2px; }
+    .doc-tags-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: 0 0 22px; color: var(--muted); }
+    .doc-tag-pill { min-height: 26px; padding: 2px 9px; font-size: 0.76rem; color: var(--text-body); background: var(--panel); }
+    .rail-tags { padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }
+    .label-section { margin-bottom: 24px; }
+    .label-cloud { display: flex; flex-wrap: wrap; gap: 8px; }
+    .label-dir-pill { gap: 7px; min-height: 34px; padding: 5px 12px; font-size: 0.85rem; color: var(--text); background: var(--canvas); }
+    .label-dir-pill-sm { min-height: 30px; padding: 4px 10px; font-size: 0.8rem; font-weight: 500; color: var(--text-body); }
+    .label-dir-cnt { font-size: 0.74rem; font-weight: 700; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; font-variant-numeric: tabular-nums; }
+    .label-dir-pill:hover .label-dir-cnt { color: var(--accent); background: var(--canvas); }
+    .sub-label-hint { font-size: 0.78rem; font-weight: 600; color: var(--muted); align-self: center; margin-right: 2px; }
+    .tag-seq-card { display: flex; align-items: flex-start; gap: 14px; }
+    .seq-num { flex-shrink: 0; min-width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 0.78rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 1px; }
+    .tag-seq-card:hover .seq-num { background: var(--canvas); border-color: var(--accent-border); color: var(--accent); }
+    .tag-seq-body { flex: 1 1 auto; min-width: 0; }
+    .result-tag { font-size: 0.74rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); }
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .folder-row, .filter-chip, .tag-chip, .doc-tag-pill, .label-dir-pill, .result-card { transition: none; }
+    }
+    @media (max-width: 768px) {
+      header { padding: 8px 12px; gap: 8px; }
+      .brand { font-size: 0.94rem; min-height: 40px; }
+      .brand-long, .desktop-actions { display: none; }
+      .mobile-menu { display: block; }
+      .mobile-menu > summary { min-height: 44px; min-width: 44px; justify-content: center; padding: 8px 12px; }
+      .mobile-menu-panel { position: absolute; right: 0; top: calc(100% + 6px); z-index: 60; width: 280px; max-width: calc(100vw - 24px); padding: 12px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }
+      .mobile-menu-row { display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+      .mobile-menu-links { display: flex; flex-direction: column; gap: 6px; }
+      .mobile-menu-links a { display: flex; align-items: center; min-height: 40px; padding: 6px 10px; border-radius: 6px; background: var(--panel); text-decoration: none; font-weight: 600; font-size: 0.86rem; color: var(--text); }
+      .mobile-menu-links a.signout-link { color: var(--red); background: var(--red-bg); }
+      .mobile-upload-form { display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }
+      .mobile-upload-form select, .mobile-upload-form input { background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px; font-size: 15px; width: 100%; }
+      .mobile-upload-form button { background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 10px; min-height: 42px; font-weight: 700; cursor: pointer; }
+      .nav-pill { min-height: 40px; padding: 6px 10px; font-size: 0.8rem; }
+      .tag-chip, .doc-tag-pill, .filter-chip, .label-dir-pill-sm { min-height: 36px; padding: 5px 11px; }
+      .sidebar-tags-all { min-height: 36px; }
+      .search-form { order: 3; flex: 1 1 100%; max-width: 100%; }
+      .search-scope { max-width: 112px; min-height: 40px; font-size: 0.8rem; }
+      .search-form input[type="search"] { font-size: 16px; min-height: 40px; padding: 6px 10px; }
+      .search-form button { min-height: 40px; padding: 6px 12px; }
+      .reader-wrap { padding: 14px 16px 36px; }
+      .reader-sheet { padding: 20px 16px; border-radius: 10px; }
+      .recent-grid { grid-template-columns: 1fr; }
+      .sidebar, .facts-col { padding: 12px; }
+      .pager-nav { grid-template-columns: 1fr; }
+      .pager-next { text-align: left; }
+      .reader h1 { font-size: 1.56rem; }
+      .reader h2 { font-size: 1.2rem; }
+      .reader h3 { font-size: 1.04rem; }
+      .table-wrap table { font-size: 0.84rem; }
+      th, td { padding: 9px 11px; }
+      pre { padding: 12px; font-size: 0.81rem; }
+    }"""
+)
+
+
 @one_vault_scan
 def render_dashboard_page(
     conn: sqlite3.Connection,
@@ -3671,8 +4028,6 @@ def render_dashboard_page(
     next_theme, theme_btn_label, theme_btn_icon = _theme_switch(theme_mode)
     upload_csrf = _mint_upload_csrf(purpose="upload", session_token=session_token)
     facts_csrf = _mint_upload_csrf(purpose="facts", session_token=session_token)
-    with DB_LOCK:
-        sync_vault_notes(conn)
 
     all_vault_notes = op_list_notes(conn, scope="")["notes"]
     norm_scope_filter = ""
@@ -3682,6 +4037,7 @@ def render_dashboard_page(
         except MemoryError:
             norm_scope_filter = ""
     scope_filter = norm_scope_filter
+    scope_qs = f"{safe_base_path}?scope={urllib.parse.quote(scope_filter)}"
 
     if scope_filter:
         all_scope_notes = [n for n in all_vault_notes if _note_matches_root_folder(str(n["scope"]), scope_filter)]
@@ -3689,24 +4045,41 @@ def render_dashboard_page(
         all_scope_notes = list(all_vault_notes)
 
     q_clean = (search_query or "").strip()
-    active_tag = _normalize_tag(tag_filter)
+    active_tag = "" if q_clean else _normalize_tag(tag_filter)
     view_mode = (view or "").strip().lower()
-    search_res = op_search(conn, query=q_clean, scope=scope_filter, include_history=True, limit=40)
+    if q_clean:
+        search_res = op_search(conn, query=q_clean, scope=scope_filter, include_history=True, limit=40)
+    else:
+        search_res = {
+            "facts": _query_recent_facts(conn, norm_scope=scope_filter, val_mode="all", limit=40),
+            "notes": [],
+            "notes_total": 0,
+        }
 
-    scope_tag_counts: dict[str, int] = {}
-    for n in all_scope_notes:
-        for tg in _note_tags_norm(n):
-            scope_tag_counts[tg] = scope_tag_counts.get(tg, 0) + 1
-    vault_tag_counts: dict[str, int] = {}
-    for n in all_vault_notes:
-        for tg in _note_tags_norm(n):
-            vault_tag_counts[tg] = vault_tag_counts.get(tg, 0) + 1
+    note_tags_by_path: dict[str, list[str]] = {str(n["path"]): _note_tags_norm(n) for n in all_scope_notes}
+    scope_tag_counts: Counter[str] = Counter(tg for tgs in note_tags_by_path.values() for tg in tgs)
+
+    def _rank_study_tags(
+        counts: Counter[str], *, exclude: str = "", min_count: int = 1, limit: int | None = None
+    ) -> list[tuple[str, int]]:
+        ranked = sorted(
+            ((t, c) for t, c in counts.items() if t != exclude and t not in _META_NOISE_TAGS and c >= min_count),
+            key=lambda kv: (-kv[1], kv[0]),
+        )
+        return ranked[:limit] if limit is not None else ranked
+
+    def _render_breadcrumbs(items: list[str]) -> str:
+        return (
+            '<nav class="breadcrumbs" aria-label="Breadcrumb">'
+            + ' <span class="crumb-sep" aria-hidden="true">/</span> '.join(items)
+            + "</nav>"
+        )
 
     if q_clean:
         matched_paths = {str(n["path"]) for n in search_res["notes"]}
         notes = [n for n in all_scope_notes if str(n["path"]) in matched_paths] or list(search_res["notes"])
     elif active_tag:
-        notes = [n for n in all_scope_notes if active_tag in _note_tags_norm(n)]
+        notes = [n for n in all_scope_notes if active_tag in note_tags_by_path[str(n["path"])]]
     else:
         notes = all_scope_notes
 
@@ -3797,7 +4170,7 @@ def render_dashboard_page(
             is_act = "active-note" if active_path_str == p_path else ""
             pinned_links_list.append(
                 f'<a class="quick-link {is_act}" '
-                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(p_path)}">'
+                f'href="{scope_qs}&note={urllib.parse.quote(p_path)}">'
                 f"{html.escape(_strip_leading_emoji(p_label))}</a>"
             )
     quick_links_html = (
@@ -3809,15 +4182,12 @@ def render_dashboard_page(
     )
 
     # Sidebar Confluence Labels (curated top study tags in active space)
-    top_sidebar_tags = sorted(
-        [(t, c) for t, c in scope_tag_counts.items() if t not in _META_NOISE_TAGS],
-        key=lambda kv: (-kv[1], kv[0]),
-    )[:16]
+    top_sidebar_tags = _rank_study_tags(scope_tag_counts, limit=16)
     if active_tag and all(t != active_tag for t, _ in top_sidebar_tags):
         top_sidebar_tags.insert(0, (active_tag, scope_tag_counts.get(active_tag, 0)))
     sidebar_tag_chips = "".join(
         f'<a class="tag-chip {"active" if t == active_tag else ""}" '
-        f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+        f'href="{scope_qs}&tag={urllib.parse.quote(t)}">'
         f'<span>#{html.escape(t)}</span><span class="tag-chip-cnt">{c}</span></a>'
         for t, c in top_sidebar_tags
     )
@@ -3827,7 +4197,7 @@ def render_dashboard_page(
         f'<summary class="sidebar-tags-summary"><span>Labels</span>'
         f'<span class="tree-count">{len(scope_tag_counts)}</span></summary>'
         f'<div class="sidebar-tag-cloud">{sidebar_tag_chips}</div>'
-        f'<a class="sidebar-tags-all" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">'
+        f'<a class="sidebar-tags-all" href="{scope_qs}&view=tags">'
         f'Browse all {len(scope_tag_counts)} labels →</a>'
         f"</details>"
         if scope_tag_counts
@@ -3840,18 +4210,15 @@ def render_dashboard_page(
         b_key = _classify_confluence_bucket(str(n["path"]))
         buckets.setdefault(b_key, []).append(n)
 
+    def _note_order(n: dict[str, object]) -> int:
+        raw_ord = n.get("order")
+        if isinstance(raw_ord, int) and not isinstance(raw_ord, bool):
+            return raw_ord
+        return _parse_sort_order({"order": raw_ord}, str(n["path"]))
+
     def _note_sort_key(n: dict[str, object]) -> tuple[int, str]:
         p = str(n["path"])
-        raw_ord = n.get("order")
-        if raw_ord is not None:
-            try:
-                ord_val = int(raw_ord)  # type: ignore[arg-type]
-            except (TypeError, ValueError):
-                ord_val = 1000
-        else:
-            fname = p.rsplit("/", 1)[-1].lower()
-            ord_val = 0 if (fname.startswith(("00-", "master-")) or fname == "readme.md") else 1000
-        return (ord_val, _humanize_note_title(str(n["title"]), p).lower())
+        return (_note_order(n), _humanize_note_title(str(n["title"]), p).lower())
 
     sorted_buckets: dict[str, list[dict[str, object]]] = {}
     for b_key, _, _ in DASHBOARD["groups"]:
@@ -3892,7 +4259,7 @@ def render_dashboard_page(
             n_path = str(n["path"])
             is_act = "active-note" if active_path_str == n_path else ""
             clean_title = _humanize_note_title(str(n["title"]), n_path)
-            n_ord = int(n.get("order") if n.get("order") is not None else 1000)  # type: ignore[arg-type]
+            n_ord = _note_order(n)
             step_prefix = ""
             if 0 < n_ord < 1000:
                 ordered_step += 1
@@ -3908,7 +4275,7 @@ def render_dashboard_page(
                     sub_hint = f"<span class='tree-sub'>{html.escape(parts[1].upper())}</span> "
             items_html.append(
                 f'<li><a class="tree-item {is_act}" '
-                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(n_path)}{active_filter_suffix}" '
+                f'href="{scope_qs}&note={urllib.parse.quote(n_path)}{active_filter_suffix}" '
                 f'title="{html.escape(n_path)}">'
                 f'<span class="tree-title">{step_prefix}{sub_hint}{html.escape(clean_title)}{_note_badge(n_path, b_key)}</span>'
                 f"</a></li>"
@@ -3926,7 +4293,7 @@ def render_dashboard_page(
     active_tag_sidebar_bar = (
         f'<div class="sidebar-active-tag">'
         f'<span>Label <strong>#{html.escape(active_tag)}</strong></span>'
-        f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">Clear</a>'
+        f'<a href="{scope_qs}&view=topics">Clear</a>'
         f"</div>"
         if active_tag
         else ""
@@ -3952,13 +4319,13 @@ def render_dashboard_page(
             crumbs.append(
                 f'<a href="{safe_base_path}?scope={urllib.parse.quote(sc_path)}&view=topics">{html.escape(folder_label)}</a>'
             )
-        breadcrumbs_html = '<nav class="breadcrumbs" aria-label="Breadcrumb">' + ' <span class="crumb-sep" aria-hidden="true">/</span> '.join(crumbs) + "</nav>"
+        breadcrumbs_html = _render_breadcrumbs(crumbs)
 
         page_tags = _note_tags_norm(active_note_meta)
         if page_tags:
             tag_pills_str = "".join(
                 f'<a class="doc-tag-pill {"active" if t == active_tag else ""}" '
-                f'href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
+                f'href="{scope_qs}&tag={urllib.parse.quote(t)}">'
                 f'#{html.escape(t)}</a>'
                 for t in page_tags
             )
@@ -3979,21 +4346,21 @@ def render_dashboard_page(
             next_item = pager_list[idx + 1] if 0 <= idx < len(pager_list) - 1 else None
             if prev_item or next_item:
                 prev_html = (
-                    f'<a class="pager-link pager-prev" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(prev_item["path"]))}{tag_param_suffix}">'
+                    f'<a class="pager-link pager-prev" href="{scope_qs}&note={urllib.parse.quote(str(prev_item["path"]))}{tag_param_suffix}">'
                     f'<span class="pager-dir">← Previous</span>'
                     f'<span class="pager-title">{html.escape(_humanize_note_title(str(prev_item["title"]), str(prev_item["path"])))}</span></a>'
                     if prev_item
                     else '<span class="pager-spacer"></span>'
                 )
                 mid_href = (
-                    f"{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(active_tag)}"
+                    f"{scope_qs}&tag={urllib.parse.quote(active_tag)}"
                     if active_tag
-                    else f"{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics"
+                    else f"{scope_qs}&view=topics"
                 )
                 mid_lbl = f"All #{active_tag} ({idx + 1}/{len(pager_list)})" if active_tag else f"All topics ({idx + 1}/{len(pager_list)})"
                 mid_html = f'<a class="pager-mid" href="{mid_href}">{html.escape(mid_lbl)}</a>'
                 next_html = (
-                    f'<a class="pager-link pager-next" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(next_item["path"]))}{tag_param_suffix}">'
+                    f'<a class="pager-link pager-next" href="{scope_qs}&note={urllib.parse.quote(str(next_item["path"]))}{tag_param_suffix}">'
                     f'<span class="pager-dir">Next →</span>'
                     f'<span class="pager-title">{html.escape(_humanize_note_title(str(next_item["title"]), str(next_item["path"])))}</span></a>'
                     if next_item
@@ -4018,7 +4385,7 @@ def render_dashboard_page(
             cn_path = str(cn["path"])
             cn_title = _humanize_note_title(str(cn["title"]), cn_path)
             conn_cards.append(
-                f'<a class="conn-item" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(cn_path)}">'
+                f'<a class="conn-item" href="{scope_qs}&note={urllib.parse.quote(cn_path)}">'
                 f"<strong>{html.escape(cn_title)}</strong>"
                 f"<span class='muted'>{html.escape(cn_path)}</span></a>"
             )
@@ -4195,7 +4562,7 @@ def render_dashboard_page(
             m_bucket = group_labels.get(m_bkey, str(mn["scope"]))
             m_snip = _format_search_snippet(str(mn.get("snippet") or mn.get("summary") or ""))
             page_cards_html.append(
-                f'<a class="result-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(mp)}&q={urllib.parse.quote(q_clean)}">'
+                f'<a class="result-card" href="{scope_qs}&note={urllib.parse.quote(mp)}&q={urllib.parse.quote(q_clean)}">'
                 f'<div class="result-top"><span class="result-title">{html.escape(m_title)}{_note_badge(mp, m_bkey)}</span>'
                 f'<span class="result-date">{html.escape(str(mn.get("updated_at") or "")[:10])}</span></div>'
                 f'<div class="result-meta"><span class="badge topic-badge">{html.escape(m_bucket)}</span> <span class="meta-mono">{html.escape(mp)}</span></div>'
@@ -4223,7 +4590,7 @@ def render_dashboard_page(
             f"<h1>Search: <span class='meta-mono'>{html.escape(q_clean)}</span></h1>"
             f"<p class='muted'>{count_phrase} and <strong>{active_fact_count}</strong> active fact(s)"
             + (f" in <strong>{html.escape(_folder_label(scope_filter))}</strong>" if scope_filter else " across the entire vault")
-            + f" · <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics'>Clear search</a></p>"
+            + f" · <a href='{scope_qs}&view=topics'>Clear search</a></p>"
             f"<div class='filter-chip-row'>{''.join(filter_chips)}</div>"
             "</div>"
             + mobile_facts_html
@@ -4232,7 +4599,7 @@ def render_dashboard_page(
     elif active_view == "topics":
         recent_notes = sorted(notes, key=lambda n: str(n.get("updated_at") or ""), reverse=True)[:4]
         recent_cards = "".join(
-            f'<a class="recent-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(rn["path"]))}" '
+            f'<a class="recent-card" href="{scope_qs}&note={urllib.parse.quote(str(rn["path"]))}" '
             f'title="{html.escape(_humanize_note_title(str(rn["title"]), str(rn["path"])))}">'
             f'<span class="recent-title">{html.escape(_humanize_note_title(str(rn["title"]), str(rn["path"])))}</span>'
             f'<span class="recent-meta">{html.escape(str(rn["scope"]))} · {html.escape(str(rn.get("updated_at") or "")[:10])}</span>'
@@ -4244,7 +4611,7 @@ def render_dashboard_page(
             b_list = sorted_buckets[b_key]
             b_lbl = group_labels.get(b_key, b_key)
             top_links = "".join(
-                f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
+                f'<li><a href="{scope_qs}&note={urllib.parse.quote(str(it["path"]))}">'
                 f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]), b_key)}</a></li>'
                 for it in b_list[:5]
             )
@@ -4263,7 +4630,7 @@ def render_dashboard_page(
                 else:
                     rest_cap = b_list[5:25]
                     rest_links = "".join(
-                        f'<li><a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(str(it["path"]))}">'
+                        f'<li><a href="{scope_qs}&note={urllib.parse.quote(str(it["path"]))}">'
                         f'{html.escape(_humanize_note_title(str(it["title"]), str(it["path"])))}{_note_badge(str(it["path"]), b_key)}</a></li>'
                         for it in rest_cap
                     )
@@ -4301,25 +4668,22 @@ def render_dashboard_page(
         )
     elif active_view == "tags":
         heading_scope = _folder_label(scope_filter)
-        study_tags = sorted(
-            [(t, c) for t, c in scope_tag_counts.items() if t not in _META_NOISE_TAGS and c >= 2],
-            key=lambda kv: (-kv[1], kv[0]),
-        )
+        study_tags = _rank_study_tags(scope_tag_counts, min_count=2)
         all_tags_az = sorted(scope_tag_counts.items(), key=lambda kv: kv[0])
-        featured_pills = "".join(
-            f'<a class="label-dir-pill" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
-            f'<span class="label-dir-name">#{html.escape(t)}</span>'
-            f'<span class="label-dir-cnt">{c}</span></a>'
-            for t, c in study_tags
-        )
-        all_pills = "".join(
-            f'<a class="label-dir-pill label-dir-pill-sm" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(t)}">'
-            f'<span class="label-dir-name">#{html.escape(t)}</span>'
-            f'<span class="label-dir-cnt">{c}</span></a>'
-            for t, c in all_tags_az
-        )
+
+        def _label_dir_pills(items: list[tuple[str, int]], extra_cls: str = "") -> str:
+            cls = f"label-dir-pill {extra_cls}".strip()
+            return "".join(
+                f'<a class="{cls}" href="{scope_qs}&tag={urllib.parse.quote(t)}">'
+                f'<span class="label-dir-name">#{html.escape(t)}</span>'
+                f'<span class="label-dir-cnt">{c}</span></a>'
+                for t, c in items
+            )
+
+        featured_pills = _label_dir_pills(study_tags)
+        all_pills = _label_dir_pills(all_tags_az, "label-dir-pill-sm")
         scope_toggle = (
-            f" · <a href='{safe_base_path}?scope=&view=tags'>View labels across entire vault ({len(vault_tag_counts)}) →</a>"
+            f" · <a href='{safe_base_path}?scope=&view=tags'>View labels across entire vault ({len(_count_tags(all_vault_notes))}) →</a>"
             if scope_filter
             else ""
         )
@@ -4343,15 +4707,13 @@ def render_dashboard_page(
         )
     elif active_view == "tag":
         heading_scope = _folder_label(scope_filter)
-        related_counts: dict[str, int] = {}
-        for tn in tag_sorted_notes:
-            for rt in _note_tags_norm(tn):
-                if rt != active_tag and rt not in _META_NOISE_TAGS:
-                    related_counts[rt] = related_counts.get(rt, 0) + 1
+        related_counter: Counter[str] = Counter(
+            rt for tn in tag_sorted_notes for rt in note_tags_by_path[str(tn["path"])]
+        )
         related_chips = "".join(
-            f'<a class="filter-chip" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(rt)}">'
+            f'<a class="filter-chip" href="{scope_qs}&tag={urllib.parse.quote(rt)}">'
             f'#{html.escape(rt)} ({rc})</a>'
-            for rt, rc in sorted(related_counts.items(), key=lambda kv: (-kv[1], kv[0]))[:16]
+            for rt, rc in _rank_study_tags(related_counter, exclude=active_tag, limit=16)
         )
         tag_cards: list[str] = []
         for idx, tn in enumerate(tag_sorted_notes, 1):
@@ -4362,12 +4724,12 @@ def render_dashboard_page(
             t_sum = _clean_latex_inline(str(tn.get("summary") or "").strip())
             if len(t_sum) > 220:
                 t_sum = t_sum[:217].rstrip() + "…"
-            other_tags = [t for t in _note_tags_norm(tn) if t != active_tag and t not in _META_NOISE_TAGS][:6]
+            other_tags = [t for t in note_tags_by_path[tp] if t != active_tag and t not in _META_NOISE_TAGS][:6]
             inline_tags = "".join(
                 f'<span class="result-tag">#{html.escape(ot)}</span>' for ot in other_tags
             )
             tag_cards.append(
-                f'<a class="result-card tag-seq-card" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(tp)}&tag={urllib.parse.quote(active_tag)}">'
+                f'<a class="result-card tag-seq-card" href="{scope_qs}&note={urllib.parse.quote(tp)}&tag={urllib.parse.quote(active_tag)}">'
                 f'<span class="seq-num">{idx}</span>'
                 f'<div class="tag-seq-body">'
                 f'<div class="result-top"><span class="result-title">{html.escape(t_title)}{_note_badge(tp, t_bkey)}</span>'
@@ -4376,32 +4738,29 @@ def render_dashboard_page(
                 + (f'<p class="result-snippet">{html.escape(t_sum)}</p>' if t_sum else "")
                 + "</div></a>"
             )
+        vault_tag_total = (
+            sum(1 for n in all_vault_notes if active_tag in _note_tags_norm(n))
+            if scope_filter
+            else len(tag_sorted_notes)
+        )
         vault_fallback = ""
-        if scope_filter and vault_tag_counts.get(active_tag, 0) > len(tag_sorted_notes):
+        if scope_filter and vault_tag_total > len(tag_sorted_notes):
             vault_fallback = (
                 f" · <a href='{safe_base_path}?scope=&tag={urllib.parse.quote(active_tag)}'>"
-                f"Show all {vault_tag_counts[active_tag]} across entire vault →</a>"
+                f"Show all {vault_tag_total} across entire vault →</a>"
             )
-        tag_crumbs = (
-            '<nav class="breadcrumbs" aria-label="Breadcrumb">'
-            f'<a href="{safe_base_path}?scope=&view=topics">Vault</a>'
-            ' <span class="crumb-sep" aria-hidden="true">/</span> '
-            + (
-                f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">{html.escape(heading_scope)}</a>'
-                ' <span class="crumb-sep" aria-hidden="true">/</span> '
-                if scope_filter
-                else ""
-            )
-            + f'<a href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">Labels</a>'
-            "</nav>"
-        )
+        tag_crumb_items = [f'<a href="{safe_base_path}?scope=&view=topics">Vault</a>']
+        if scope_filter:
+            tag_crumb_items.append(f'<a href="{scope_qs}&view=topics">{html.escape(heading_scope)}</a>')
+        tag_crumb_items.append(f'<a href="{scope_qs}&view=tags">Labels</a>')
+        tag_crumbs = _render_breadcrumbs(tag_crumb_items)
         reader_body_html = (
             "<div class='search-header'>"
             + tag_crumbs
             + f"<h1>#{html.escape(active_tag)}</h1>"
             + f"<p class='muted'><strong>{len(tag_sorted_notes)}</strong> page(s) in <strong>{html.escape(heading_scope)}</strong> in study order"
             + vault_fallback
-            + f" · <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags'>All labels</a></p>"
+            + f" · <a href='{scope_qs}&view=tags'>All labels</a></p>"
             + (
                 f"<div class='filter-chip-row' aria-label='Related sub-labels'><span class='sub-label-hint'>Sub-topics:</span>{related_chips}</div>"
                 if related_chips
@@ -4414,9 +4773,9 @@ def render_dashboard_page(
                 else (
                     f"<p class='muted'>No pages tagged <code>#{html.escape(active_tag)}</code> in <strong>{html.escape(heading_scope)}</strong>."
                     + (
-                        f" <a href='{safe_base_path}?scope=&tag={urllib.parse.quote(active_tag)}'>Browse {vault_tag_counts[active_tag]} page(s) across the entire vault →</a>"
-                        if scope_filter and vault_tag_counts.get(active_tag, 0) > 0
-                        else f" <a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags'>Browse all labels →</a>"
+                        f" <a href='{safe_base_path}?scope=&tag={urllib.parse.quote(active_tag)}'>Browse {vault_tag_total} page(s) across the entire vault →</a>"
+                        if scope_filter and vault_tag_total > 0
+                        else f" <a href='{scope_qs}&view=tags'>Browse all labels →</a>"
                     )
                     + "</p>"
                 )
@@ -4424,18 +4783,19 @@ def render_dashboard_page(
         )
     elif active_note_meta:
         back_to_search_html = ""
-        if q_clean:
+        if q_clean or active_tag:
+            if q_clean:
+                back_qs = f"q={urllib.parse.quote(q_clean)}"
+                back_lbl = f'← Back to {int(search_res.get("notes_total") or len(search_res["notes"]))} results for "{html.escape(q_clean)}"'
+                clear_lbl = "Clear filter"
+            else:
+                back_qs = f"tag={urllib.parse.quote(active_tag)}"
+                back_lbl = f"← Back to #{html.escape(active_tag)} ({len(tag_sorted_notes)} pages)"
+                clear_lbl = "Clear label"
             back_to_search_html = (
                 f"<div class='search-banner'>"
-                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&q={urllib.parse.quote(q_clean)}'>← Back to {int(search_res.get('notes_total') or len(search_res['notes']))} results for \"{html.escape(q_clean)}\"</a>"
-                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear filter</a>"
-                f"</div>"
-            )
-        elif active_tag:
-            back_to_search_html = (
-                f"<div class='search-banner'>"
-                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&tag={urllib.parse.quote(active_tag)}'>← Back to #{html.escape(active_tag)} ({len(tag_sorted_notes)} pages)</a>"
-                f"<a href='{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&note={urllib.parse.quote(active_path_str)}'>Clear label</a>"
+                f"<a href='{scope_qs}&{back_qs}'>{back_lbl}</a>"
+                f"<a href='{scope_qs}&note={urllib.parse.quote(active_path_str)}'>{clear_lbl}</a>"
                 f"</div>"
             )
         reader_body_html = (
@@ -4495,303 +4855,7 @@ def render_dashboard_page(
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{html.escape(dashboard_title)} · Vault &amp; Memory Hub</title>
   <style>
-    html {{ scroll-behavior: smooth; background: var(--bg); }}
-    {BASE_THEME_CSS}
-    :root {{ --header-h: 58px; }}
-    * {{ box-sizing: border-box; scrollbar-width: thin; scrollbar-color: var(--border-strong) transparent; }}
-    ::selection {{ background: var(--accent-soft); color: var(--accent); }}
-    :focus-visible {{ outline: 2px solid var(--accent); outline-offset: 2px; }}
-    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Inter, sans-serif; background: var(--bg); color: var(--text); line-height: 1.65; overflow-x: hidden; caret-color: var(--accent); }}
-    .skip-link {{ position: absolute; left: -9999px; top: 8px; z-index: 100; background: var(--accent); color: var(--accent-fg); padding: 8px 14px; border-radius: 6px; font-weight: 700; text-decoration: none; }}
-    .skip-link:focus-visible {{ left: 12px; }}
-    .app-shell {{ min-height: 100vh; background: var(--bg); color: var(--text); width: 100%; max-width: 100vw; overflow-x: clip; }}
-    .mview-radio {{ position: fixed; top: 0; left: 0; width: 0; height: 0; opacity: 0; pointer-events: none; margin: 0; }}
-    header {{ min-height: var(--header-h); padding: 8px 20px; background: var(--header-bg); border-bottom: 1px solid var(--border); display: flex; flex-wrap: nowrap; gap: 12px; align-items: center; justify-content: space-between; position: sticky; top: 0; z-index: 30; }}
-    .brand-wrap {{ display: flex; align-items: center; gap: 10px; flex-shrink: 0; }}
-    .brand {{ display: inline-flex; align-items: center; gap: 7px; font-weight: 700; font-size: 0.98rem; color: var(--text); letter-spacing: -0.015em; text-decoration: none; white-space: nowrap; min-height: 32px; padding: 2px 4px; border-radius: 6px; }}
-    .brand:hover {{ color: var(--accent); }}
-    .nav-pill {{ display: inline-flex; align-items: center; gap: 5px; font-size: 0.82rem; font-weight: 600; color: var(--text-body); text-decoration: none; min-height: 32px; padding: 4px 10px; border-radius: 6px; border: 1px solid var(--border); background: var(--panel); white-space: nowrap; }}
-    .nav-pill:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .nav-pill.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
-    .search-form {{ display: flex; gap: 6px; flex: 1 1 420px; max-width: 560px; min-width: 0; align-items: center; }}
-    .search-scope {{ background: var(--panel); color: var(--text-body); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 8px; font-size: 0.81rem; max-width: 150px; min-height: 34px; flex-shrink: 0; }}
-    .search-form input[type="search"] {{ width: 100%; min-width: 0; min-height: 34px; background: var(--canvas); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 6px 12px; font-size: 0.86rem; }}
-    .search-form input[type="search"]:focus {{ outline: 2px solid var(--accent); border-color: transparent; }}
-    .search-form button, .upload-form button, .fact-add-form button {{ background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 6px 13px; min-height: 34px; font-weight: 600; cursor: pointer; font-size: 0.82rem; white-space: nowrap; flex-shrink: 0; }}
-    .header-right {{ display: flex; align-items: center; gap: 8px; flex-shrink: 0; }}
-    .theme-form {{ margin: 0; display: inline-flex; }}
-    .upload-box, .mobile-menu {{ position: relative; }}
-    .mobile-menu {{ display: none; }}
-    .upload-box > summary, .mobile-menu > summary {{ list-style: none; cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--text-body); font-size: 0.81rem; font-weight: 600; white-space: nowrap; user-select: none; }}
-    .upload-box > summary::-webkit-details-marker, .mobile-menu > summary::-webkit-details-marker {{ display: none; }}
-    .upload-box[open] > summary, .mobile-menu[open] > summary {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .upload-box[open] > summary::before, .mobile-menu[open] > summary::before {{ content: " "; position: fixed; top: 0; right: 0; bottom: 0; left: 0; z-index: 45; display: block; cursor: default; background: transparent; }}
-    .upload-box:not([open]) .upload-form, .mobile-menu:not([open]) .mobile-menu-panel {{ display: none; }}
-    .upload-form {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 50; width: 310px; max-width: calc(100vw - 24px); padding: 14px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 10px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }}
-    .form-label {{ font-size: 0.76rem; font-weight: 600; color: var(--muted); margin-top: 2px; }}
-    .upload-form select, .upload-form input[type="text"], .upload-form input[type="file"], .fact-add-form select, .fact-add-form input[type="text"], .fact-add-form textarea {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 7px 9px; font-size: 0.84rem; width: 100%; font-family: inherit; }}
-    .theme-toggle {{ cursor: pointer; display: inline-flex; align-items: center; gap: 5px; min-height: 34px; font-size: 0.81rem; font-weight: 600; padding: 5px 10px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--panel); color: var(--text); user-select: none; white-space: nowrap; }}
-    .theme-toggle:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .actor-tag {{ display: inline-flex; align-items: center; gap: 4px; font-size: 0.8rem; background: var(--panel); padding: 4px 8px 4px 10px; border-radius: 6px; border: 1px solid var(--border); color: var(--muted); white-space: nowrap; }}
-    .actor-tag strong {{ color: var(--text); }}
-    .actor-link, .signout-link {{ display: inline-flex; align-items: center; min-height: 28px; padding: 2px 7px; border-radius: 5px; text-decoration: none; font-weight: 600; }}
-    .actor-link {{ color: var(--text); }}
-    .actor-link:hover {{ background: var(--panel-hover); color: var(--accent); }}
-    .signout-link {{ color: var(--red); }}
-    .signout-link:hover {{ background: var(--red-bg); }}
-    .dl-btn {{ display: inline-flex; align-items: center; min-height: 28px; padding: 3px 10px; border-radius: 6px; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--accent-border); text-decoration: none; font-weight: 600; font-size: 0.78rem; }}
-    .mobile-tabs {{ display: none; }}
-    .layout {{ display: grid; grid-template-columns: 288px minmax(0, 1fr) 280px; width: 100%; min-height: calc(100vh - var(--header-h)); align-items: start; }}
-    .sidebar {{ padding: 14px 12px 28px 14px; border-right: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); text-align: left; }}
-    .sidebar-section-label {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 2px 6px 6px; text-align: left; }}
-    .scope-strip {{ display: flex; flex-direction: column; gap: 2px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
-    .folder-row {{ display: flex; align-items: center; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--text-body); padding: 6px 8px; min-height: 32px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; border: 1px solid transparent; transition: background-color 0.15s ease, color 0.15s ease; min-width: 0; }}
-    .folder-row-left {{ display: inline-flex; align-items: center; gap: 7px; min-width: 0; }}
-    .pill-label {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .pill-count {{ font-size: 0.74rem; font-weight: 600; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
-    .folder-row:hover {{ background: var(--panel); color: var(--accent); }}
-    .folder-row.active {{ color: var(--accent); background: var(--accent-soft); border-color: var(--accent-border); font-weight: 600; }}
-    .folder-row.active .pill-count {{ color: var(--accent); }}
-    .quick-links {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .quick-link {{ display: block; padding: 6px 8px; min-height: 30px; border-radius: 6px; font-size: 0.82rem; font-weight: 500; color: var(--text-body); text-decoration: none; text-align: left; }}
-    .quick-link:hover {{ background: var(--panel); color: var(--accent); }}
-    .quick-link.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; }}
-    .tree-group {{ margin-bottom: 4px; border-radius: 6px; text-align: left; }}
-    .tree-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: flex-start; gap: 6px; padding: 6px 8px; min-height: 32px; border-radius: 6px; font-size: 0.82rem; font-weight: 600; color: var(--text); user-select: none; text-align: left; }}
-    .tree-summary::-webkit-details-marker {{ display: none; }}
-    .tree-summary:hover {{ background: var(--panel); }}
-    .tree-folder-name {{ flex: 1 1 auto; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; text-align: left; }}
-    .tree-group > .tree-summary::before {{ content: "▸"; font-size: 0.76rem; color: var(--muted); flex-shrink: 0; }}
-    .tree-group[open] > .tree-summary::before {{ content: "▾"; color: var(--accent); }}
-    .tree-count {{ font-size: 0.73rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); flex-shrink: 0; margin-left: auto; font-variant-numeric: tabular-nums; }}
-    .note-list {{ list-style: none; padding: 2px 0 6px 8px; margin: 0 0 0 9px; border-left: 1px solid var(--border-strong); display: flex; flex-direction: column; gap: 2px; text-align: left; }}
-    .tree-item {{ display: block; padding: 5px 8px; min-height: 28px; border-radius: 6px; text-decoration: none; color: var(--text-body); font-size: 0.82rem; line-height: 1.38; text-align: left; border: 1px solid transparent; }}
-    .tree-item:hover {{ background: var(--panel); color: var(--accent); }}
-    .tree-item.active-note {{ background: var(--accent-soft); color: var(--accent); font-weight: 600; border-color: var(--accent-border); }}
-    .tree-title {{ overflow-wrap: anywhere; text-align: left; }}
-    .tree-sub {{ font-size: 0.7rem; font-weight: 700; padding: 1px 5px; border-radius: 4px; background: var(--panel); color: var(--muted); border: 1px solid var(--border); }}
-    .reader-wrap {{ padding: 24px 28px 60px; min-width: 0; display: flex; justify-content: center; }}
-    .reader {{ max-width: 880px; width: 100%; min-width: 0; overflow-wrap: break-word; color: var(--text-body); font-size: 1rem; line-height: 1.72; }}
-    .reader-sheet {{ background: var(--canvas); border: 1px solid var(--border); border-radius: 12px; padding: 34px 44px; box-shadow: var(--shadow); }}
-    .reader-flat {{ background: transparent; border: none; padding: 4px 0; }}
-    html[data-theme="dark"] .reader {{ line-height: 1.76; letter-spacing: 0.005em; }}
-    .search-banner {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; margin-bottom: 16px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.84rem; color: var(--text); }}
-    .search-banner a {{ color: var(--accent); font-weight: 600; text-decoration: none; padding: 2px 4px; }}
-    .search-banner a:hover {{ text-decoration: underline; }}
-    .search-header, .topics-header {{ margin-bottom: 22px; padding-bottom: 14px; border-bottom: 1px solid var(--border); }}
-    .filter-chip-row {{ display: flex; flex-wrap: wrap; gap: 6px; margin-top: 12px; }}
-    .filter-chip {{ display: inline-flex; align-items: center; min-height: 30px; padding: 4px 11px; border-radius: 999px; font-size: 0.79rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--canvas); border: 1px solid var(--border); }}
-    .filter-chip:hover {{ border-color: var(--accent); color: var(--accent); }}
-    .filter-chip.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
-    .mobile-search-facts {{ display: none; margin-bottom: 18px; background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 10px 14px; }}
-    .mobile-search-facts summary {{ list-style: none; cursor: pointer; font-weight: 700; font-size: 0.86rem; color: var(--text); min-height: 28px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
-    .mobile-search-facts summary::-webkit-details-marker {{ display: none; }}
-    .mobile-search-facts summary::after {{ content: "▸"; color: var(--muted); font-size: 0.85rem; }}
-    .mobile-search-facts[open] summary::after {{ content: "▾"; color: var(--accent); }}
-    .mobile-fact-list {{ margin: 8px 0 0; padding-left: 1.1em; display: flex; flex-direction: column; gap: 6px; font-size: 0.86rem; }}
-    .section-kicker {{ font-size: 0.78rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin: 0 0 12px; border: none; padding: 0; }}
-    .search-section {{ margin-bottom: 24px; }}
-    .result-list {{ display: flex; flex-direction: column; gap: 10px; }}
-    .result-card {{ display: block; padding: 14px 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); transition: border-color 0.15s ease; }}
-    .result-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
-    .result-top {{ display: flex; align-items: baseline; justify-content: space-between; gap: 12px; }}
-    .result-title {{ font-weight: 700; font-size: 1rem; color: var(--accent); }}
-    .result-date {{ font-size: 0.78rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }}
-    .result-meta {{ display: flex; flex-wrap: wrap; align-items: center; gap: 8px; margin-top: 5px; font-size: 0.8rem; color: var(--muted); }}
-    .result-snippet {{ margin: 8px 0 0; font-size: 0.89rem; line-height: 1.55; color: var(--text-body); max-width: none; }}
-    mark {{ background: var(--mark-bg); color: var(--mark-fg); padding: 0 3px; border-radius: 3px; font-weight: 600; }}
-    .topics-recent {{ margin-bottom: 24px; }}
-    .recent-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
-    .recent-card {{ display: flex; flex-direction: column; justify-content: space-between; gap: 4px; padding: 11px 14px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); text-decoration: none; color: var(--text); }}
-    .recent-card:hover {{ border-color: var(--accent); background: var(--accent-soft); }}
-    .recent-title {{ font-weight: 600; font-size: 0.88rem; color: var(--text); line-height: 1.35; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }}
-    .recent-meta {{ font-size: 0.77rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
-    .topic-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(290px, 1fr)); gap: 14px; }}
-    .topic-card {{ padding: 16px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); display: flex; flex-direction: column; gap: 8px; scroll-margin-top: 72px; }}
-    .topic-card-head {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; }}
-    .topic-card-head h3 {{ margin: 0; font-size: 0.96rem; line-height: 1.3; color: var(--text); }}
-    .topic-card-list {{ list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; max-width: none; }}
-    .topic-card-list li {{ margin: 0; }}
-    .topic-card-list a {{ display: block; padding: 4px 0; min-height: 28px; text-decoration: none; color: var(--text-body); font-size: 0.86rem; line-height: 1.4; }}
-    .topic-card-list a:hover {{ color: var(--accent); text-decoration: underline; }}
-    .topic-more-link {{ display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); text-decoration: none; margin-top: 2px; }}
-    .topic-more-link:hover {{ text-decoration: underline; }}
-    .topic-more summary {{ cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; font-size: 0.81rem; font-weight: 600; color: var(--accent); margin-top: 2px; }}
-    .topic-more .topic-card-list {{ margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border); }}
-    .empty-state {{ padding: 8px 0; }}
-    .breadcrumbs {{ display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 0.82rem; color: var(--muted); margin-bottom: 6px; }}
-    .breadcrumbs a {{ display: inline-flex; align-items: center; min-height: 28px; padding: 2px 4px; border-radius: 4px; color: var(--muted); text-decoration: none; font-weight: 500; text-underline-offset: 3px; }}
-    .breadcrumbs a:hover {{ color: var(--accent); background: var(--panel); }}
-    .crumb-sep {{ color: var(--muted); opacity: 0.6; }}
-    .doc-meta-bar {{ display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: center; font-size: 0.81rem; color: var(--muted); padding-bottom: 16px; margin-bottom: 24px; border-bottom: 1px solid var(--border); }}
-    .doc-source-foot {{ margin-top: 28px; padding-top: 12px; border-top: 1px dashed var(--border); font-size: 0.81rem; color: var(--muted); }}
-    .meta-mono {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.96em; color: var(--muted); }}
-    .reader h1, .reader h2, .reader h3, .reader h4 {{ color: var(--text); font-weight: 700; line-height: 1.28; letter-spacing: -0.02em; scroll-margin-top: 72px; text-wrap: balance; }}
-    .reader h1 {{ font-size: 2rem; margin: 0 0 0.65em; }}
-    .reader h2 {{ font-size: 1.45rem; margin-top: 1.85em; margin-bottom: 0.55em; padding-bottom: 6px; border-bottom: 1px solid var(--border); }}
-    .reader h2.section-kicker {{ font-size: 0.78rem; margin: 0 0 12px; border: none; padding: 0; letter-spacing: 0.06em; color: var(--muted); }}
-    .reader h3 {{ font-size: 1.14rem; margin-top: 1.45em; margin-bottom: 0.45em; }}
-    .reader h4 {{ font-size: 0.96rem; margin-top: 1.2em; margin-bottom: 0.4em; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; }}
-    .reader p {{ margin: 0 0 1.05em; max-width: 68ch; text-wrap: pretty; }}
-    .reader ul, .reader ol {{ margin: 0 0 1.15em; padding-left: 1.5em; max-width: 68ch; }}
-    .reader li {{ margin-bottom: 0.4em; text-wrap: pretty; }}
-    .reader hr {{ border: none; border-top: 1px solid var(--border); margin: 1.8em 0; }}
-    code {{ font-family: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; background: var(--code-inline-bg); color: var(--code-inline-fg); padding: 2px 5px; border-radius: 4px; font-size: 0.86em; word-break: break-word; }}
-    .code-block {{ margin: 14px 0 18px; border-radius: 8px; overflow: hidden; border: 1px solid var(--border-strong); background: var(--pre-bg); }}
-    .code-lang {{ background: rgba(255,255,255,0.06); color: #cbd5e1; font-size: 0.76rem; font-family: ui-monospace, monospace; text-transform: uppercase; letter-spacing: 0.06em; padding: 6px 14px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
-    pre {{ background: var(--pre-bg); color: var(--pre-fg); margin: 0; padding: 14px 16px; overflow-x: auto; -webkit-overflow-scrolling: touch; max-width: 100%; line-height: 1.55; font-size: 0.86rem; }}
-    pre code {{ word-break: normal; padding: 0; background: transparent; color: inherit; font-size: inherit; }}
-    blockquote {{ margin: 16px 0; padding: 12px 16px; max-width: 72ch; border-left: 3px solid var(--accent); background: var(--quote-bg); border-radius: 0 8px 8px 0; }}
-    blockquote p:last-child {{ margin-bottom: 0; }}
-    .table-wrap {{ width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 18px 0 22px; }}
-    .table-wrap table {{ width: 100%; min-width: 540px; border-collapse: collapse; font-size: 0.88rem; background: transparent; font-variant-numeric: tabular-nums; border-top: 1.5px solid var(--border-strong); border-bottom: 1.5px solid var(--border-strong); }}
-    th, td {{ border-bottom: 1px solid var(--border); padding: 10px 14px; text-align: left; vertical-align: top; word-break: normal; overflow-wrap: break-word; }}
-    tbody tr:last-child td {{ border-bottom: none; }}
-    th {{ background: var(--panel); color: var(--text); font-weight: 600; border-bottom: 1.5px solid var(--border-strong); }}
-    a.wikilink, a.ext-link {{ color: var(--accent); text-decoration: none; font-weight: 500; border-bottom: 1px solid var(--accent-border); text-underline-offset: 3px; }}
-    a.wikilink:hover, a.ext-link:hover {{ background: var(--accent-soft); }}
-    .pager-nav {{ margin-top: 28px; padding-top: 18px; border-top: 1px solid var(--border); display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px; align-items: center; }}
-    .pager-link {{ display: flex; flex-direction: column; gap: 2px; padding: 10px 12px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); min-width: 0; }}
-    .pager-link:hover {{ background: var(--accent-soft); }}
-    .pager-next {{ text-align: right; }}
-    .pager-dir {{ font-size: 0.74rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); }}
-    .pager-title {{ font-size: 0.86rem; font-weight: 600; color: var(--accent); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    .pager-mid {{ display: inline-flex; align-items: center; min-height: 32px; font-size: 0.78rem; font-weight: 600; color: var(--muted); text-decoration: none; padding: 6px 10px; border-radius: 6px; background: var(--panel); white-space: nowrap; }}
-    .pager-mid:hover {{ color: var(--accent); background: var(--accent-soft); }}
-    .connected-section {{ margin-top: 26px; padding-top: 18px; border-top: 1px solid var(--border); }}
-    .connected-section .connected-title {{ font-size: 1.14rem; margin: 0 0 10px; border: none; padding: 0; }}
-    .connected-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 8px; margin-top: 8px; }}
-    .conn-item {{ display: flex; flex-direction: column; gap: 2px; padding: 9px 11px; border-radius: 8px; background: var(--bg); text-decoration: none; color: var(--text); font-size: 0.84rem; }}
-    .conn-item:hover {{ background: var(--accent-soft); color: var(--accent); }}
-    .facts-col {{ padding: 16px 14px 28px 12px; border-left: 1px solid var(--border); background: var(--bg); height: calc(100vh - var(--header-h)); overflow-y: auto; position: sticky; top: var(--header-h); }}
-    .toc-nav {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }}
-    .toc-header {{ font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 5px; }}
-    .toc-link {{ display: flex; align-items: baseline; justify-content: space-between; gap: 6px; text-decoration: none; color: var(--muted); font-size: 0.8rem; line-height: 1.35; padding: 5px 8px; min-height: 28px; border-left: 2px solid var(--border-strong); }}
-    .toc-link:hover {{ color: var(--accent); border-left-color: var(--accent); background: var(--panel); }}
-    .toc-cnt {{ font-size: 0.72rem; color: var(--muted); font-variant-numeric: tabular-nums; flex-shrink: 0; }}
-    .toc-h3 {{ padding-left: 16px; font-size: 0.77rem; }}
-    .facts-drawer > summary {{ cursor: pointer; font-size: 0.81rem; font-weight: 700; color: var(--text); padding: 8px 10px; min-height: 36px; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); list-style: none; display: flex; align-items: center; justify-content: space-between; gap: 6px; }}
-    .facts-drawer > summary::-webkit-details-marker {{ display: none; }}
-    .facts-drawer-title {{ display: inline-flex; align-items: center; gap: 6px; }}
-    .facts-drawer-body {{ margin-top: 10px; }}
-    .facts-summary-line {{ margin: 0 0 10px; font-size: 0.78rem; color: var(--muted); text-wrap: pretty; }}
-    .fact-add {{ margin: 0 0 10px; }}
-    .fact-add > summary {{ cursor: pointer; display: flex; align-items: center; min-height: 32px; font-size: 0.79rem; font-weight: 600; color: var(--accent); background: var(--accent-soft); border: 1px solid var(--accent-border); border-radius: 6px; padding: 5px 10px; list-style: none; }}
-    .fact-add > summary::-webkit-details-marker {{ display: none; }}
-    .fact-add-form {{ display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding: 10px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); }}
-    .muted {{ color: var(--muted); font-size: 0.8rem; }}
-    .fact-card {{ padding: 10px 12px; border-radius: 10px; border: 1px solid var(--border); background: var(--canvas); margin-bottom: 8px; font-size: 0.83rem; overflow-wrap: break-word; }}
-    .fact-card.superseded {{ background: var(--retired-bg); border-color: var(--retired-border); border-style: dashed; }}
-    .fact-head {{ display: flex; align-items: flex-start; justify-content: space-between; gap: 6px; }}
-    .fact-badges {{ display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }}
-    .confirm-box {{ position: relative; flex-shrink: 0; }}
-    .confirm-trigger {{ list-style: none; cursor: pointer; display: inline-flex; align-items: center; min-height: 28px; padding: 3px 9px; border-radius: 5px; border: 1px solid var(--border-strong); background: var(--canvas); color: var(--muted); font-size: 0.74rem; font-weight: 600; }}
-    .confirm-trigger::-webkit-details-marker {{ display: none; }}
-    .confirm-trigger:hover {{ color: var(--red); border-color: var(--red); background: var(--red-bg); }}
-    .confirm-pop {{ position: absolute; right: 0; top: calc(100% + 4px); z-index: 40; width: 175px; padding: 8px; border-radius: 8px; background: var(--canvas); border: 1px solid var(--border-strong); box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 6px; }}
-    .danger-btn {{ background: var(--red); color: #ffffff; border: none; border-radius: 5px; padding: 6px 10px; min-height: 30px; font-size: 0.76rem; font-weight: 700; cursor: pointer; }}
-    .fact-subject {{ font-weight: 700; color: var(--text); text-transform: capitalize; }}
-    .fact-text {{ margin-top: 6px; color: var(--text-body); line-height: 1.48; }}
-    .fact-reason {{ margin-top: 4px; font-size: 0.76rem; color: var(--muted); }}
-    .badge {{ display: inline-block; padding: 2px 6px; border-radius: 4px; font-size: 0.71rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.02em; }}
-    .guide-badge {{ background: var(--panel); color: var(--muted); border: 1px solid var(--border-strong); }}
-    .topic-badge {{ background: var(--panel); color: var(--text); border: 1px solid var(--border); text-transform: none; font-weight: 600; }}
-    .valid-badge {{ background: var(--green-bg); color: var(--green); }}
-    .invalid-badge {{ background: var(--red-bg); color: var(--red); }}
-    .cat-fact {{ background: var(--fact-bg); color: var(--fact-fg); }}
-    .cat-question {{ background: var(--purple-bg); color: var(--purple); }}
-    .cat-weakness {{ background: var(--red-bg); color: var(--red); }}
-    .cat-strength, .cat-progress {{ background: var(--green-bg); color: var(--green); }}
-    .cat-decision, .cat-preference {{ background: var(--amber-bg); color: var(--amber); }}
-    .scope-badge {{ background: var(--accent-soft); color: var(--accent); }}
-    .fact-meta {{ margin-top: 5px; font-size: 0.74rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
-    @media (max-width: 1120px) {{
-      header {{ flex-wrap: wrap; padding: 8px 14px; gap: 8px; position: static; }}
-      .mobile-search-facts {{ display: block; }}
-      .mobile-tabs {{ display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); background: var(--canvas); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 25; }}
-      .mtab {{ display: flex; align-items: center; justify-content: center; min-height: 44px; padding: 8px 6px; font-size: 0.84rem; font-weight: 600; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; user-select: none; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-      .layout {{ display: block; min-height: auto; }}
-      .sidebar, .reader-wrap, .facts-col {{ display: none; border: none; height: auto; max-height: none; position: static; width: 100%; }}
-      #tab-reader:checked ~ .app-shell .layout .reader-wrap {{ display: block; }}
-      #tab-notes:checked ~ .app-shell .layout .sidebar {{ display: block; }}
-      #tab-facts:checked ~ .app-shell .layout .facts-col {{ display: block; }}
-      #tab-reader:checked ~ .app-shell .mobile-tabs .mtab-reader,
-      #tab-notes:checked ~ .app-shell .mobile-tabs .mtab-notes,
-      #tab-facts:checked ~ .app-shell .mobile-tabs .mtab-facts {{
-        color: var(--accent); border-bottom-color: var(--accent); background: var(--accent-soft);
-      }}
-      #tab-reader:focus-visible ~ .app-shell .mobile-tabs .mtab-reader,
-      #tab-notes:focus-visible ~ .app-shell .mobile-tabs .mtab-notes,
-      #tab-facts:focus-visible ~ .app-shell .mobile-tabs .mtab-facts {{
-        outline: 2px solid var(--accent); outline-offset: -2px;
-      }}
-    }}
-    .sidebar-tags {{ margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid var(--border); }}
-    .sidebar-tags-summary {{ list-style: none; cursor: pointer; display: flex; align-items: center; justify-content: space-between; gap: 6px; padding: 4px 6px; min-height: 30px; border-radius: 6px; font-size: 0.72rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); user-select: none; }}
-    .sidebar-tags-summary::-webkit-details-marker {{ display: none; }}
-    .sidebar-tags-summary:hover {{ background: var(--panel); color: var(--text); }}
-    .sidebar-tag-cloud {{ display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }}
-    .tag-chip {{ display: inline-flex; align-items: center; gap: 4px; min-height: 26px; padding: 2px 8px; border-radius: 999px; font-size: 0.75rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--canvas); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
-    .tag-chip:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .tag-chip.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
-    .tag-chip-cnt {{ font-size: 0.71rem; color: var(--muted); font-variant-numeric: tabular-nums; }}
-    .tag-chip.active .tag-chip-cnt {{ color: var(--accent); }}
-    .sidebar-tags-all {{ display: inline-flex; align-items: center; min-height: 28px; margin-top: 8px; padding: 2px 6px; font-size: 0.78rem; font-weight: 600; color: var(--accent); text-decoration: none; border-radius: 5px; }}
-    .sidebar-tags-all:hover {{ background: var(--accent-soft); text-decoration: underline; }}
-    .sidebar-active-tag {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; margin: 0 0 8px; padding: 6px 9px; border-radius: 8px; background: var(--accent-soft); border: 1px solid var(--accent-border); font-size: 0.78rem; color: var(--text); }}
-    .sidebar-active-tag a {{ color: var(--accent); font-weight: 600; text-decoration: none; }}
-    .sidebar-active-tag a:hover {{ text-decoration: underline; }}
-    .tree-step {{ font-size: 0.74rem; font-weight: 700; color: var(--muted); font-variant-numeric: tabular-nums; margin-right: 2px; }}
-    .doc-tags-bar {{ display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin: -12px 0 22px; color: var(--muted); }}
-    .doc-tag-pill {{ display: inline-flex; align-items: center; min-height: 26px; padding: 2px 9px; border-radius: 999px; font-size: 0.76rem; font-weight: 600; text-decoration: none; color: var(--text-body); background: var(--panel); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
-    .doc-tag-pill:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .doc-tag-pill.active {{ background: var(--accent-soft); color: var(--accent); border-color: var(--accent-border); }}
-    .rail-tags {{ padding-bottom: 14px; margin-bottom: 14px; border-bottom: 1px solid var(--border); }}
-    .label-section {{ margin-bottom: 24px; }}
-    .label-cloud {{ display: flex; flex-wrap: wrap; gap: 8px; }}
-    .label-dir-pill {{ display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 5px 12px; border-radius: 999px; font-size: 0.85rem; font-weight: 600; text-decoration: none; color: var(--text); background: var(--canvas); border: 1px solid var(--border); transition: border-color 0.15s ease, background-color 0.15s ease, color 0.15s ease; }}
-    .label-dir-pill:hover {{ border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }}
-    .label-dir-pill-sm {{ min-height: 30px; padding: 4px 10px; font-size: 0.8rem; font-weight: 500; color: var(--text-body); }}
-    .label-dir-cnt {{ font-size: 0.74rem; font-weight: 700; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; font-variant-numeric: tabular-nums; }}
-    .label-dir-pill:hover .label-dir-cnt {{ color: var(--accent); background: var(--canvas); }}
-    .sub-label-hint {{ font-size: 0.78rem; font-weight: 600; color: var(--muted); align-self: center; margin-right: 2px; }}
-    .tag-seq-card {{ display: flex; align-items: flex-start; gap: 14px; }}
-    .seq-num {{ flex-shrink: 0; min-width: 28px; height: 28px; display: inline-flex; align-items: center; justify-content: center; border-radius: 8px; background: var(--panel); border: 1px solid var(--border); color: var(--text); font-size: 0.78rem; font-weight: 700; font-variant-numeric: tabular-nums; margin-top: 1px; }}
-    .tag-seq-card:hover .seq-num {{ background: var(--canvas); border-color: var(--accent-border); color: var(--accent); }}
-    .tag-seq-body {{ flex: 1 1 auto; min-width: 0; }}
-    .result-tag {{ font-size: 0.74rem; font-weight: 600; color: var(--muted); background: var(--panel); padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border); }}
-    @media (max-width: 768px) {{
-      header {{ padding: 8px 12px; gap: 8px; }}
-      .brand {{ font-size: 0.94rem; min-height: 40px; }}
-      .brand-long, .desktop-actions {{ display: none; }}
-      .mobile-menu {{ display: block; }}
-      .mobile-menu > summary {{ min-height: 44px; min-width: 44px; justify-content: center; padding: 8px 12px; }}
-      .mobile-menu-panel {{ position: absolute; right: 0; top: calc(100% + 6px); z-index: 60; width: 280px; max-width: calc(100vw - 24px); padding: 12px; background: var(--canvas); border: 1px solid var(--border-strong); border-radius: 12px; box-shadow: var(--shadow); display: flex; flex-direction: column; gap: 10px; }}
-      .mobile-menu-row {{ display: flex; align-items: center; justify-content: space-between; gap: 8px; padding-bottom: 8px; border-bottom: 1px solid var(--border); }}
-      .mobile-menu-links {{ display: flex; flex-direction: column; gap: 6px; }}
-      .mobile-menu-links a {{ display: flex; align-items: center; min-height: 40px; padding: 6px 10px; border-radius: 6px; background: var(--panel); text-decoration: none; font-weight: 600; font-size: 0.86rem; color: var(--text); }}
-      .mobile-menu-links a.signout-link {{ color: var(--red); background: var(--red-bg); }}
-      .mobile-upload-form {{ display: flex; flex-direction: column; gap: 6px; padding-top: 8px; border-top: 1px solid var(--border); }}
-      .mobile-upload-form select, .mobile-upload-form input {{ background: var(--bg); color: var(--text); border: 1px solid var(--border-strong); border-radius: 6px; padding: 8px; font-size: 15px; width: 100%; }}
-      .mobile-upload-form button {{ background: var(--accent); color: var(--accent-fg); border: none; border-radius: 6px; padding: 10px; min-height: 42px; font-weight: 700; cursor: pointer; }}
-      .nav-pill {{ min-height: 40px; padding: 6px 10px; font-size: 0.8rem; }}
-      .search-form {{ order: 3; flex: 1 1 100%; max-width: 100%; }}
-      .search-scope {{ max-width: 112px; min-height: 40px; font-size: 0.8rem; }}
-      .search-form input[type="search"] {{ font-size: 16px; min-height: 40px; padding: 6px 10px; }}
-      .search-form button {{ min-height: 40px; padding: 6px 12px; }}
-      .reader-wrap {{ padding: 14px 16px 36px; }}
-      .reader-sheet {{ padding: 20px 16px; border-radius: 10px; }}
-      .recent-grid {{ grid-template-columns: 1fr; }}
-      .sidebar, .facts-col {{ padding: 12px; }}
-      .pager-nav {{ grid-template-columns: 1fr; }}
-      .pager-next {{ text-align: left; }}
-      .reader h1 {{ font-size: 1.56rem; }}
-      .reader h2 {{ font-size: 1.2rem; }}
-      .reader h3 {{ font-size: 1.04rem; }}
-      .table-wrap table {{ font-size: 0.84rem; }}
-      th, td {{ padding: 9px 11px; }}
-      pre {{ padding: 12px; font-size: 0.81rem; }}
-    }}
+{DASHBOARD_CSS}
   </style>
 </head>
 <body>
@@ -4803,8 +4867,8 @@ def render_dashboard_page(
     <header>
       <div class="brand-wrap">
         <a class="brand" href="{safe_base_path}?scope=&view=topics" title="Vyn Unified Obsidian Vault &amp; Cross-Agent Memory">{_svg_icon("vault")}<span>{html.escape(dashboard_title)}<span class="brand-long"> Vault</span></span></a>
-        <a class="nav-pill {topics_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=topics">{_svg_icon("grid")}<span>Topics</span></a>
-        <a class="nav-pill {tags_nav_active}" href="{safe_base_path}?scope={urllib.parse.quote(scope_filter)}&view=tags">{_svg_icon("tag")}<span>Labels</span></a>
+        <a class="nav-pill {topics_nav_active}"{' aria-current="page"' if topics_nav_active else ''} href="{scope_qs}&view=topics">{_svg_icon("grid")}<span>Topics</span></a>
+        <a class="nav-pill {tags_nav_active}"{' aria-current="page"' if tags_nav_active else ''} href="{scope_qs}&view=tags">{_svg_icon("tag")}<span>Labels</span></a>
       </div>
       <form class="search-form" method="get" action="{safe_base_path}">
         <select class="search-scope" name="scope" aria-label="Search scope">{search_scope_options}</select>
@@ -5093,16 +5157,50 @@ AUTH_FAILURE_WINDOW_SECONDS = 300.0
 MAX_TRACKED_AUTH_IPS = 4096
 
 
+def _is_https_public() -> bool:
+    return PUBLIC_URL.lower().startswith("https://")
+
+
+def _behind_cloudflare() -> bool:
+    return os.environ.get("MEMORY_BEHIND_CLOUDFLARE") == "1"
+
+
 def _client_ip(headers: object, client_address: tuple[str, int] | None) -> str:
     getter = getattr(headers, "get", None)
     # Only a Cloudflare tunnel sets this header reliably; anyone else could forge it to dodge rate limits.
-    if callable(getter) and os.environ.get("MEMORY_BEHIND_CLOUDFLARE") == "1":
+    if callable(getter) and _behind_cloudflare():
         cf_ip = (getter("CF-Connecting-IP") or "").strip()
         if cf_ip:
-            return cf_ip
+            try:
+                return str(ipaddress.ip_address(cf_ip))
+            except ValueError:
+                pass
     if client_address and client_address[0]:
         return str(client_address[0])
     return "unknown"
+
+
+def _cloudflare_scheme(headers: object) -> str:
+    """Return 'http', 'https', or '' (internal/direct request) when running behind Cloudflare."""
+    getter = getattr(headers, "get", None)
+    if not callable(getter) or not _behind_cloudflare():
+        return ""
+    xfp = (getter("X-Forwarded-Proto") or "").strip()
+    if xfp:
+        first = xfp.split(",", 1)[0].strip().lower()
+        if first in ("http", "https"):
+            return first
+    cf_visitor = (getter("CF-Visitor") or "").strip()
+    if cf_visitor:
+        try:
+            parsed = json.loads(cf_visitor)
+            if isinstance(parsed, dict):
+                scheme = str(parsed.get("scheme") or "").strip().lower()
+                if scheme in ("http", "https"):
+                    return scheme
+        except (ValueError, TypeError):
+            return ""
+    return ""
 
 
 def _is_rate_limited(ip: str) -> bool:
@@ -5582,13 +5680,26 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
     def log_message(self, fmt: str, *args: object) -> None:
         return
 
+    def handle_one_request(self) -> None:
+        self._auth_cookie_token = ""
+        super().handle_one_request()
+
     def end_headers(self) -> None:
         # A POST answered before its body was read (401, 429, ...) must not keep the connection:
         # the unread body would be parsed as the next request line (claude.ai got a 501 from that).
-        if self.command == "POST" and not getattr(self, "_body_read", False):
+        if getattr(self, "command", "") == "POST" and not getattr(self, "_body_read", False):
             self.close_connection = True
             self.send_header("Connection", "close")
+        if _is_https_public() and _cloudflare_scheme(getattr(self, "headers", None)) == "https":
+            self.send_header("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
         super().end_headers()
+
+    def _maybe_redirect_to_https(self) -> bool:
+        if not (_is_https_public() and _cloudflare_scheme(getattr(self, "headers", None)) == "http"):
+            return False
+        safe_path = _sanitize_next_path(self.path, default="/")
+        self.redirect(f"{PUBLIC_URL.rstrip('/')}{safe_path}", status=308)
+        return True
 
     def client_ip(self) -> str:
         return _client_ip(self.headers, getattr(self, "client_address", None))
@@ -5628,6 +5739,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         extra_headers: dict[str, str] | None = None,
         *,
         csp: str = DASHBOARD_CSP,
+        coop: bool | None = None,
     ) -> None:
         body = html_text.encode("utf-8")
         self.send_response(status)
@@ -5637,6 +5749,9 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         self.send_header("X-Content-Type-Options", "nosniff")
         self.send_header("X-Frame-Options", "DENY")
         self.send_header("Referrer-Policy", "same-origin")
+        self.send_header("Permissions-Policy", "camera=(), microphone=(), geolocation=(), payment=(), usb=()")
+        if (csp == DASHBOARD_CSP) if coop is None else coop:
+            self.send_header("Cross-Origin-Opener-Policy", "same-origin")
         self.send_header("Content-Security-Policy", csp)
         if extra_headers:
             for k, v in extra_headers.items():
@@ -5668,19 +5783,20 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                     host_tokens.append(v)
                 elif k == "vyn_memory_token" and v not in plain_tokens:
                     plain_tokens.append(v)
-            try:
-                c = SimpleCookie()
-                c.load(raw_cookie)
-                if "__Host-vyn_memory_token" in c:
-                    val = urllib.parse.unquote(c["__Host-vyn_memory_token"].value.strip())
-                    if val and val not in host_tokens:
-                        host_tokens.append(val)
-                if "vyn_memory_token" in c:
-                    val = urllib.parse.unquote(c["vyn_memory_token"].value.strip())
-                    if val and val not in plain_tokens:
-                        plain_tokens.append(val)
-            except Exception:
-                pass
+            if not host_tokens and not plain_tokens:
+                try:
+                    c = SimpleCookie()
+                    c.load(raw_cookie)
+                    if "__Host-vyn_memory_token" in c:
+                        val = urllib.parse.unquote(c["__Host-vyn_memory_token"].value.strip())
+                        if val and val not in host_tokens:
+                            host_tokens.append(val)
+                    if "vyn_memory_token" in c:
+                        val = urllib.parse.unquote(c["vyn_memory_token"].value.strip())
+                        if val and val not in plain_tokens:
+                            plain_tokens.append(val)
+                except Exception:
+                    pass
         return host_tokens + [t for t in plain_tokens if t not in host_tokens]
 
     def _cookie_value(self, *names: str) -> str:
@@ -5715,6 +5831,7 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         """Send the browser on (after a form post: 303), never cached."""
         self.send_response(status)
         self.send_header("Location", location)
+        self.send_header("Content-Length", "0")
         for cookie in cookies:
             self.send_header("Set-Cookie", cookie)
         self.send_header("Cache-Control", "no-store")
@@ -5763,12 +5880,18 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         cookie_tokens = self._extract_cookie_tokens() if allow_cookie and raw_path in BROWSER_ROUTES else []
 
         provided_any = False
-        for candidate in (bearer, api_key, *cookie_tokens):
+        for is_cookie, candidate in (
+            (False, bearer),
+            (False, api_key),
+            *((True, ct) for ct in cookie_tokens),
+        ):
             if not candidate:
                 continue
             provided_any = True
             actor = resolve_actor_from_token(candidate, self.server.db, subagent=subagent)  # type: ignore[attr-defined]
             if actor:
+                if is_cookie and actor == "owner":
+                    self._auth_cookie_token = candidate
                 return raw_path, query, actor
         if provided_any:
             _record_auth_failure(self.client_ip())
@@ -5785,6 +5908,9 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         return None
 
     def owner_cookie_token(self) -> str:
+        cached = getattr(self, "_auth_cookie_token", None)
+        if cached:
+            return str(cached)
         pair = self._owner_cookie_pair()
         return pair[0] if pair else ""
 
@@ -5870,6 +5996,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
         self.do_GET()
 
     def do_GET(self) -> None:
+        if self._maybe_redirect_to_https():
+            return
         conn: sqlite3.Connection = self.server.db  # type: ignore[attr-defined]
         ip = self.client_ip()
         if _is_rate_limited(ip):
@@ -5889,7 +6017,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
 
         if route == "/login":
             next_p = (query.get("next") or [f"/?scope={DEFAULT_SCOPE}"])[0]
-            self.send_html(200, render_login_page(next_path=next_p, theme=theme))
+            safe_next = _sanitize_next_path(next_p)
+            self.send_html(200, render_login_page(next_path=safe_next, theme=theme), coop=not safe_next.startswith("/oauth/authorize"))
             return
 
         if route == "/auth/start":
@@ -6289,6 +6418,8 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         self._body_read = False
+        if self._maybe_redirect_to_https():
+            return
         conn: sqlite3.Connection = self.server.db  # type: ignore[attr-defined]
         ip = self.client_ip()
         if _is_rate_limited(ip):
@@ -6884,7 +7015,12 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
                 raw_tags = data.get("tags")
                 tags = [str(x) for x in raw_tags] if isinstance(raw_tags, list) else []
                 raw_order = data.get("order")
-                order_val = _safe_int(raw_order, "order", default=0) if raw_order is not None and str(raw_order).strip() != "" else None
+                if raw_order is None or (isinstance(raw_order, str) and raw_order.strip() == ""):
+                    order_val: int | None = None
+                elif isinstance(raw_order, bool) or isinstance(raw_order, float):
+                    raise MemoryError(f"Invalid integer for order: {raw_order!r}")
+                else:
+                    order_val = _safe_int(raw_order, "order", default=0)
                 res = op_write_note(
                     conn,
                     effective_actor,

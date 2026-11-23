@@ -2051,6 +2051,22 @@ class TestVynMemory(unittest.TestCase):
         self.assertEqual(tag_map.get("linked-list"), 1)
         self.assertEqual(tag_map.get("queues"), 1)
 
+        # API: punctuation-only tag returns 0 instead of dropping filter; vault-wide tag preserves study order
+        self.assertEqual(self.srv.op_list_notes(self.conn, scope="shared", tag="!!!")["count"], 0)
+        vault_listed = self.srv.op_list_notes(self.conn, scope="", tag="dsa")
+        self.assertEqual(
+            [n["path"] for n in vault_listed["notes"]],
+            ["shared/dsa-bitwise.md", "shared/dsa-linked-list.md", "shared/dsa-queues.md"],
+        )
+
+        # Inline YAML comments and booleans in _parse_sort_order; boolean/out-of-range order rejected in op_write_note
+        self.assertEqual(self.srv._parse_sort_order({"order": "15 # step 2"}, "shared/x.md"), 15)
+        self.assertEqual(self.srv._parse_sort_order({"order": True}, "shared/x.md"), 1000)
+        with self.assertRaises(self.srv.MemoryError):
+            self.srv.op_write_note(self.conn, "owner", path="shared/bad-ord.md", content="x", order=True)  # type: ignore[arg-type]
+        with self.assertRaises(self.srv.MemoryError):
+            self.srv.op_write_note(self.conn, "owner", path="shared/bad-ord.md", content="x", order=-1)
+
         # UI: Labels directory (?view=tags)
         tags_page = self.srv.render_dashboard_page(self.conn, "owner", scope_filter="shared", view="tags")
         self.assertIn("Labels in", tags_page)
@@ -2066,7 +2082,7 @@ class TestVynMemory(unittest.TestCase):
         self.assertLess(tag_page.index("Bitwise Operations"), tag_page.index("Linked Lists"))
         self.assertLess(tag_page.index("Linked Lists"), tag_page.index("Queues and Rings"))
 
-        # UI: Reader opened from ?tag=dsa shows back-to-#dsa banner, clickable page labels, and tag-scoped Prev/Next pager
+        # UI: Reader opened from ?tag=dsa shows back-to-#dsa banner, clickable page labels, and exact tag-scoped Prev/Next URLs
         reader_page = self.srv.render_dashboard_page(
             self.conn,
             "owner",
@@ -2076,9 +2092,177 @@ class TestVynMemory(unittest.TestCase):
         )
         self.assertIn("Back to #dsa (3 pages)", reader_page)
         self.assertIn("All #dsa (2/3)", reader_page)
-        self.assertIn("Bitwise Operations", reader_page)
-        self.assertIn("Queues and Rings", reader_page)
+        self.assertIn('class="pager-link pager-prev" href="/?scope=shared&note=shared/dsa-bitwise.md&tag=dsa"', reader_page)
+        self.assertIn('class="pager-link pager-next" href="/?scope=shared&note=shared/dsa-queues.md&tag=dsa"', reader_page)
         self.assertIn('class="doc-tags-bar"', reader_page)
+
+        # UI: Simultaneous q + tag keeps search mode clean (no contradictory #dsa banner/pager over search hits)
+        mixed_page = self.srv.render_dashboard_page(
+            self.conn,
+            "owner",
+            scope_filter="shared",
+            selected_note="shared/dsa-linked-list.md",
+            search_query="Pointer",
+            tag_filter="dsa",
+        )
+        self.assertNotIn("Back to #dsa", mixed_page)
+        self.assertNotIn("All #dsa", mixed_page)
+
+    def test_cloudflare_security_hardening(self) -> None:
+        # 1. Tag normalization caps length to <= 64 chars
+        self.assertEqual(len(self.srv._normalize_tag("a" * 300)), 64)
+
+        # 2. CF-Connecting-IP is ignored unless MEMORY_BEHIND_CLOUDFLARE=1, and must be a valid IP when enabled
+        old_cf = os.environ.get("MEMORY_BEHIND_CLOUDFLARE")
+        old_pub = self.srv.PUBLIC_URL
+        try:
+            os.environ.pop("MEMORY_BEHIND_CLOUDFLARE", None)
+            self.assertEqual(self.srv._client_ip({"CF-Connecting-IP": "203.0.113.42"}, ("127.0.0.1", 1234)), "127.0.0.1")
+
+            os.environ["MEMORY_BEHIND_CLOUDFLARE"] = "1"
+            self.srv.PUBLIC_URL = "https://memory.example.com"
+            self.assertEqual(self.srv._client_ip({"CF-Connecting-IP": "203.0.113.42"}, ("127.0.0.1", 1234)), "203.0.113.42")
+            self.assertEqual(self.srv._client_ip({"CF-Connecting-IP": "not-an-ip, 1.2.3.4"}, ("127.0.0.1", 1234)), "127.0.0.1")
+
+            # Start ephemeral server to test live HTTP->HTTPS 308 redirect, HSTS, COOP, Permissions-Policy, and HTTP API order validation
+            class _NoRedir(urllib.request.HTTPRedirectHandler):
+                def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                    return None
+
+            httpd = ThreadingHTTPServer(("127.0.0.1", 0), self.srv.MemoryHTTPHandler)
+            httpd.db = self.conn  # type: ignore[attr-defined]
+            port = httpd.server_address[1]
+            t = threading.Thread(target=httpd.serve_forever, daemon=True)
+            t.start()
+            base = f"http://127.0.0.1:{port}"
+            opener = urllib.request.build_opener(_NoRedir())
+            try:
+                # Plaintext via Cloudflare X-Forwarded-Proto: http (and comma-separated) -> 308 Permanent Redirect to HTTPS
+                for xfp_val in ("http", "http, https"):
+                    req_http = urllib.request.Request(f"{base}/login?scope=career", headers={"X-Forwarded-Proto": xfp_val})
+                    with self.assertRaises(urllib.error.HTTPError) as ctx:
+                        opener.open(req_http)
+                    self.assertEqual(ctx.exception.code, 308)
+                    self.assertEqual(ctx.exception.headers.get("Location"), "https://memory.example.com/login?scope=career")
+                    self.assertIsNone(ctx.exception.headers.get("Strict-Transport-Security"))
+                    ctx.exception.close()
+
+                # HEAD and POST plaintext requests -> 308 (POST also sets Connection: close)
+                req_head = urllib.request.Request(f"{base}/login", method="HEAD", headers={"X-Forwarded-Proto": "http"})
+                with self.assertRaises(urllib.error.HTTPError) as ctx_h:
+                    opener.open(req_head)
+                self.assertEqual(ctx_h.exception.code, 308)
+                ctx_h.exception.close()
+
+                req_post = urllib.request.Request(
+                    f"{base}/mcp",
+                    data=b"{}",
+                    method="POST",
+                    headers={"Content-Type": "application/json", "X-Forwarded-Proto": "http"},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx_p:
+                    opener.open(req_post)
+                self.assertEqual(ctx_p.exception.code, 308)
+                self.assertEqual(ctx_p.exception.headers.get("Location"), "https://memory.example.com/mcp")
+                self.assertEqual((ctx_p.exception.headers.get("Connection") or "").lower(), "close")
+                ctx_p.exception.close()
+
+                # Open-redirect sanitization on 308 (backslash & absolute-URI targets -> /)
+                import http.client
+                for evil_target in ("/\\evil.com/phish", "https://evil.com/phish"):
+                    raw_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    try:
+                        raw_conn.request("GET", evil_target, headers={"X-Forwarded-Proto": "http"})
+                        raw_resp = raw_conn.getresponse()
+                        raw_resp.read()
+                        self.assertEqual(raw_resp.status, 308)
+                        self.assertEqual(raw_resp.getheader("Location"), "https://memory.example.com/")
+                    finally:
+                        raw_conn.close()
+
+                # HTTP/1.1 keep-alive connection reuse across schemes (HTTPS -> HTTP -> direct loopback on ONE socket)
+                ka_conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                try:
+                    ka_conn.request("GET", "/health", headers={"X-Forwarded-Proto": "https"})
+                    r1 = ka_conn.getresponse()
+                    r1.read()
+                    self.assertEqual(r1.status, 200)
+                    self.assertIn("max-age=31536000", r1.getheader("Strict-Transport-Security") or "")
+
+                    ka_conn.request("GET", "/login", headers={"X-Forwarded-Proto": "http"})
+                    r2 = ka_conn.getresponse()
+                    r2.read()
+                    self.assertEqual(r2.status, 308)
+                    self.assertEqual(r2.getheader("Location"), "https://memory.example.com/login")
+                    self.assertIsNone(r2.getheader("Strict-Transport-Security"))
+
+                    ka_conn.request("GET", "/health")
+                    r3 = ka_conn.getresponse()
+                    r3.read()
+                    self.assertEqual(r3.status, 200)
+                    self.assertIsNone(r3.getheader("Strict-Transport-Security"))
+                finally:
+                    ka_conn.close()
+
+                # Plaintext via CF-Visitor: {"scheme":"http"} (including unrecognized XFP fallback) -> 308 Redirect
+                req_cfv = urllib.request.Request(
+                    f"{base}/?tag=dsa",
+                    headers={"X-Forwarded-Proto": "weird", "CF-Visitor": '{"scheme":"http"}'},
+                )
+                with self.assertRaises(urllib.error.HTTPError) as ctx2:
+                    opener.open(req_cfv)
+                self.assertEqual(ctx2.exception.code, 308)
+                self.assertEqual(ctx2.exception.headers.get("Location"), "https://memory.example.com/?tag=dsa")
+                ctx2.exception.close()
+
+                # Internal/loopback request without Cloudflare proto headers -> 200 OK and NO HSTS over plaintext HTTP!
+                with opener.open(f"{base}/health") as r_int:
+                    self.assertEqual(r_int.status, 200)
+                    self.assertIsNone(r_int.headers.get("Strict-Transport-Security"))
+
+                # HTTPS via Cloudflare (both X-Forwarded-Proto and CF-Visitor) -> 200 OK with HSTS, Permissions-Policy, COOP, CSP
+                for hdrs in ({"X-Forwarded-Proto": "https"}, {"CF-Visitor": '{"scheme":"https"}'}):
+                    req_https = urllib.request.Request(f"{base}/login", headers=hdrs)
+                    with opener.open(req_https) as r_https:
+                        self.assertEqual(r_https.status, 200)
+                        self.assertIn("max-age=31536000", r_https.headers.get("Strict-Transport-Security", ""))
+                        self.assertIn("camera=()", r_https.headers.get("Permissions-Policy", ""))
+                        self.assertEqual(r_https.headers.get("Cross-Origin-Opener-Policy"), "same-origin")
+
+                # /login redirecting to /oauth/authorize omits COOP to preserve OAuth popup window.opener
+                req_oauth_login = urllib.request.Request(
+                    f"{base}/login?next=%2Foauth%2Fauthorize%3Fclient_id%3Ddemo",
+                    headers={"X-Forwarded-Proto": "https"},
+                )
+                with opener.open(req_oauth_login) as r_ol:
+                    self.assertEqual(r_ol.status, 200)
+                    self.assertIsNone(r_ol.headers.get("Cross-Origin-Opener-Policy"))
+
+                # HTTP API POST /api/v1/note rejects boolean and float order with HTTP 400
+                for bad_order in (True, False, 1.5, -5):
+                    req_bad = urllib.request.Request(
+                        f"{base}/api/v1/note",
+                        data=json.dumps({"path": "shared/api-ord.md", "content": "hi", "order": bad_order}).encode("utf-8"),
+                        method="POST",
+                        headers={
+                            "Content-Type": "application/json",
+                            "Authorization": f"Bearer {self.env_patch['MEMORY_CLAUDE_TOKEN']}",
+                            "X-Forwarded-Proto": "https",
+                        },
+                    )
+                    with self.assertRaises(urllib.error.HTTPError) as ctx_ord:
+                        opener.open(req_bad)
+                    self.assertEqual(ctx_ord.exception.code, 400)
+                    ctx_ord.exception.close()
+            finally:
+                httpd.shutdown()
+                httpd.server_close()
+        finally:
+            self.srv.PUBLIC_URL = old_pub
+            if old_cf is None:
+                os.environ.pop("MEMORY_BEHIND_CLOUDFLARE", None)
+            else:
+                os.environ["MEMORY_BEHIND_CLOUDFLARE"] = old_cf
 
 
 if __name__ == "__main__":
