@@ -5,3 +5,7 @@ __pycache__/
 data/
 vault/
 settings.json
+
+# Graphify knowledge graph: generated per machine, rebuilt by the git hook
+# (scripts/host/dev-tools.sh in the workspace).
+graphify-out/

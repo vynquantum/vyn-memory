@@ -1,0 +1,9 @@
+# Kept out of the Graphify scan (gitignore syntax). data/ holds runtime
+# state (in core: the Obsidian vault, personal notes included).
+data/
+backups/
+logs/
+node_modules/
+.venv/
+dist/
+output/
