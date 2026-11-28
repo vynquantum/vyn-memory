@@ -357,6 +357,10 @@ class TestVynMemory(unittest.TestCase):
                 res_ok = json.loads(resp.read().decode())
                 self.assertFalse(res_ok["result"]["isError"])
 
+            with urllib.request.urlopen(f"{base}/favicon.ico") as resp:  # public, no login
+                self.assertEqual(resp.headers["Content-Type"], "image/x-icon")
+                self.assertEqual(resp.read()[:4], b"\x00\x00\x01\x00")
+
             # 4. OAuth 2.1 + PKCE flow (including RFC 9207 iss + discovery metadata)
             with urllib.request.urlopen(f"{base}/.well-known/oauth-protected-resource") as resp:
                 pr_meta = json.loads(resp.read().decode())

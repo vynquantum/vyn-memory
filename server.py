@@ -6138,6 +6138,16 @@ class MemoryHTTPHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if route == "/favicon.ico":  # public on purpose: only the brand icon, so connector lists show it
+            data = (Path(__file__).parent / "favicon.ico").read_bytes()
+            self.send_response(200)
+            self.send_header("Content-Type", "image/x-icon")
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "public, max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
+            return
+
         if route == "/.well-known/oauth-protected-resource":
             self.send_json(
                 200,
